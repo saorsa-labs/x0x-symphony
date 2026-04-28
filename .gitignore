@@ -1,0 +1,10 @@
+target/
+Cargo.lock.bak
+*.swp
+.DS_Store
+.idea/
+.vscode/
+**/*.rs.bk
+.deps/
+proofs/
+workspaces/
