@@ -46,7 +46,7 @@ just lint                                      # clippy with -D warnings
 just test                                      # cargo nextest
 ```
 
-Until the workspace has crates, `just` recipes are stubs. See `justfile`.
+`just` recipes execute against the real Cargo workspace. `just check` is the canonical local validation entry point.
 
 ## Quality standards
 
