@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = []
+members = ["crates/x0x-symphony-core"]
 
 [workspace.package]
 version = "0.0.0"
@@ -16,7 +16,7 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "deny"
-pedantic = "warn"
+pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
