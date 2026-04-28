@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/x0x-symphony-core"]
+members = [
+    "crates/x0x-symphony-core",
+    "crates/x0x-symphony-workspace",
+]
 
 [workspace.package]
 version = "0.0.0"
