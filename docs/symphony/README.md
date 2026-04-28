@@ -8,6 +8,7 @@ populates it.
 |----------|----------|--------|
 | `operator.md` | M1 | Pending (XSY-0008) |
 | `runner-authoring.md` | M1 | Pending (XSY-0008) |
+| `workspace.md` | M1 | Initial implementation note (XSY-0005) |
 | `x0x-tracker.md` | M3 | Pending |
 | `security.md` | M4 | Pending |
 | `distributed-workers.md` | M4 | Pending |

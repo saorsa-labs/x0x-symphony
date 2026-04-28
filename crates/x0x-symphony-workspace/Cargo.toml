@@ -1,0 +1,25 @@
+[package]
+name = "x0x-symphony-workspace"
+description = "Workspace manager and hook execution for x0x-symphony."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "process", "rt", "time"] }
+tracing = "0.1"
+x0x-symphony-core = { path = "../x0x-symphony-core" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
