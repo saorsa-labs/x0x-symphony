@@ -29,7 +29,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: taiki-e/install-action@just
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -53,7 +53,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: taiki-e/install-action@just
 
       - name: Run rustdoc examples
         run: just doc-test
