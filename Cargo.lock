@@ -900,6 +900,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "x0x-symphony-workspace"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "x0x-symphony-core",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
