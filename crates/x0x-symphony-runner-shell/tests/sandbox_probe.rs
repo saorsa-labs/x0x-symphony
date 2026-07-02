@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::path::Path;
 
 use x0x_symphony_runner_shell::{
