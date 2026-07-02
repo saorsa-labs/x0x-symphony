@@ -21,7 +21,8 @@ use tokio::{
 };
 use tracing::warn;
 use x0x_symphony_core::{
-    Hook, HookEnv, HookOutcome, HookStatus, Issue, IssueState, Workspace, WorkspaceHandle,
+    Hook, HookEnv, HookOutcome, HookStatus, Issue, IssueId, IssueState, RefusedWorkspace,
+    Workspace, WorkspaceHandle, WorkspaceScan,
 };
 
 use crate::{
@@ -35,6 +36,7 @@ use crate::{
 const DEFAULT_HOOK_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const HOOK_OUTPUT_TIMEOUT_DRAIN_MS: u64 = 1_000;
 const BASH_PATH: &str = "/bin/bash";
+const ORPHAN_QUARANTINE_DIR: &str = ".orphaned";
 
 /// Workspace manager configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,6 +279,138 @@ impl Manager {
         }
     }
 
+    /// Scan the workspace root for containment-valid issue workspace directories.
+    ///
+    /// The reserved `.orphaned` quarantine tree is skipped so repeated orphan
+    /// sweeps are idempotent. Other entries with invalid names, symlink escapes,
+    /// aliasing, or non-directory metadata are returned as refused scan entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] only when the root directory itself cannot be read.
+    pub fn list_workspace_directories(&self) -> Result<WorkspaceScan> {
+        let mut scan = WorkspaceScan::new();
+        let entries = fs::read_dir(&self.root).map_err(|source| Error::ReadDir {
+            path: self.root.clone(),
+            source,
+        })?;
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(source) => {
+                    scan.refused.push(RefusedWorkspace::new(
+                        "(read_dir_entry)",
+                        self.root.clone(),
+                        Error::ReadDirEntry {
+                            path: self.root.clone(),
+                            source,
+                        }
+                        .to_string(),
+                    ));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(name) => {
+                    scan.refused.push(RefusedWorkspace::new(
+                        name.to_string_lossy(),
+                        path,
+                        "workspace name is not valid UTF-8",
+                    ));
+                    continue;
+                }
+            };
+
+            if name == ORPHAN_QUARANTINE_DIR {
+                continue;
+            }
+
+            let sanitized = match sanitize_issue_identifier(&name) {
+                Ok(sanitized) => sanitized,
+                Err(error) => {
+                    scan.refused
+                        .push(RefusedWorkspace::new(name, path, error.to_string()));
+                    continue;
+                }
+            };
+            let issue_id = match IssueId::new(sanitized.as_str()) {
+                Ok(issue_id) => issue_id,
+                Err(error) => {
+                    scan.refused.push(RefusedWorkspace::new(
+                        sanitized.as_str(),
+                        path,
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+
+            match self.validate_existing_directory(&path) {
+                Ok(canonical) => {
+                    scan.workspaces
+                        .push(WorkspaceHandle::new(issue_id, canonical, false));
+                }
+                Err(error) => {
+                    scan.refused.push(RefusedWorkspace::new(
+                        issue_id.as_str(),
+                        path,
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+
+        scan.workspaces.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        scan.refused.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        Ok(scan)
+    }
+
+    /// Move a workspace into `.orphaned/<quarantine_namespace>/`.
+    ///
+    /// The source workspace and each destination component are re-validated
+    /// before the move. The move uses `rename`; this method never removes a
+    /// workspace directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the namespace is invalid, containment checks fail,
+    /// the target already exists, or the filesystem move fails.
+    pub fn quarantine_workspace_directory(
+        &self,
+        handle: &WorkspaceHandle,
+        quarantine_namespace: &str,
+    ) -> Result<PathBuf> {
+        let source = self.validate_handle(handle)?;
+        let source_name = file_name_utf8(&source)?;
+        if source_name != handle.issue_id.as_str() {
+            return Err(Error::InvalidQuarantinePath {
+                path: source,
+                reason: "workspace handle issue id does not match directory name",
+            });
+        }
+        let quarantine_dir = self.prepare_quarantine_dir(quarantine_namespace)?;
+        let target = quarantine_dir.join(&source_name);
+        self.validate_new_quarantine_target(&quarantine_dir, &target, &source_name)?;
+        fs::rename(&source, &target).map_err(|source_error| Error::MoveDir {
+            from: source.clone(),
+            to: target.clone(),
+            source: source_error,
+        })?;
+        self.validate_existing_quarantine_child(&quarantine_dir, &target, &source_name)?;
+        Ok(target)
+    }
+
     fn create_or_reuse_directory(&self, path: &Path) -> Result<(bool, PathBuf)> {
         match fs::symlink_metadata(path) {
             Ok(_metadata) => self
@@ -309,6 +443,145 @@ impl Manager {
         })?;
         if !metadata.is_dir() {
             return Err(Error::NotDirectory { path: canonical });
+        }
+        Ok(canonical)
+    }
+
+    fn prepare_quarantine_dir(&self, quarantine_namespace: &str) -> Result<PathBuf> {
+        let namespace = sanitize_issue_identifier(quarantine_namespace)?;
+        let orphan_root = self.root.join(ORPHAN_QUARANTINE_DIR);
+        let orphan_root = self.ensure_quarantine_dir(
+            &orphan_root,
+            &self.root,
+            ORPHAN_QUARANTINE_DIR,
+            "orphan quarantine root must remain a direct child of workspace root",
+        )?;
+        let namespace_path = orphan_root.join(namespace.as_str());
+        self.ensure_quarantine_dir(
+            &namespace_path,
+            &orphan_root,
+            namespace.as_str(),
+            "orphan quarantine namespace must remain under quarantine root",
+        )
+    }
+
+    fn ensure_quarantine_dir(
+        &self,
+        path: &Path,
+        expected_parent: &Path,
+        expected_name: &str,
+        containment_reason: &'static str,
+    ) -> Result<PathBuf> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Error::InvalidQuarantinePath {
+                        path: path.to_path_buf(),
+                        reason: "quarantine path is not a real directory",
+                    });
+                }
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                if let Err(create_source) = fs::create_dir(path) {
+                    if create_source.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(Error::CreateQuarantineDir {
+                            path: path.to_path_buf(),
+                            source: create_source,
+                        });
+                    }
+                }
+            }
+            Err(source) => {
+                return Err(Error::Metadata {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+        self.validate_existing_quarantine_child(expected_parent, path, expected_name)
+            .map_err(|error| match error {
+                Error::InvalidQuarantinePath { path, .. } => Error::InvalidQuarantinePath {
+                    path,
+                    reason: containment_reason,
+                },
+                other => other,
+            })
+    }
+
+    fn validate_new_quarantine_target(
+        &self,
+        quarantine_dir: &Path,
+        target: &Path,
+        expected_name: &str,
+    ) -> Result<()> {
+        sanitize_issue_identifier(expected_name)?;
+        self.validate_existing_quarantine_child(
+            &self.root.join(ORPHAN_QUARANTINE_DIR),
+            quarantine_dir,
+            file_name_utf8(quarantine_dir)?.as_str(),
+        )?;
+        match fs::symlink_metadata(target) {
+            Ok(_metadata) => Err(Error::InvalidQuarantinePath {
+                path: target.to_path_buf(),
+                reason: "quarantine target already exists",
+            }),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(Error::Metadata {
+                path: target.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    fn validate_existing_quarantine_child(
+        &self,
+        expected_parent: &Path,
+        path: &Path,
+        expected_name: &str,
+    ) -> Result<PathBuf> {
+        if !expected_parent.is_absolute() || !path.is_absolute() {
+            return Err(Error::InvalidQuarantinePath {
+                path: path.to_path_buf(),
+                reason: "quarantine path is not absolute",
+            });
+        }
+        let canonical_parent =
+            fs::canonicalize(expected_parent).map_err(|source| Error::Metadata {
+                path: expected_parent.to_path_buf(),
+                source,
+            })?;
+        let canonical = fs::canonicalize(path).map_err(|source| Error::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !canonical.starts_with(&self.root) {
+            return Err(Error::InvalidQuarantinePath {
+                path: canonical,
+                reason: "quarantine path escapes workspace root",
+            });
+        }
+        if canonical.parent() != Some(canonical_parent.as_path()) {
+            return Err(Error::InvalidQuarantinePath {
+                path: canonical,
+                reason: "quarantine path has unexpected parent",
+            });
+        }
+        let resolved_name = file_name_utf8(&canonical)?;
+        if resolved_name != expected_name {
+            return Err(Error::InvalidQuarantinePath {
+                path: canonical,
+                reason: "quarantine path resolved name mismatch",
+            });
+        }
+        let metadata = fs::metadata(&canonical).map_err(|source| Error::Metadata {
+            path: canonical.clone(),
+            source,
+        })?;
+        if !metadata.is_dir() {
+            return Err(Error::InvalidQuarantinePath {
+                path: canonical,
+                reason: "quarantine path is not a directory",
+            });
         }
         Ok(canonical)
     }
@@ -432,6 +705,16 @@ impl Manager {
     }
 }
 
+fn file_name_utf8(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| Error::InvalidQuarantinePath {
+            path: path.to_path_buf(),
+            reason: "path has no UTF-8 file name",
+        })
+}
+
 #[async_trait]
 impl Workspace for Manager {
     fn root(&self) -> &Path {
@@ -456,6 +739,19 @@ impl Workspace for Manager {
     ) -> x0x_symphony_core::Result<HookOutcome> {
         Manager::run_hook_in(self, handle, hook, env)
             .await
+            .map_err(Error::into_core)
+    }
+
+    async fn list_workspaces(&self) -> x0x_symphony_core::Result<WorkspaceScan> {
+        self.list_workspace_directories().map_err(Error::into_core)
+    }
+
+    async fn quarantine_workspace(
+        &self,
+        handle: &WorkspaceHandle,
+        quarantine_namespace: &str,
+    ) -> x0x_symphony_core::Result<PathBuf> {
+        self.quarantine_workspace_directory(handle, quarantine_namespace)
             .map_err(Error::into_core)
     }
 

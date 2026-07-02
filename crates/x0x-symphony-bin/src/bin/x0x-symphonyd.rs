@@ -61,6 +61,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
         orchestrator_config,
     ));
 
+    let _ = orchestrator.reconcile().await;
+    let sweep = orchestrator
+        .sweep_orphans()
+        .await
+        .context("orphan workspace sweep failed")?;
+    info!(
+        preserved = sweep.preserved_count(),
+        quarantined = sweep.quarantined_count(),
+        refused = sweep.refused_count(),
+        "orphan workspace sweep finished before poll loop"
+    );
+
     let orchestrator_handle: Arc<dyn api::OrchestratorHandle> = orchestrator.clone();
     let app_state = api::AppState::new(
         tracker_paths.issues_path.clone(),

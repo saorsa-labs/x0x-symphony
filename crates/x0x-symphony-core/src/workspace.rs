@@ -239,6 +239,50 @@ impl WorkspaceHandle {
     }
 }
 
+/// One workspace-root entry refused during a scan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RefusedWorkspace {
+    /// Best-effort issue identifier or directory name associated with the refusal.
+    pub issue_id: String,
+    /// Path that failed scan-time validation.
+    pub path: PathBuf,
+    /// Human-readable refusal reason.
+    pub reason: String,
+}
+
+impl RefusedWorkspace {
+    /// Construct a refused workspace scan entry.
+    #[must_use]
+    pub fn new(
+        issue_id: impl Into<String>,
+        path: impl Into<PathBuf>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            issue_id: issue_id.into(),
+            path: path.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Result of scanning a workspace root for issue directories.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceScan {
+    /// Valid, containment-checked workspace directories.
+    pub workspaces: Vec<WorkspaceHandle>,
+    /// Entries that looked like workspaces but failed validation.
+    pub refused: Vec<RefusedWorkspace>,
+}
+
+impl WorkspaceScan {
+    /// Construct an empty scan result.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Workspace lifecycle abstraction used by the orchestrator.
 ///
 /// # Examples
@@ -286,6 +330,31 @@ pub trait Workspace: Send + Sync {
     ) -> Result<HookOutcome> {
         Err(SymphonyError::Workspace(
             "workspace implementation does not support handle-scoped hooks".into(),
+        ))
+    }
+
+    /// List existing workspace directories under the configured root.
+    ///
+    /// The default implementation returns an empty scan so pre-existing test or
+    /// out-of-tree workspace implementations remain source-compatible. Real
+    /// filesystem managers should return only containment-validated direct
+    /// children and report refused entries in [`WorkspaceScan::refused`].
+    async fn list_workspaces(&self) -> Result<WorkspaceScan> {
+        Ok(WorkspaceScan::new())
+    }
+
+    /// Move a workspace into an implementation-managed quarantine directory.
+    ///
+    /// `quarantine_namespace` is a caller-supplied, sanitized timestamp or
+    /// batch identifier. Implementations must re-validate both the source and
+    /// destination containment before moving and must not delete the source.
+    async fn quarantine_workspace(
+        &self,
+        _handle: &WorkspaceHandle,
+        _quarantine_namespace: &str,
+    ) -> Result<PathBuf> {
+        Err(SymphonyError::Workspace(
+            "workspace implementation does not support quarantine".into(),
         ))
     }
 

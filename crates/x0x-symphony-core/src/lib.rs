@@ -22,4 +22,6 @@ pub use runner::{
 };
 pub use tracker::{PollContext, ReleaseReason, ReleaseReasonCode, Tracker};
 pub use workflow::{Hook, HookName, LifecycleHooks, WorkflowDefinition, WorkflowPath};
-pub use workspace::{HookEnv, HookOutcome, HookStatus, Workspace, WorkspaceHandle};
+pub use workspace::{
+    HookEnv, HookOutcome, HookStatus, RefusedWorkspace, Workspace, WorkspaceHandle, WorkspaceScan,
+};
