@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     error::Error,
     fs, io,
@@ -12,14 +13,16 @@ use proptest::{prelude::*, test_runner::TestCaseError};
 use serde_json::{Map, Value};
 use tempfile::TempDir;
 use x0x_symphony_core::{
-    AgentId, Handoff, IssueId, IssueState, PollContext, ReleaseReason, ReleaseReasonCode, Tracker,
-    ValidationResult, ValidationStatus,
+    AgentId, Claim, Handoff, Issue, IssueId, IssueRef, IssueState, PollContext, ReleaseReason,
+    ReleaseReasonCode, Shard, ShardRole, Tracker, ValidationResult, ValidationStatus,
 };
 use x0x_symphony_tracker_git_jsonl::{
     parse_issue_line, serialize_issue, IssueDraft, JsonlTracker, TrackerError,
 };
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error>>;
+
+const V1_ISSUE_FIXTURE: &str = include_str!("fixtures/v1_issue.json");
 
 #[tokio::test]
 async fn round_trip_create_claim_heartbeat_handoff_review() -> TestResult {
@@ -200,39 +203,82 @@ async fn multiprocess_claim_child() -> TestResult {
 
 proptest! {
     #[test]
-    fn unknown_fields_are_byte_stable_after_parse_serialize(
-        extra in proptest::collection::btree_map("[a-z][a-z0-9_]{0,8}", "[ -~]{0,24}", 1..8)
+    fn schema_v1_arbitrary_issue_round_trip_is_byte_identical(
+        issue in arbitrary_issue_strategy()
     ) {
-        let mut object = base_issue_object();
-        let mut original_unknown = Vec::new();
-        for (key, text) in extra {
-            let field = format!("x_{key}");
-            let value = Value::String(text);
-            let bytes = serde_json::to_string(&value)
-                .map_err(|error| TestCaseError::fail(error.to_string()))?;
-            object.insert(field.clone(), value);
-            original_unknown.push((field, bytes));
-        }
-        let line = serde_json::to_string(&Value::Object(object))
+        let serialized = serialize_issue(&issue)
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
-        let parsed = parse_issue_line(1, &line)
+        let parsed = parse_issue_line(1, &serialized)
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
-        let serialized = serialize_issue(&parsed)
+        let reserialized = serialize_issue(&parsed)
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
-        let reparsed = serde_json::from_str::<Value>(&serialized)
-            .map_err(|error| TestCaseError::fail(error.to_string()))?;
-        let Value::Object(after) = reparsed else {
-            return Err(TestCaseError::fail("serialized issue was not an object"));
-        };
-        for (field, before_bytes) in original_unknown {
-            let Some(after_value) = after.get(&field) else {
-                return Err(TestCaseError::fail(format!("missing unknown field {field}")));
-            };
-            let after_bytes = serde_json::to_string(after_value)
-                .map_err(|error| TestCaseError::fail(error.to_string()))?;
-            prop_assert_eq!(before_bytes, after_bytes);
-        }
+        prop_assert_eq!(serialized, reserialized);
     }
+}
+
+#[test]
+fn unknown_fields_survive_write_read_cycle_byte_for_byte() -> TestResult {
+    let temp = TempDir::new()?;
+    let issues_dir = temp.path().join("issues");
+    fs::create_dir_all(&issues_dir)?;
+    let line = v1_issue_with_future_fields();
+    let path = issues_dir.join("issues.jsonl");
+    fs::write(&path, format!("{line}\n"))?;
+
+    let tracker = JsonlTracker::new(temp.path());
+    let loaded = tracker.load_issues()?;
+    let issue = loaded
+        .into_iter()
+        .next()
+        .ok_or_else(|| io::Error::other("expected one loaded issue"))?;
+    let serialized = serialize_issue(&issue)?;
+    fs::write(&path, format!("{serialized}\n"))?;
+
+    let reloaded = tracker.load_issues()?;
+    let issue = reloaded
+        .first()
+        .ok_or_else(|| io::Error::other("expected one reloaded issue"))?;
+    assert_eq!(serialize_issue(issue)?, line);
+    assert_eq!(
+        issue.extra.get("future_field"),
+        Some(&serde_json::json!([1, 2, 3]))
+    );
+    assert_eq!(
+        issue.extra.get("another"),
+        Some(&serde_json::json!({"nested": true}))
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_issue_defaults_schema_version_and_writes_v1() -> TestResult {
+    let temp = TempDir::new()?;
+    let issues_dir = temp.path().join("issues");
+    fs::create_dir_all(&issues_dir)?;
+    let legacy = issue_json("XSY-0200", "todo", Vec::new())?;
+    let path = issues_dir.join("issues.jsonl");
+    fs::write(&path, format!("{legacy}\n"))?;
+
+    let tracker = JsonlTracker::new(temp.path());
+    let loaded = tracker.load_issues()?;
+    let issue = loaded
+        .first()
+        .ok_or_else(|| io::Error::other("expected one legacy issue"))?;
+    assert_eq!(issue.schema_version, 1);
+
+    let serialized = serialize_issue(issue)?;
+    fs::write(&path, format!("{serialized}\n"))?;
+    let written = fs::read_to_string(&path)?;
+    assert!(written.starts_with("{\"schema_version\":1,"));
+    Ok(())
+}
+
+#[test]
+fn canned_v1_fixture_is_byte_stable() -> TestResult {
+    let parsed = parse_issue_line(1, V1_ISSUE_FIXTURE)?;
+    assert_eq!(parsed.schema_version, 1);
+    assert_eq!(serialize_issue(&parsed)?, V1_ISSUE_FIXTURE);
+    Ok(())
 }
 
 fn init_repo() -> TestResult<TempDir> {
@@ -354,30 +400,240 @@ fn issue_json(id: &str, state: &str, blockers: Vec<(&str, &str)>) -> TestResult<
     serde_json::to_string(&value).map_err(Into::into)
 }
 
-fn base_issue_object() -> Map<String, Value> {
-    let mut object = Map::new();
-    object.insert("id".to_owned(), Value::String("XSY-0100".to_owned()));
-    object.insert(
-        "identifier".to_owned(),
-        Value::String("XSY-0100".to_owned()),
+const fn v1_issue_with_future_fields() -> &'static str {
+    "{\"schema_version\":1,\"id\":\"XSY-0101\",\"identifier\":\"XSY-0101\",\"title\":\"Future fields\",\"description\":\"test issue\",\"priority\":2,\"state\":\"todo\",\"branch_name\":null,\"url\":null,\"labels\":[\"x0x-symphony\"],\"blocked_by\":[],\"created_at\":\"2026-07-02T00:00:00Z\",\"updated_at\":\"2026-07-02T00:00:00Z\",\"another\":{\"nested\":true},\"future_field\":[1,2,3]}"
+}
+
+fn arbitrary_issue_strategy() -> BoxedStrategy<Issue> {
+    let identity = (
+        issue_id_strategy(),
+        non_empty_text_strategy(),
+        text_strategy(),
+        prop::option::of(0_u8..=5),
+        issue_state_strategy(),
     );
-    object.insert("title".to_owned(), Value::String("Property".to_owned()));
-    object.insert("description".to_owned(), Value::String(String::new()));
-    object.insert("priority".to_owned(), Value::Number(2_u8.into()));
-    object.insert("state".to_owned(), Value::String("todo".to_owned()));
-    object.insert("branch_name".to_owned(), Value::Null);
-    object.insert("url".to_owned(), Value::Null);
-    object.insert("labels".to_owned(), Value::Array(Vec::new()));
-    object.insert("blocked_by".to_owned(), Value::Array(Vec::new()));
-    object.insert(
-        "created_at".to_owned(),
-        Value::String("2026-07-02T00:00:00Z".to_owned()),
+    let metadata = (
+        prop::option::of(non_empty_text_strategy()),
+        prop::option::of(non_empty_text_strategy()),
+        prop::collection::vec(label_strategy(), 0..4),
+        prop::collection::vec(issue_ref_strategy(), 0..3),
     );
-    object.insert(
-        "updated_at".to_owned(),
-        Value::String("2026-07-02T00:00:00Z".to_owned()),
+    let symphony = (
+        prop::option::of(shard_strategy()),
+        prop::option::of(claim_strategy()),
+        prop::option::of(handoff_strategy()),
     );
-    object
+    let timestamps = (
+        timestamp_strategy(),
+        timestamp_strategy(),
+        issue_extra_strategy(),
+    );
+
+    (identity, metadata, symphony, timestamps)
+        .prop_map(
+            |(
+                (id, title, description, priority, state),
+                (branch_name, url, labels, blocked_by),
+                (shard, claim, handoff),
+                (created_at, updated_at, extra),
+            )| Issue {
+                schema_version: 1,
+                identifier: id.as_str().to_owned(),
+                id,
+                title,
+                description,
+                priority,
+                state,
+                branch_name,
+                url,
+                labels,
+                blocked_by,
+                shard,
+                claim,
+                handoff,
+                created_at,
+                updated_at,
+                extra,
+            },
+        )
+        .boxed()
+}
+
+fn issue_id_strategy() -> impl Strategy<Value = IssueId> {
+    (1_u32..10_000).prop_filter_map("valid issue id", |suffix| {
+        IssueId::new(format!("XSY-{suffix:04}")).ok()
+    })
+}
+
+fn agent_id_strategy() -> impl Strategy<Value = AgentId> {
+    (1_u32..10_000).prop_filter_map("valid agent id", |suffix| {
+        AgentId::new(format!("agent-{suffix:04}")).ok()
+    })
+}
+
+fn issue_state_strategy() -> impl Strategy<Value = IssueState> {
+    prop::sample::select(vec![
+        "todo",
+        "in_progress",
+        "review",
+        "blocked",
+        "done",
+        "cancelled",
+        "duplicate",
+    ])
+    .prop_filter_map("valid issue state", |state| IssueState::new(state).ok())
+}
+
+fn issue_ref_strategy() -> impl Strategy<Value = IssueRef> {
+    (issue_id_strategy(), issue_state_strategy()).prop_map(|(id, state)| {
+        let identifier = id.as_str().to_owned();
+        IssueRef::new(id, identifier, state)
+    })
+}
+
+fn shard_strategy() -> impl Strategy<Value = Shard> {
+    (
+        agent_id_strategy(),
+        prop::collection::vec(agent_id_strategy(), 0..3),
+        1_u64..3_600_001,
+        0_u64..100,
+    )
+        .prop_map(|(primary, backups, claim_ttl_ms, created_view_epoch)| {
+            Shard::new(primary, backups, claim_ttl_ms, created_view_epoch)
+        })
+}
+
+fn shard_role_strategy() -> impl Strategy<Value = ShardRole> {
+    prop_oneof![
+        Just(ShardRole::Primary),
+        (0_usize..3).prop_map(ShardRole::Backup),
+        Just(ShardRole::ManualM1),
+    ]
+}
+
+fn claim_strategy() -> impl Strategy<Value = Claim> {
+    (
+        prop::option::of(issue_id_strategy()),
+        agent_id_strategy(),
+        timestamp_strategy(),
+        timestamp_strategy(),
+        shard_role_strategy(),
+        prop::option::of(non_empty_text_strategy()),
+    )
+        .prop_map(
+            |(issue_id, by, at, heartbeat_at, shard_role, signature)| Claim {
+                issue_id,
+                by,
+                at,
+                heartbeat_at,
+                shard_role,
+                signature,
+            },
+        )
+}
+
+fn handoff_strategy() -> impl Strategy<Value = Handoff> {
+    (
+        non_empty_text_strategy(),
+        prop::collection::vec(path_strategy(), 0..4),
+        prop::collection::vec(validation_result_strategy(), 0..3),
+        prop::collection::vec(text_strategy(), 0..3),
+        prop::option::of(path_strategy()),
+    )
+        .prop_map(
+            |(summary, files_changed, validation, follow_up, proofs_dir)| Handoff {
+                summary,
+                files_changed,
+                validation,
+                follow_up,
+                proofs_dir,
+            },
+        )
+}
+
+fn validation_result_strategy() -> impl Strategy<Value = ValidationResult> {
+    (
+        non_empty_text_strategy(),
+        validation_status_strategy(),
+        prop::option::of(-255_i32..=255_i32),
+    )
+        .prop_map(|(command, status, exit_code)| ValidationResult {
+            command,
+            status,
+            exit_code,
+        })
+}
+
+fn validation_status_strategy() -> impl Strategy<Value = ValidationStatus> {
+    prop_oneof![
+        Just(ValidationStatus::Passed),
+        Just(ValidationStatus::Failed),
+        Just(ValidationStatus::Skipped),
+    ]
+}
+
+fn issue_extra_strategy() -> impl Strategy<Value = BTreeMap<String, Value>> {
+    let acceptance = prop::collection::vec(text_strategy(), 0..3).prop_map(strings_value);
+    let validation = prop::collection::vec(text_strategy(), 0..3).prop_map(strings_value);
+    let links = prop::collection::vec(non_empty_text_strategy(), 0..3).prop_map(strings_value);
+    let unknown = prop::collection::btree_map("x_[a-z][a-z0-9_]{0,8}", json_value_strategy(), 0..4);
+
+    (acceptance, validation, links, unknown).prop_map(
+        |(acceptance, validation, links, mut unknown)| {
+            unknown.insert("acceptance".to_owned(), acceptance);
+            unknown.insert("validation".to_owned(), validation);
+            unknown.insert("links".to_owned(), links);
+            unknown
+        },
+    )
+}
+
+fn json_value_strategy() -> BoxedStrategy<Value> {
+    let leaf = prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::Bool),
+        (-10_000_i64..=10_000_i64).prop_map(|number| Value::Number(number.into())),
+        text_strategy().prop_map(Value::String),
+    ];
+
+    leaf.prop_recursive(3, 16, 3, |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..3).prop_map(Value::Array),
+            prop::collection::btree_map("[a-z][a-z0-9_]{0,8}", inner, 0..3).prop_map(|entries| {
+                let mut object = Map::new();
+                for (key, value) in entries {
+                    object.insert(key, value);
+                }
+                Value::Object(object)
+            }),
+        ]
+    })
+    .boxed()
+}
+
+fn strings_value(strings: Vec<String>) -> Value {
+    Value::Array(strings.into_iter().map(Value::String).collect())
+}
+
+fn non_empty_text_strategy() -> impl Strategy<Value = String> {
+    "[A-Za-z0-9][A-Za-z0-9 _.,:/-]{0,48}"
+}
+
+fn text_strategy() -> impl Strategy<Value = String> {
+    "[A-Za-z0-9 _.,:/-]{0,48}"
+}
+
+fn label_strategy() -> impl Strategy<Value = String> {
+    "[a-z][a-z0-9-]{0,16}"
+}
+
+fn path_strategy() -> impl Strategy<Value = String> {
+    "[a-z][a-z0-9_.-]{0,16}".prop_map(|name| format!("src/{name}.rs"))
+}
+
+fn timestamp_strategy() -> impl Strategy<Value = String> {
+    (0_u32..60, 0_u32..60)
+        .prop_map(|(minute, second)| format!("2026-07-02T00:{minute:02}:{second:02}Z"))
 }
 
 #[tokio::test]

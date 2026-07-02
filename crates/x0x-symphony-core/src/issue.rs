@@ -2,10 +2,16 @@
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::{Result, SymphonyError};
+
+const ISSUE_SCHEMA_VERSION_V1: u32 = 1;
+
+const fn default_issue_schema_version() -> u32 {
+    ISSUE_SCHEMA_VERSION_V1
+}
 
 /// Stable tracker identifier for an issue.
 ///
@@ -275,6 +281,16 @@ impl IssueRef {
 /// Unknown JSON fields are preserved in [`Issue::extra`] so bootstrap adapters
 /// can round-trip records while later milestones extend the schema.
 ///
+/// # Schema freeze and signatures
+///
+/// `schema_version == 1` is the M2 freeze for today's issue, claim, shard, and
+/// handoff fields. Future schema evolution is additive-only: new fields must be
+/// optional and must not rename, remove, or re-type v1 fields.
+///
+/// Signatures (XSY-0020) cover the EXACT stored payload bytes — the serialized
+/// claim/handoff as written — never a re-derived canonical projection.
+/// Therefore additive schema growth can never invalidate an existing signature.
+///
 /// # Examples
 ///
 /// ```
@@ -290,8 +306,14 @@ impl IssueRef {
 /// assert_eq!(issue.identifier, "XSY-0002");
 /// # Ok::<(), x0x_symphony_core::SymphonyError>(())
 /// ```
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct Issue {
+    /// Issue schema version.
+    ///
+    /// Version `1` is the M2 freeze. It is emitted on every write; legacy
+    /// records without this field deserialize as version `1`.
+    #[serde(default = "default_issue_schema_version")]
+    pub schema_version: u32,
     /// Stable tracker-internal identifier.
     pub id: IssueId,
     /// Human-readable issue key.
@@ -328,6 +350,65 @@ pub struct Issue {
     /// Adapter-specific fields preserved across read/write cycles.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl Serialize for Issue {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut issue = serializer.serialize_map(None)?;
+        issue.serialize_entry("schema_version", &ISSUE_SCHEMA_VERSION_V1)?;
+        issue.serialize_entry("id", &self.id)?;
+        issue.serialize_entry("identifier", &self.identifier)?;
+        issue.serialize_entry("title", &self.title)?;
+        issue.serialize_entry("description", &self.description)?;
+        issue.serialize_entry("priority", &self.priority)?;
+        issue.serialize_entry("state", &self.state)?;
+        issue.serialize_entry("branch_name", &self.branch_name)?;
+        issue.serialize_entry("url", &self.url)?;
+        issue.serialize_entry("labels", &self.labels)?;
+        issue.serialize_entry("blocked_by", &self.blocked_by)?;
+        if let Some(shard) = &self.shard {
+            issue.serialize_entry("shard", shard)?;
+        }
+        if let Some(claim) = &self.claim {
+            issue.serialize_entry("claim", claim)?;
+        }
+        if let Some(handoff) = &self.handoff {
+            issue.serialize_entry("handoff", handoff)?;
+        }
+        issue.serialize_entry("created_at", &self.created_at)?;
+        issue.serialize_entry("updated_at", &self.updated_at)?;
+        for (key, value) in &self.extra {
+            if !is_issue_field(key) {
+                issue.serialize_entry(key, value)?;
+            }
+        }
+        issue.end()
+    }
+}
+
+fn is_issue_field(key: &str) -> bool {
+    matches!(
+        key,
+        "schema_version"
+            | "id"
+            | "identifier"
+            | "title"
+            | "description"
+            | "priority"
+            | "state"
+            | "branch_name"
+            | "url"
+            | "labels"
+            | "blocked_by"
+            | "shard"
+            | "claim"
+            | "handoff"
+            | "created_at"
+            | "updated_at"
+    )
 }
 
 impl Issue {
@@ -382,6 +463,7 @@ impl Issue {
             ));
         }
         Ok(Self {
+            schema_version: ISSUE_SCHEMA_VERSION_V1,
             id,
             identifier,
             title,

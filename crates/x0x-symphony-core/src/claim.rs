@@ -6,8 +6,9 @@ use crate::{AgentId, IssueId};
 
 /// Role held by a claimant inside an issue's frozen shard slate.
 ///
-/// M1 manual work uses [`ShardRole::ManualM1`]. M2 and later use the primary
-/// and backup roles described in ADR-0002.
+/// Operators may use [`ShardRole::ManualM1`] for hand-assigned claims even when
+/// real shard slates exist. The `ManualM1` variant name is permanent for v1
+/// byte stability; the `M1` suffix is historical, not temporary.
 ///
 /// # Examples
 ///
@@ -24,7 +25,9 @@ pub enum ShardRole {
     Primary,
     /// A backup owner may claim after the primary heartbeat expires.
     Backup(usize),
-    /// Manual bootstrap claim used before M2 writes shard records.
+    /// Permanent operator-hand-assigned claim role.
+    ///
+    /// Serialized as `manual_m1` for v1 byte stability.
     ManualM1,
 }
 
