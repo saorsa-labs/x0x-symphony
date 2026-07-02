@@ -40,6 +40,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let data_dir = config::expand_tilde_path(&args.data_dir, "data-dir")?;
     let workflow = config::WorkflowConfig::load(&args.config)?;
     let tracker_paths = workflow.tracker_paths(&args.config)?;
+    let proofs_dir = tracker_paths.repo_root.join("proofs");
     let api_token = auth::load_or_generate_api_token(&data_dir).await?;
     let signing_client = if workflow.signing.policy == SigningPolicy::Required {
         Some(Arc::new(
@@ -74,7 +75,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Manager::new(WorkspaceConfig::new(workflow.workspace.root.clone()))
             .context("failed to initialize workspace manager")?,
     );
-    let orchestrator_config = workflow.to_orchestrator_config(agent_id.clone())?;
+    let orchestrator_config = workflow
+        .to_orchestrator_config(agent_id.clone())?
+        .with_proofs_dir(proofs_dir.clone());
     let orchestrator = Arc::new(Orchestrator::new(
         tracker,
         runner,
@@ -101,7 +104,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         agent_id,
         api_token,
         Some(orchestrator_handle),
-    );
+    )
+    .with_proofs_dir(proofs_dir);
     let app = api::build_router(app_state);
     let listener = TcpListener::bind(bind_addr)
         .await

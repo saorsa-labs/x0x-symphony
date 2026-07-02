@@ -21,10 +21,13 @@ use x0x_symphony_core::{
     WorkspaceHandle,
 };
 
-use crate::{clock::Clock, error::Result, reconcile::is_fresh_self, Orchestrator};
-// `Error` is referenced only via `Error::NotEligible` / `Error::PoisonedState`;
-// re-exported through `error` for the variants below.
-use crate::error::Error;
+use crate::{
+    clock::Clock,
+    error::{Error, Result},
+    proofs::{join_event_writer, ProofRun},
+    reconcile::is_fresh_self,
+    Orchestrator,
+};
 
 /// Why a polled candidate may (or may not) be taken by this agent now.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,7 +145,30 @@ pub enum Resolution {
 /// Carries a runner session through `select!` so shutdown can preempt it.
 struct RunTurnOutcome {
     status: TurnStatus,
+    summary: Option<String>,
     session: x0x_symphony_core::SessionHandle,
+}
+
+/// Result of racing one runner turn against a shutdown signal.
+enum RunSelection {
+    /// Shutdown won the race and still owns the runner session.
+    Shutdown(x0x_symphony_core::SessionHandle),
+    /// The runner turn completed or errored.
+    Turn(Result<RunTurnOutcome>),
+}
+
+/// Completed runner turn data needed after session cleanup.
+struct CompletedTurn {
+    status: TurnStatus,
+    summary: Option<String>,
+}
+
+/// Outcome of one dispatch attempt.
+enum AttemptOutcome {
+    /// Shutdown won the race and the claim was released.
+    ShutdownReleased,
+    /// The runner turn completed and can be classified by the retry loop.
+    Completed(CompletedTurn),
 }
 
 /// Lets `select!` await `run_turn` while keeping the session handle for the
@@ -175,6 +201,7 @@ impl<R: Runner> RunTurnExt for R {
         let outcome = self.run_turn(&mut session, prompt).await?;
         Ok(RunTurnOutcome {
             status: outcome.status,
+            summary: outcome.summary,
             session,
         })
     }
@@ -197,6 +224,37 @@ fn claim_env_id(claim: &Claim) -> String {
         Some(issue_id) => format!("{}:{}:{}", issue_id.as_str(), claim.by.as_str(), claim.at),
         None => format!("{}:{}", claim.by.as_str(), claim.at),
     }
+}
+
+fn hook_status_name(status: &HookStatus) -> &'static str {
+    match status {
+        HookStatus::Succeeded => "succeeded",
+        HookStatus::Failed => "failed",
+        HookStatus::TimedOut => "timed_out",
+    }
+}
+
+fn turn_exit_code(status: &TurnStatus, summary: Option<&str>) -> i32 {
+    match status {
+        TurnStatus::Succeeded => parse_exit_code(summary).unwrap_or(0),
+        TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled => {
+            parse_exit_code(summary)
+                .filter(|code| *code != 0)
+                .unwrap_or(1)
+        }
+    }
+}
+
+fn parse_exit_code(summary: Option<&str>) -> Option<i32> {
+    let summary = summary?;
+    for part in summary.split(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';') {
+        if let Some(raw) = part.strip_prefix("exit_code=") {
+            if let Ok(value) = raw.parse::<i32>() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 impl<T, R, W> Orchestrator<T, R, W>
@@ -241,14 +299,30 @@ where
         );
 
         let issue = self.fetch_claim_issue(&claim).await?;
+        let mut proof = ProofRun::start(
+            &self.config.proofs_dir,
+            &issue,
+            &self.config.agent_id,
+            self.runner.name(),
+            self.runner.capabilities(),
+            self.clock.now(),
+        )?;
         let handle = self.workspace.create(&issue).await?;
         let workspace_path = handle.path.clone();
 
         if self
-            .block_if_hook_failed(&mut guard, &claim, &handle, HookName::AfterCreate)
+            .block_if_hook_failed(
+                &mut guard,
+                &claim,
+                &handle,
+                HookName::AfterCreate,
+                &mut proof,
+            )
             .await?
         {
-            self.cleanup_if_terminal(&claim, &handle, "blocked").await?;
+            self.cleanup_if_terminal(&claim, &handle, "blocked", &mut proof)
+                .await?;
+            proof.finish(1, self.clock.now())?;
             return Ok(Resolution::Blocked);
         }
 
@@ -257,39 +331,26 @@ where
         loop {
             attempts += 1;
             if self
-                .block_if_hook_failed(&mut guard, &claim, &handle, HookName::BeforeRun)
+                .block_if_hook_failed(&mut guard, &claim, &handle, HookName::BeforeRun, &mut proof)
                 .await?
             {
-                self.cleanup_if_terminal(&claim, &handle, "blocked").await?;
+                self.cleanup_if_terminal(&claim, &handle, "blocked", &mut proof)
+                    .await?;
+                proof.finish(1, self.clock.now())?;
                 return Ok(Resolution::Blocked);
             }
 
-            let session = self
-                .runner
-                .start_session(SessionContext::new(issue.clone(), workspace_path.clone()))
-                .await?;
-            let prompt = Prompt::new(issue.description.clone());
-            // The run-turn branch takes ownership; clone first so the shutdown
-            // branch still owns a handle to stop the same runner-side session.
-            let run_session = session.clone();
-            let outcome = tokio::select! {
-                biased;
-                () = self.shutdown_signaled() => {
-                    let _ = self.runner.stop_session(session).await;
-                    guard.cancel_heartbeat();
-                    self.tracker
-                        .release(
-                            &claim,
-                            ReleaseReason::new(ReleaseReasonCode::Shutdown, "graceful shutdown"),
-                        )
-                        .await?;
-                    return Ok(Resolution::ShutdownReleased);
-                }
-                outcome = self.runner.run_turn_prompt(run_session, prompt) => outcome?,
+            let outcome = match self
+                .run_attempt(&claim, &mut guard, &issue, &workspace_path, &mut proof)
+                .await?
+            {
+                AttemptOutcome::ShutdownReleased => return Ok(Resolution::ShutdownReleased),
+                AttemptOutcome::Completed(outcome) => outcome,
             };
-            let _ = self.runner.stop_session(outcome.session).await;
 
-            self.warn_after_run_hook_failure(&claim, &handle).await;
+            self.warn_after_run_hook_failure(&claim, &handle, &mut proof)
+                .await;
+            let exit_code = turn_exit_code(&outcome.status, outcome.summary.as_deref());
 
             match outcome.status {
                 TurnStatus::Succeeded => {
@@ -297,10 +358,13 @@ where
                         "runner '{}' succeeded after {attempts} attempt(s)",
                         self.runner.name()
                     ))
-                    .with_file(workspace_path.to_string_lossy().into_owned());
+                    .with_file(workspace_path.to_string_lossy().into_owned())
+                    .with_proofs_dir(proof.relative_dir().to_owned());
                     guard.cancel_heartbeat();
                     self.tracker.handoff(&claim, handoff).await?;
-                    self.cleanup_if_terminal(&claim, &handle, "review").await?;
+                    self.cleanup_if_terminal(&claim, &handle, "review", &mut proof)
+                        .await?;
+                    proof.finish(exit_code, self.clock.now())?;
                     return Ok(Resolution::Completed);
                 }
                 TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled
@@ -319,7 +383,9 @@ where
                             ),
                         )
                         .await?;
-                    self.cleanup_if_terminal(&claim, &handle, "blocked").await?;
+                    self.cleanup_if_terminal(&claim, &handle, "blocked", &mut proof)
+                        .await?;
+                    proof.finish(exit_code, self.clock.now())?;
                     return Ok(Resolution::Blocked);
                 }
                 TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled => {
@@ -331,18 +397,85 @@ where
         }
     }
 
+    async fn run_attempt(
+        &self,
+        claim: &Claim,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        issue: &Issue,
+        workspace_path: &std::path::Path,
+        proof: &mut ProofRun,
+    ) -> Result<AttemptOutcome> {
+        let session = self
+            .runner
+            .start_session(SessionContext::new(
+                issue.clone(),
+                workspace_path.to_path_buf(),
+            ))
+            .await?;
+        let event_writer = proof.spawn_event_writer(
+            self.runner.stream_events(&session),
+            workspace_path.to_path_buf(),
+        );
+        let prompt = Prompt::new(issue.description.clone());
+        // The run-turn branch takes ownership; clone first so the shutdown
+        // branch still owns a handle to stop the same runner-side session. A
+        // second clone lets us clean up if the runner errors without returning
+        // its session handle.
+        let run_session = session.clone();
+        let stop_on_error = session.clone();
+        let selected = tokio::select! {
+            biased;
+            () = self.shutdown_signaled() => RunSelection::Shutdown(session),
+            outcome = self.runner.run_turn_prompt(run_session, prompt) => {
+                RunSelection::Turn(outcome)
+            }
+        };
+        let outcome = match selected {
+            RunSelection::Shutdown(session) => {
+                let _ = self.runner.stop_session(session).await;
+                join_event_writer(event_writer).await?;
+                guard.cancel_heartbeat();
+                self.tracker
+                    .release(
+                        claim,
+                        ReleaseReason::new(ReleaseReasonCode::Shutdown, "graceful shutdown"),
+                    )
+                    .await?;
+                proof.finish(1, self.clock.now())?;
+                return Ok(AttemptOutcome::ShutdownReleased);
+            }
+            RunSelection::Turn(Ok(outcome)) => outcome,
+            RunSelection::Turn(Err(error)) => {
+                let _ = self.runner.stop_session(stop_on_error).await;
+                join_event_writer(event_writer).await?;
+                return Err(error);
+            }
+        };
+        let _ = self.runner.stop_session(outcome.session).await;
+        join_event_writer(event_writer).await?;
+        Ok(AttemptOutcome::Completed(CompletedTurn {
+            status: outcome.status,
+            summary: outcome.summary,
+        }))
+    }
+
     async fn block_if_hook_failed(
         &self,
         guard: &mut HeldClaim<'_, T, R, W>,
         claim: &Claim,
         handle: &WorkspaceHandle,
         phase: HookName,
+        proof: &mut ProofRun,
     ) -> Result<bool> {
         let phase_name = phase.as_str();
         match self.run_hook_phase(claim, handle, phase).await {
             Ok(None) => Ok(false),
-            Ok(Some(outcome)) if outcome.status.is_success() => Ok(false),
+            Ok(Some(outcome)) if outcome.status.is_success() => {
+                proof.record_hook(phase_name, hook_status_name(&outcome.status));
+                Ok(false)
+            }
             Ok(Some(outcome)) => {
+                proof.record_hook(phase_name, hook_status_name(&outcome.status));
                 self.block_for_hook_failure(
                     guard,
                     claim,
@@ -353,6 +486,7 @@ where
                 Ok(true)
             }
             Err(error) => {
+                proof.record_hook(phase_name, "errored");
                 self.block_for_hook_failure(guard, claim, phase_name, error.to_string())
                     .await?;
                 Ok(true)
@@ -380,16 +514,25 @@ where
         Ok(())
     }
 
-    async fn warn_after_run_hook_failure(&self, claim: &Claim, handle: &WorkspaceHandle) {
+    async fn warn_after_run_hook_failure(
+        &self,
+        claim: &Claim,
+        handle: &WorkspaceHandle,
+        proof: &mut ProofRun,
+    ) {
         match self.run_hook_phase(claim, handle, HookName::AfterRun).await {
-            Ok(
-                None
-                | Some(HookOutcome {
-                    status: HookStatus::Succeeded,
-                    ..
-                }),
-            ) => {}
+            Ok(None) => {}
+            Ok(Some(outcome)) if outcome.status.is_success() => {
+                proof.record_hook(
+                    HookName::AfterRun.as_str(),
+                    hook_status_name(&outcome.status),
+                );
+            }
             Ok(Some(outcome)) => {
+                proof.record_hook(
+                    HookName::AfterRun.as_str(),
+                    hook_status_name(&outcome.status),
+                );
                 warn!(
                     issue_id = handle.issue_id.as_str(),
                     detail = %describe_hook_outcome(&outcome),
@@ -397,6 +540,7 @@ where
                 );
             }
             Err(error) => {
+                proof.record_hook(HookName::AfterRun.as_str(), "errored");
                 warn!(
                     issue_id = handle.issue_id.as_str(),
                     error = %error,
@@ -411,6 +555,7 @@ where
         claim: &Claim,
         handle: &WorkspaceHandle,
         state_name: &str,
+        proof: &mut ProofRun,
     ) -> Result<()> {
         if !self
             .config
@@ -421,25 +566,38 @@ where
             return Ok(());
         }
 
-        if self.before_remove_allows_cleanup(claim, handle).await {
+        if self
+            .before_remove_allows_cleanup(claim, handle, proof)
+            .await
+        {
             self.workspace.destroy(handle.clone()).await?;
         }
         Ok(())
     }
 
-    async fn before_remove_allows_cleanup(&self, claim: &Claim, handle: &WorkspaceHandle) -> bool {
+    async fn before_remove_allows_cleanup(
+        &self,
+        claim: &Claim,
+        handle: &WorkspaceHandle,
+        proof: &mut ProofRun,
+    ) -> bool {
         match self
             .run_hook_phase(claim, handle, HookName::BeforeRemove)
             .await
         {
-            Ok(
-                None
-                | Some(HookOutcome {
-                    status: HookStatus::Succeeded,
-                    ..
-                }),
-            ) => true,
+            Ok(None) => true,
+            Ok(Some(outcome)) if outcome.status.is_success() => {
+                proof.record_hook(
+                    HookName::BeforeRemove.as_str(),
+                    hook_status_name(&outcome.status),
+                );
+                true
+            }
             Ok(Some(outcome)) => {
+                proof.record_hook(
+                    HookName::BeforeRemove.as_str(),
+                    hook_status_name(&outcome.status),
+                );
                 warn!(
                     issue_id = handle.issue_id.as_str(),
                     detail = %describe_hook_outcome(&outcome),
@@ -448,6 +606,7 @@ where
                 false
             }
             Err(error) => {
+                proof.record_hook(HookName::BeforeRemove.as_str(), "errored");
                 warn!(
                     issue_id = handle.issue_id.as_str(),
                     error = %error,

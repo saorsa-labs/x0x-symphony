@@ -58,9 +58,13 @@ impl ShellRunner {
     /// Returns an error when the static portion of the spec is invalid.
     pub fn new(spec: RunnerSpec) -> Result<Self> {
         spec.validate()?;
-        let mut capabilities = RunnerCapabilities::new("shell");
+        let mut capabilities = RunnerCapabilities::new("shell")
+            .with_command_line(spec.command.clone(), spec.args.clone())
+            .with_env_allowlist(spec.env.keys().cloned());
         if let Some(preset) = spec.preset {
-            capabilities = capabilities.with_label(preset.as_str());
+            capabilities = capabilities
+                .with_label(preset.as_str())
+                .with_preset(preset.as_str());
         }
         let sandbox = spec
             .sandbox

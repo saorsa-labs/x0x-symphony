@@ -23,6 +23,7 @@ pub mod concurrency;
 pub mod dispatch;
 pub mod error;
 pub mod orphans;
+mod proofs;
 pub mod reconcile;
 pub mod retry;
 
@@ -36,6 +37,7 @@ pub use retry::RetryPolicy;
 
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -96,6 +98,8 @@ pub struct Config {
     pub retry: RetryPolicy,
     /// Lifecycle hook scripts and timeout.
     pub hooks: LifecycleHooks,
+    /// Root directory where dispatch proof artefacts are written.
+    pub proofs_dir: PathBuf,
     /// Claim heartbeat TTL; a claim older than this is stale.
     pub claim_ttl: chrono::Duration,
     /// Maximum time to wait for in-flight runs to release on shutdown.
@@ -118,9 +122,17 @@ impl Config {
             per_state_concurrency: BTreeMap::new(),
             retry: RetryPolicy::default(),
             hooks: LifecycleHooks::default(),
+            proofs_dir: PathBuf::from("proofs"),
             claim_ttl: chrono::Duration::minutes(30),
             shutdown_grace: Duration::from_mins(1),
         }
+    }
+
+    /// Return a copy configured to write proofs under `proofs_dir`.
+    #[must_use]
+    pub fn with_proofs_dir(mut self, proofs_dir: impl Into<PathBuf>) -> Self {
+        self.proofs_dir = proofs_dir.into();
+        self
     }
 
     /// Heartbeat interval: one quarter of the claim TTL, never zero.
@@ -151,6 +163,7 @@ pub struct ConfigBuilder {
     per_state_concurrency: BTreeMap<IssueState, usize>,
     retry: RetryPolicy,
     hooks: LifecycleHooks,
+    proofs_dir: PathBuf,
     claim_ttl: chrono::Duration,
     shutdown_grace: Duration,
 }
@@ -198,6 +211,12 @@ impl ConfigBuilder {
         self.hooks = hooks;
         self
     }
+    /// Override the proof artefact root.
+    #[must_use]
+    pub fn proofs_dir(mut self, proofs_dir: impl Into<PathBuf>) -> Self {
+        self.proofs_dir = proofs_dir.into();
+        self
+    }
     /// Override the claim TTL.
     #[must_use]
     pub fn claim_ttl(mut self, ttl: chrono::Duration) -> Self {
@@ -222,6 +241,7 @@ impl ConfigBuilder {
             per_state_concurrency: self.per_state_concurrency,
             retry: self.retry,
             hooks: self.hooks,
+            proofs_dir: self.proofs_dir,
             claim_ttl: self.claim_ttl,
             shutdown_grace: self.shutdown_grace,
         }

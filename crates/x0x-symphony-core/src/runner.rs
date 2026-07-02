@@ -131,6 +131,18 @@ pub struct RunnerCapabilities {
     pub labels: Vec<String>,
     /// Whether the runner can produce structured events.
     pub structured_events: bool,
+    /// Preset name that resolved this runner, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Executable command used by process-backed runners, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Static argument vector used by process-backed runners.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Names of environment variables explicitly forwarded to the runner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_allowlist: Vec<String>,
 }
 
 impl RunnerCapabilities {
@@ -150,6 +162,10 @@ impl RunnerCapabilities {
             runner_kind: runner_kind.into(),
             labels: Vec::new(),
             structured_events: false,
+            preset: None,
+            command: None,
+            args: Vec::new(),
+            env_allowlist: Vec::new(),
         }
     }
 
@@ -182,6 +198,63 @@ impl RunnerCapabilities {
     #[must_use]
     pub fn with_structured_events(mut self) -> Self {
         self.structured_events = true;
+        self
+    }
+
+    /// Return a copy with process command metadata attached.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use x0x_symphony_core::RunnerCapabilities;
+    ///
+    /// let caps = RunnerCapabilities::new("shell").with_command_line("codex", ["--full-auto"]);
+    /// assert_eq!(caps.command.as_deref(), Some("codex"));
+    /// ```
+    #[must_use]
+    pub fn with_command_line<I, S>(mut self, command: impl Into<String>, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.command = Some(command.into());
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Return a copy with a runner preset name attached.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use x0x_symphony_core::RunnerCapabilities;
+    ///
+    /// let caps = RunnerCapabilities::new("shell").with_preset("codex");
+    /// assert_eq!(caps.preset.as_deref(), Some("codex"));
+    /// ```
+    #[must_use]
+    pub fn with_preset(mut self, preset: impl Into<String>) -> Self {
+        self.preset = Some(preset.into());
+        self
+    }
+
+    /// Return a copy with the forwarded environment variable names attached.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use x0x_symphony_core::RunnerCapabilities;
+    ///
+    /// let caps = RunnerCapabilities::new("shell").with_env_allowlist(["PATH", "HOME"]);
+    /// assert_eq!(caps.env_allowlist, ["PATH", "HOME"]);
+    /// ```
+    #[must_use]
+    pub fn with_env_allowlist<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.env_allowlist = names.into_iter().map(Into::into).collect();
         self
     }
 }
