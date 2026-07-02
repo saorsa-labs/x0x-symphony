@@ -78,3 +78,30 @@ jobs:
 
       - name: Run cargo audit
         run: cargo audit
+
+  windows-check:
+    # Guard against platform-specific escapes: the v0x0.M1 release matrix
+    # failed on windows-x64 because `tokio::process::Child` was imported only
+    # under #[cfg(unix)] while the non-unix fallback still referenced it, and
+    # nothing in CI ever compiled the workspace for Windows. This job compiles
+    # the shipped library + binary code for Windows on every push so that class
+    # of defect cannot recur. Uses `cargo check` (no --all-targets) deliberately:
+    # the test suites are unix-cfg-gated and pull `nix`, a unix-only dev-dependency.
+    name: cargo check (Windows compile gate)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-check
+
+      - name: Check workspace compiles for Windows
+        run: cargo check --workspace --all-features

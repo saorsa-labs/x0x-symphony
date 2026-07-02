@@ -9,7 +9,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-#[cfg(unix)]
+// `Child` is used by both unix and non-unix `kill_process_group` bodies
+// (the non-unix fallback calls `start_kill` on it). Only the nix-based
+// process-group signalling inside the unix body needs `#[cfg(unix)]`.
 use tokio::process::Child;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
