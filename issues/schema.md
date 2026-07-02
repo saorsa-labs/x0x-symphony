@@ -131,6 +131,15 @@ Lower numbers are dispatched first:
 
 A `todo` issue with any non-terminal blocker must not be dispatched.
 
+> **Advisory snapshots — live resolution by `id` is authoritative.** The
+> `state` embedded in each `blocked_by` entry is a write-time snapshot and
+> may be stale (e.g. the blocker has since moved to `done`, as several
+> seeded entries do). Treat it as **advisory-only**. Authoritative blocker
+> resolution is **live by `id`**: an adapter must look up the referenced
+> issue's *current* `state` and act on that, never the embedded snapshot.
+> This is what the M1 `git_jsonl` adapter (XSY-0003) implements and what
+> the 2026-07 M1 execution plan §8 mandates.
+
 ## Update rules
 
 1. Keep `id` and `identifier` stable.

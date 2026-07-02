@@ -13,9 +13,14 @@ the shared backlog.
 
 ## Status
 
-Pre-1.0. Bootstrapping from a git-committed JSONL issue database; the v1.0
-shipping tracker is x0x's native CRDT TaskList, accessed through the local
-x0xd REST API.
+pre-M1 (design frozen, core traits only). The architecture and four ADRs are
+frozen; only the `x0x-symphony-core` traits crate is implemented so far. The
+M1 vertical slice (tracker → runner → workspace → orchestrator → daemon) is
+in flight — see
+[`docs/plan/2026-07-m1-execution-plan.md`](docs/plan/2026-07-m1-execution-plan.md).
+The v1.0 shipping tracker is x0x's native CRDT TaskList, accessed through the
+local x0xd REST API; until M3 the daemon reads only the operator-controlled
+`issues/issues.jsonl` backlog.
 
 ## Design
 
