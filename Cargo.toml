@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/x0x-symphony-core", "crates/x0x-symphony-runner-shell"]
+members = [
+    "crates/x0x-symphony-core",
+    "crates/x0x-symphony-tracker-git-jsonl",
+    "crates/x0x-symphony-runner-shell",
+]
 
 [workspace.package]
 version = "0.0.0"
