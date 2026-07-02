@@ -2108,6 +2108,7 @@ dependencies = [
  "tokio",
  "tracing",
  "x0x-symphony-core",
+ "x0x-symphony-tracker-git-jsonl",
  "x0x-symphony-workspace",
 ]
 

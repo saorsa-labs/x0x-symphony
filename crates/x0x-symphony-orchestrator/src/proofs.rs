@@ -15,7 +15,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::task::JoinHandle;
-use x0x_symphony_core::{AgentId, EventStream, Issue, RunnerCapabilities, RunnerEventKind};
+use x0x_symphony_core::{
+    AgentId, Claim, EventStream, Issue, ReleaseReason, RunnerCapabilities, RunnerEventKind,
+};
 use x0x_symphony_workspace::containment::{
     canonicalize_root, sanitize_issue_identifier, validate_existing_workspace_path,
 };
@@ -43,6 +45,15 @@ struct ProofManifest {
     hooks: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct AbandonManifest {
+    issue_id: String,
+    recorded_at: String,
+    abandoned_claim: Claim,
+    reason: ReleaseReason,
+    winning_agent_id: String,
+}
+
 #[derive(Clone, Debug)]
 struct RunnerManifestMetadata {
     runner_kind: String,
@@ -50,6 +61,41 @@ struct RunnerManifestMetadata {
     command: String,
     args: Vec<String>,
     env_allowlist: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProofDirectory<'a> {
+    root: &'a Path,
+}
+
+impl<'a> ProofDirectory<'a> {
+    pub(crate) const fn new(root: &'a Path) -> Self {
+        Self { root }
+    }
+
+    pub(crate) fn write_abandoned(
+        &self,
+        issue: &Issue,
+        abandoned_claim: &Claim,
+        reason: &ReleaseReason,
+        winning_claim: &Claim,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<String> {
+        let canonical_root = prepare_root(self.root)?;
+        let issue_segment = sanitize_segment(issue.id.as_str())?;
+        let issue_dir = ensure_child_dir(&canonical_root, issue_segment.as_str())?;
+        let base_timestamp = format!("{}-abandoned", timestamp_segment(recorded_at));
+        let (abandon_dir, abandon_segment) = create_unique_run_dir(&issue_dir, &base_timestamp)?;
+        let manifest = AbandonManifest {
+            issue_id: issue.id.to_string(),
+            recorded_at: recorded_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            abandoned_claim: abandoned_claim.clone(),
+            reason: reason.clone(),
+            winning_agent_id: winning_claim.by.to_string(),
+        };
+        write_json_file(&abandon_dir.join("abandon.json"), &manifest)?;
+        Ok(format!("proofs/{issue_segment}/{abandon_segment}"))
+    }
 }
 
 #[derive(Debug)]
@@ -137,19 +183,7 @@ impl ProofRun {
     }
 
     fn write_manifest(&self, manifest: &ProofManifest) -> Result<()> {
-        let path = self.dir.join(MANIFEST_JSON);
-        let mut file = File::create(&path).map_err(|source| Error::ProofIo {
-            path: path.clone(),
-            source,
-        })?;
-        serde_json::to_writer_pretty(&mut file, manifest)
-            .map_err(|source| Error::ProofJson { source })?;
-        file.write_all(b"\n").map_err(|source| Error::ProofIo {
-            path: path.clone(),
-            source,
-        })?;
-        file.sync_all()
-            .map_err(|source| Error::ProofIo { path, source })
+        write_json_file(&self.dir.join(MANIFEST_JSON), manifest)
     }
 }
 
@@ -323,6 +357,22 @@ fn append_file(path: &Path) -> Result<File> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let mut file = File::create(path).map_err(|source| Error::ProofIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::to_writer_pretty(&mut file, value).map_err(|source| Error::ProofJson { source })?;
+    file.write_all(b"\n").map_err(|source| Error::ProofIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.sync_all().map_err(|source| Error::ProofIo {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn write_all(file: &mut File, path: &Path, bytes: &[u8]) -> Result<()> {

@@ -30,6 +30,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+x0x-symphony-tracker-git-jsonl = { path = "../x0x-symphony-tracker-git-jsonl" }
 
 [lints]
 workspace = true

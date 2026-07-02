@@ -437,7 +437,7 @@ where
 
         let mut summary = ReconcileSummary::default();
         for (_id, issues) in by_issue {
-            if self.reconcile_conflict(&issues, &mut summary).await? {
+            if self.reconcile_conflict(&issues, &mut summary, now).await? {
                 continue;
             }
             let Some(issue) = issues.first() else {
@@ -483,6 +483,7 @@ where
         &self,
         issues: &[Issue],
         summary: &mut ReconcileSummary,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool> {
         let claims = issues
             .iter()
@@ -494,21 +495,22 @@ where
         let Some(winner) = reconcile::winning_conflict_claim(claims.iter().copied()) else {
             return Ok(true);
         };
-        for claim in claims {
+        let proof_directory = proofs::ProofDirectory::new(&self.config.proofs_dir);
+        for issue in issues {
+            let Some(claim) = issue.claim.as_ref() else {
+                continue;
+            };
             if claim != winner && claim.by.eq(&self.config.agent_id) {
-                self.tracker
-                    .release(
-                        claim,
-                        ReleaseReason::new(
-                            ReleaseReasonCode::Conflict,
-                            format!(
-                                "duplicate claim abandoned; winner {} has shard rank {}",
-                                winner.by,
-                                winner.shard_role.rank()
-                            ),
-                        ),
-                    )
-                    .await?;
+                let reason = ReleaseReason::new(
+                    ReleaseReasonCode::Conflict,
+                    format!(
+                        "duplicate claim abandoned; winner {} has shard rank {}",
+                        winner.by,
+                        winner.shard_role.rank()
+                    ),
+                );
+                self.tracker.release(claim, reason.clone()).await?;
+                proof_directory.write_abandoned(issue, claim, &reason, winner, now)?;
                 summary.conflicts_abandoned += 1;
             }
         }
