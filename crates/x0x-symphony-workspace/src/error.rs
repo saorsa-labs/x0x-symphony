@@ -44,6 +44,16 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// Setting owner-only permissions on a newly-created directory failed.
+    #[error("failed to set owner-only permissions on {path}: {source}", path = .path.display())]
+    SetPermissions {
+        /// Directory path.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: io::Error,
+    },
+
     /// Creating an orphan quarantine directory failed.
     #[error("failed to create orphan quarantine directory {path}: {source}", path = .path.display())]
     CreateQuarantineDir {

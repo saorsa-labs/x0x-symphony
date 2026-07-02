@@ -9,6 +9,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 // `Child` is used by both unix and non-unix `kill_process_group` bodies
 // (the non-unix fallback calls `start_kill` on it). Only the nix-based
 // process-group signalling inside the unix body needs `#[cfg(unix)]`.
@@ -37,6 +39,11 @@ const DEFAULT_HOOK_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const HOOK_OUTPUT_TIMEOUT_DRAIN_MS: u64 = 1_000;
 const BASH_PATH: &str = "/bin/bash";
 const ORPHAN_QUARANTINE_DIR: &str = ".orphaned";
+// POSIX keeps environment names comfortably within one path-component-sized
+// boundary. Values intentionally rely on the platform's total env-size limit.
+const MAX_HOOK_ENV_NAME_BYTES: usize = 255;
+#[cfg(unix)]
+const WORKSPACE_DIR_MODE: u32 = 0o700;
 
 /// Workspace manager configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,11 +132,9 @@ impl Manager {
     /// Returns [`Error`] when the root cannot be created, canonicalized, or
     /// verified as a directory.
     pub fn new(config: Config) -> Result<Self> {
-        fs::create_dir_all(config.root()).map_err(|source| Error::CreateRoot {
-            path: config.root().to_path_buf(),
-            source,
-        })?;
+        ensure_workspace_root(config.root())?;
         let root = canonicalize_root(config.root())?;
+        warn_if_broader_workspace_root_permissions(&root);
         Ok(Self { config, root })
     }
 
@@ -416,18 +421,24 @@ impl Manager {
             Ok(_metadata) => self
                 .validate_existing_directory(path)
                 .map(|canonical| (false, canonical)),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
-                Ok(()) => self
-                    .validate_existing_directory(path)
-                    .map(|canonical| (true, canonical)),
-                Err(create_source) if create_source.kind() == io::ErrorKind::AlreadyExists => self
-                    .validate_existing_directory(path)
-                    .map(|canonical| (false, canonical)),
-                Err(create_source) => Err(Error::CreateDir {
-                    path: path.to_path_buf(),
-                    source: create_source,
-                }),
-            },
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                match create_dir_private(path) {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        set_private_dir_permissions(path)?;
+                        self.validate_existing_directory(path)
+                            .map(|canonical| (true, canonical))
+                    }
+                    Err(create_source) if create_source.kind() == io::ErrorKind::AlreadyExists => {
+                        self.validate_existing_directory(path)
+                            .map(|canonical| (false, canonical))
+                    }
+                    Err(create_source) => Err(Error::CreateDir {
+                        path: path.to_path_buf(),
+                        source: create_source,
+                    }),
+                }
+            }
             Err(source) => Err(Error::Metadata {
                 path: path.to_path_buf(),
                 source,
@@ -687,12 +698,7 @@ impl Manager {
         let mut vars = BTreeMap::new();
         for (name, value) in &env.vars {
             validate_env_name(name)?;
-            if value.as_bytes().contains(&0) {
-                return Err(Error::InvalidHookEnv {
-                    name: name.clone(),
-                    reason: "value must not contain NUL",
-                });
-            }
+            validate_env_value(name, value)?;
             if is_sensitive_env_name(name) && !self.config.sensitive_env_allowlist.contains(name) {
                 return Err(Error::SensitiveHookEnvDenied { name: name.clone() });
             }
@@ -713,6 +719,86 @@ fn file_name_utf8(path: &Path) -> Result<String> {
             path: path.to_path_buf(),
             reason: "path has no UTF-8 file name",
         })
+}
+
+fn ensure_workspace_root(path: &Path) -> Result<()> {
+    let existed = fs::symlink_metadata(path).is_ok();
+    create_dir_all_private(path).map_err(|source| Error::CreateRoot {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    if !existed {
+        set_private_dir_permissions(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_dir_all_private(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder
+        .recursive(true)
+        .mode(WORKSPACE_DIR_MODE)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+fn create_dir_all_private(path: &Path) -> io::Result<()> {
+    // Non-Unix platforms inherit directory ACLs from the parent; the standard
+    // library has no portable equivalent of Unix 0o700 mode bits.
+    fs::create_dir_all(path)
+}
+
+#[cfg(unix)]
+fn create_dir_private(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(WORKSPACE_DIR_MODE).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_dir_private(path: &Path) -> io::Result<()> {
+    // Non-Unix platforms inherit directory ACLs from the parent; the standard
+    // library has no portable equivalent of Unix 0o700 mode bits.
+    fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(WORKSPACE_DIR_MODE)).map_err(|source| {
+        Error::SetPermissions {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+#[cfg(unix)]
+fn warn_if_broader_workspace_root_permissions(path: &Path) {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                warn!(
+                    path = %path.display(),
+                    mode = %format!("0o{mode:03o}"),
+                    expected = "0o700",
+                    "workspace root permissions allow group or other access; leaving existing permissions unchanged"
+                );
+            }
+        }
+        Err(source) => warn!(
+            path = %path.display(),
+            error = %source,
+            "failed to inspect workspace root permissions"
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_broader_workspace_root_permissions(_path: &Path) {
+    // Non-Unix platforms inherit directory ACLs from the parent. Operators who
+    // need stricter isolation must harden the parent ACL out of band.
 }
 
 #[async_trait]
@@ -861,6 +947,12 @@ fn validate_env_name(name: &str) -> Result<()> {
             reason: "name must not be empty",
         });
     }
+    if name.len() > MAX_HOOK_ENV_NAME_BYTES {
+        return Err(Error::InvalidHookEnv {
+            name: name.to_owned(),
+            reason: "name must be at most 255 bytes",
+        });
+    }
     if name.as_bytes().contains(&0) {
         return Err(Error::InvalidHookEnv {
             name: name.to_owned(),
@@ -884,6 +976,27 @@ fn validate_env_name(name: &str) -> Result<()> {
             name: name.to_owned(),
             reason: "name must contain only ASCII letters, digits, or underscore",
         });
+    }
+    Ok(())
+}
+
+fn validate_env_value(name: &str, value: &str) -> Result<()> {
+    for byte in value.bytes() {
+        let reason = match byte {
+            0x00 => Some("value must not contain NUL"),
+            b'\n' => Some("value must not contain newline"),
+            b'\r' => Some("value must not contain carriage return"),
+            0x01..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f => {
+                Some("value must not contain ASCII control bytes other than tab")
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return Err(Error::InvalidHookEnv {
+                name: name.to_owned(),
+                reason,
+            });
+        }
     }
     Ok(())
 }
