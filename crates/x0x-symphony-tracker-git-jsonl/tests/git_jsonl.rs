@@ -67,6 +67,66 @@ async fn round_trip_create_claim_heartbeat_handoff_review() -> TestResult {
 }
 
 #[tokio::test]
+async fn create_issue_assigns_shard_from_static_workers() -> TestResult {
+    let repo = init_plain()?;
+    let workers = vec![
+        AgentId::new("agent-a")?,
+        AgentId::new("agent-b")?,
+        AgentId::new("agent-c")?,
+        AgentId::new("agent-d")?,
+    ];
+    let tracker = JsonlTracker::builder(repo.path())
+        .shard_workers(workers.clone())
+        .shard_replication_factor(3)
+        .build();
+
+    let issue = tracker.create_issue(IssueDraft::new("Assign me")?)?;
+    let expected = x0x_symphony_core::shard::assign(&issue.id, &workers, 3)
+        .ok_or_else(|| io::Error::other("expected shard for non-empty workers"))?;
+
+    assert_eq!(issue.shard.as_ref(), Some(&expected));
+    let primary = issue
+        .shard
+        .as_ref()
+        .map(|shard| shard.primary.clone())
+        .ok_or_else(|| io::Error::other("created issue did not include shard"))?;
+    let claim = tracker.claim(&issue.id, &primary).await?;
+    assert_eq!(claim.shard_role, ShardRole::Primary);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_issue_without_workers_keeps_manual_m1_claims() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = JsonlTracker::new(repo.path());
+    let issue = tracker.create_issue(IssueDraft::new("Manual fallback")?)?;
+
+    assert!(issue.shard.is_none());
+    let claim = tracker.claim(&issue.id, &AgentId::new("agent-a")?).await?;
+    assert_eq!(claim.shard_role, ShardRole::ManualM1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_shard_worker_cannot_claim_sharded_issue() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = JsonlTracker::builder(repo.path())
+        .shard_workers(vec![AgentId::new("agent-a")?])
+        .build();
+    let issue = tracker.create_issue(IssueDraft::new("Reject outsider")?)?;
+
+    match tracker.claim(&issue.id, &AgentId::new("agent-b")?).await {
+        Err(error) => {
+            assert!(error.to_string().contains("not in the issue shard slate"));
+            Ok(())
+        }
+        Ok(_) => Err(Into::into(io::Error::other(
+            "non-shard worker claim was accepted",
+        ))),
+    }
+}
+
+#[tokio::test]
 async fn release_transition_returns_issue_to_todo_without_git() -> TestResult {
     let temp = TempDir::new()?;
     fs::create_dir_all(temp.path().join("issues"))?;

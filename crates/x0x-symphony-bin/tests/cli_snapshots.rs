@@ -5,6 +5,7 @@ use clap::Parser;
 use serde_json::json;
 use tokio::{net::TcpListener, task::JoinHandle};
 use x0x_symphony_bin::cli::{self, CommandLine};
+use x0x_symphony_tracker_git_jsonl::parse_issue_line;
 
 struct StubDaemon {
     server: String,
@@ -100,6 +101,45 @@ async fn proofs_list_snapshot() -> Result<(), Box<dyn Error>> {
         stdout,
         "proofs:\n- XSY-0001/run.txt\n- XSY-0002/report.txt\n"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_new_writes_sharded_issue() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let workflow_path = dir.path().join("WORKFLOW.md");
+    std::fs::write(
+        &workflow_path,
+        workflow_with_sharding("/tmp/xsy-workspaces"),
+    )?;
+    let config_arg = workflow_path.to_string_lossy().into_owned();
+
+    let stdout = run_cli(&[
+        "x0x-symphony",
+        "issue",
+        "new",
+        "--config",
+        &config_arg,
+        "--title",
+        "Shard me",
+        "--priority",
+        "2",
+        "--label",
+        "x0x-symphony",
+    ])
+    .await?;
+
+    assert!(stdout.starts_with("created XSY-0001\nshard: primary="));
+    let issues_path = dir.path().join("issues").join("issues.jsonl");
+    let content = std::fs::read_to_string(issues_path)?;
+    let issue = parse_issue_line(1, content.trim())?;
+    assert_eq!(issue.title, "Shard me");
+    assert_eq!(issue.priority, Some(2));
+    assert_eq!(issue.labels, vec!["x0x-symphony"]);
+    let shard = issue
+        .shard
+        .ok_or_else(|| std::io::Error::other("issue new did not write a shard"))?;
+    assert_eq!(shard.backups.len(), 2);
     Ok(())
 }
 
@@ -224,6 +264,19 @@ async fn stub_routes() -> Json<serde_json::Value> {
 
 async fn stub_proofs() -> Json<serde_json::Value> {
     Json(json!({"proofs": ["XSY-0001/run.txt", "XSY-0002/report.txt"]}))
+}
+
+fn workflow_with_sharding(root: &str) -> String {
+    valid_workflow(root).replace(
+        "polling:\n  interval_ms: 1\n",
+        concat!(
+            "sharding:\n",
+            "  workers: [\"agent-a\", \"agent-b\", \"agent-c\"]\n",
+            "  replication_factor: 3\n",
+            "polling:\n",
+            "  interval_ms: 1\n",
+        ),
+    )
 }
 
 fn valid_workflow(root: &str) -> String {

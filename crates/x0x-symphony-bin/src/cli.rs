@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
+use x0x_symphony_core::{AgentId, Issue};
+use x0x_symphony_tracker_git_jsonl::{IssueDraft, JsonlTracker};
+
 use crate::{client, config::WorkflowConfig};
 
 /// Result alias for CLI dispatch.
@@ -66,6 +69,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: ProofsCommand,
     },
+    /// Create or inspect issues in the configured tracker.
+    Issue {
+        /// Issue subcommand.
+        #[command(subcommand)]
+        command: IssueCommand,
+    },
     /// Inspect or validate workflow configuration.
     Config {
         /// Config subcommand.
@@ -85,6 +94,29 @@ pub enum ProofsCommand {
     Show {
         /// Proof name relative to the daemon proofs root.
         name: String,
+    },
+}
+
+/// Issue-related subcommands.
+#[derive(Clone, Debug, Subcommand)]
+pub enum IssueCommand {
+    /// Create a new issue in the git JSONL tracker.
+    New {
+        /// Workflow file path used to resolve tracker and sharding settings.
+        #[arg(long, default_value = "WORKFLOW.md")]
+        config: PathBuf,
+        /// Issue title.
+        #[arg(long)]
+        title: String,
+        /// Markdown-capable issue description.
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Dispatch priority where lower values run earlier.
+        #[arg(long)]
+        priority: Option<u8>,
+        /// Label to attach; may be supplied more than once.
+        #[arg(long = "label")]
+        labels: Vec<String>,
     },
 }
 
@@ -125,6 +157,9 @@ pub enum Error {
     /// Workflow configuration loading failed.
     #[error(transparent)]
     Config(#[from] crate::config::Error),
+    /// Git JSONL tracker operation failed.
+    #[error(transparent)]
+    Tracker(#[from] x0x_symphony_tracker_git_jsonl::TrackerError),
 }
 
 impl Output {
@@ -157,6 +192,7 @@ impl Output {
 pub async fn run(command_line: CommandLine) -> Result<Output> {
     match &command_line.command {
         Commands::Config { command } => run_config(command),
+        Commands::Issue { command } => run_issue(command),
         command => run_daemon_command(&command_line, command).await,
     }
 }
@@ -202,10 +238,36 @@ async fn run_daemon_command(command_line: &CommandLine, command: &Commands) -> R
             let routes = client.routes().await?;
             Ok(Output::success(format_routes(&routes.routes)))
         }
-        Commands::Config { .. } => Ok(Output::failure(
-            "internal error: config command reached daemon dispatch\n",
+        Commands::Config { .. } | Commands::Issue { .. } => Ok(Output::failure(
+            "internal error: local command reached daemon dispatch\n",
         )),
     }
+}
+
+fn run_issue(command: &IssueCommand) -> Result<Output> {
+    let IssueCommand::New {
+        config,
+        title,
+        description,
+        priority,
+        labels,
+    } = command;
+    let workflow = WorkflowConfig::load(config)?;
+    let paths = workflow.tracker_paths(config)?;
+    let mut draft = IssueDraft::new(title.clone())?.with_description(description.clone());
+    if let Some(priority) = priority {
+        draft = draft.with_priority(*priority);
+    }
+    for label in labels {
+        draft = draft.with_label(label.clone());
+    }
+    let issue = JsonlTracker::builder(paths.repo_root)
+        .issues_path(paths.issues_path)
+        .shard_workers(workflow.sharding.workers)
+        .shard_replication_factor(workflow.sharding.replication_factor)
+        .build()
+        .create_issue(draft)?;
+    Ok(Output::success(format_created_issue(&issue)))
 }
 
 fn run_config(command: &ConfigCommand) -> Result<Output> {
@@ -234,6 +296,25 @@ fn client_options(command_line: &CommandLine) -> client::Options {
         token: command_line.token.clone(),
         token_file: command_line.token_file.clone(),
     }
+}
+
+fn format_created_issue(issue: &Issue) -> String {
+    let mut lines = vec![format!("created {}", issue.identifier)];
+    if let Some(shard) = &issue.shard {
+        lines.push(format!(
+            "shard: primary={} backups={}",
+            shard.primary,
+            format_agent_list(&shard.backups)
+        ));
+    } else {
+        lines.push("shard: manual_m1 (no static workers configured)".to_owned());
+    }
+    join_lines(&lines)
+}
+
+fn format_agent_list(agents: &[AgentId]) -> String {
+    let values = agents.iter().map(ToString::to_string).collect::<Vec<_>>();
+    format!("[{}]", values.join(", "))
 }
 
 fn format_tasks(tasks: &[crate::api::Task]) -> String {

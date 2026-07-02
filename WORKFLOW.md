@@ -22,6 +22,18 @@ tracker:
   id_prefix: XSY
   lock_mode: git
 
+# SHARDING (M2 STATIC PLACEHOLDER): this optional static worker roster exists
+# only so `x0x-symphony issue new` can freeze shard.primary/backups at issue
+# creation. M4 replaces it with live x0x presence-based trusted-worker
+# discovery. Do not treat this list as dynamic membership; existing shard
+# fields are immutable after creation.
+# sharding:
+#   workers:
+#     - agent-a
+#     - agent-b
+#     - agent-c
+#   replication_factor: 3
+
 polling:
   interval_ms: 30000
 

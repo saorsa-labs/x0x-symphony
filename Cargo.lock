@@ -2086,6 +2086,7 @@ dependencies = [
  "async-trait",
  "futures-core",
  "futures-util",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",
