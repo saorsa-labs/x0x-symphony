@@ -42,34 +42,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let tracker_paths = workflow.tracker_paths(&args.config)?;
     let proofs_dir = tracker_paths.repo_root.join("proofs");
     let api_token = auth::load_or_generate_api_token(&data_dir).await?;
-    let signing_client = if workflow.signing.policy == SigningPolicy::Required {
-        Some(Arc::new(
-            X0xdClient::new(&workflow.signing.x0xd_url)
-                .context("failed to configure x0xd signing client")?,
-        ))
-    } else {
-        None
-    };
-    let agent_id = if let Some(client) = signing_client.as_ref() {
-        let identity = client
-            .agent_identity()
-            .await
-            .context("failed to read x0xd agent identity for required signing")?;
-        AgentId::new(identity.agent_id)?
-    } else {
-        AgentId::new(args.agent_id.clone())?
-    };
-
-    let mut tracker_builder = JsonlTracker::builder(tracker_paths.repo_root.clone())
-        .issues_path(tracker_paths.issues_path.clone())
-        .shard_workers(workflow.sharding.workers.clone())
-        .shard_replication_factor(workflow.sharding.replication_factor);
-    if let Some(client) = signing_client {
-        let signing: Arc<dyn SigningClient> = client.clone();
-        let resolver: Arc<dyn TrustedKeyResolver> = client;
-        tracker_builder = tracker_builder.required_signing(signing, resolver);
-    }
-    let tracker = Arc::new(tracker_builder.build());
+    let (tracker, agent_id) = build_tracker(&workflow, &tracker_paths, &args).await?;
     let runner_spec = RunnerSpec::from_workflow_config(&workflow.definition.config)
         .context("runner configuration did not resolve")?;
     let runner = Arc::new(ShellRunner::new(runner_spec).context("failed to build shell runner")?);
@@ -141,6 +114,42 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Construct the JSONL tracker with optional required-signing, returning the
+/// resolved agent identity (from x0xd when signing is required, from CLI otherwise).
+async fn build_tracker(
+    workflow: &config::WorkflowConfig,
+    tracker_paths: &config::TrackerPaths,
+    args: &Args,
+) -> anyhow::Result<(Arc<JsonlTracker>, AgentId)> {
+    let signing_client = if workflow.signing.policy == SigningPolicy::Required {
+        Some(Arc::new(
+            X0xdClient::new(&workflow.signing.x0xd_url)
+                .context("failed to configure x0xd signing client")?,
+        ))
+    } else {
+        None
+    };
+    let agent_id = if let Some(client) = signing_client.as_ref() {
+        let identity = client
+            .agent_identity()
+            .await
+            .context("failed to read x0xd agent identity for required signing")?;
+        AgentId::new(identity.agent_id)?
+    } else {
+        AgentId::new(args.agent_id.clone())?
+    };
+    let mut tracker_builder = JsonlTracker::builder(tracker_paths.repo_root.clone())
+        .issues_path(tracker_paths.issues_path.clone())
+        .shard_workers(workflow.sharding.workers.clone())
+        .shard_replication_factor(workflow.sharding.replication_factor);
+    if let Some(client) = signing_client {
+        let signing: Arc<dyn SigningClient> = client.clone();
+        let resolver: Arc<dyn TrustedKeyResolver> = client;
+        tracker_builder = tracker_builder.required_signing(signing, resolver);
+    }
+    Ok((Arc::new(tracker_builder.build()), agent_id))
 }
 
 fn init_tracing() {
