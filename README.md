@@ -13,11 +13,12 @@ the shared backlog.
 
 ## Status
 
-pre-M1 (design frozen, core traits only). The architecture and four ADRs are
-frozen; only the `x0x-symphony-core` traits crate is implemented so far. The
-M1 vertical slice (tracker → runner → workspace → orchestrator → daemon) is
-in flight — see
+**M1 passed** — the vertical slice (tracker → runner → workspace → orchestrator
+→ daemon + CLI) is implemented and the M1 gate demos are committed under
+[`proofs/m1/`](proofs/m1/). The architecture and four ADRs remain frozen; see
 [`docs/plan/2026-07-m1-execution-plan.md`](docs/plan/2026-07-m1-execution-plan.md).
+Operator and runner-authoring guides live in
+[`docs/symphony/`](docs/symphony/).
 The v1.0 shipping tracker is x0x's native CRDT TaskList, accessed through the
 local x0xd REST API; until M3 the daemon reads only the operator-controlled
 `issues/issues.jsonl` backlog.
