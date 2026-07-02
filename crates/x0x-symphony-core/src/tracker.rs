@@ -86,6 +86,10 @@ pub enum ReleaseReasonCode {
     ExpiredHeartbeat,
     /// Claim conflict was resolved in favor of another worker.
     Conflict,
+    /// Retry budget was exhausted; the orchestrator moved the issue to `blocked`.
+    RetryExhausted,
+    /// Graceful shutdown released the claim before completion.
+    Shutdown,
     /// Other structured reason.
     Other,
 }
@@ -107,6 +111,8 @@ impl ReleaseReasonCode {
             Self::RunnerFailed => "runner_failed",
             Self::ExpiredHeartbeat => "expired_heartbeat",
             Self::Conflict => "conflict",
+            Self::RetryExhausted => "retry_exhausted",
+            Self::Shutdown => "shutdown",
             Self::Other => "other",
         }
     }
@@ -194,4 +200,27 @@ pub trait Tracker: Send + Sync {
 
     /// Append a final handoff and move the issue to review.
     async fn handoff(&self, claim: &Claim, handoff: Handoff) -> Result<()>;
+
+    /// Return all issues with an active claim, optionally restricted to those
+    /// owned by `agent_id`. Used by the orchestrator for startup
+    /// reconciliation. Must **not** apply blocker filtering and must return
+    /// every claimed issue regardless of state.
+    ///
+    /// Adapters that predate this method return an empty slice, signaling that
+    /// no reconciliation is possible.
+    async fn fetch_claimed(&self, _agent_id: Option<&AgentId>) -> Result<Vec<Issue>> {
+        Ok(Vec::new())
+    }
+
+    /// Move the issue behind `claim` to the `blocked` state, clear the claim,
+    /// and persist a structured `blocked_reason`. Used by the orchestrator when
+    /// the retry budget is exhausted.
+    ///
+    /// Adapters that predate this method return [`crate::SymphonyError::Tracker`];
+    /// callers treat the unsupported case as a hard failure.
+    async fn block(&self, _claim: &Claim, _reason: ReleaseReason) -> Result<()> {
+        Err(crate::SymphonyError::Tracker(
+            "tracker does not support blocking issues".into(),
+        ))
+    }
 }

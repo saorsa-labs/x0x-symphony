@@ -1,0 +1,225 @@
+//! Dispatch helpers: eligibility gate and the per-issue run/retry flow.
+//!
+//! [`claimable_for`] decides which polled candidates this agent may take right
+//! now (free, or already owned-and-fresh). [`Orchestrator::run_claim`] runs a
+//! claimed issue through the retry loop, handing off on success and blocking on
+//! exhaustion. Graceful shutdown cancels an in-flight run, releases the claim
+//! with `shutdown`, and preserves the workspace.
+//!
+//! Ownership contract: the caller of `run_claim` first acquires a budget slot
+//! and registers the claim as in-flight (done by [`Orchestrator::claim_next`]
+//! and the resume path). `run_claim` releases that slot on every exit path.
+
+use tokio::time::sleep;
+use x0x_symphony_core::{
+    Handoff, Issue, IssueId, Prompt, ReleaseReason, ReleaseReasonCode, Runner, SessionContext,
+    TurnStatus, Workspace,
+};
+
+use crate::{
+    clock::Clock,
+    error::{Error, Result},
+    reconcile::is_fresh_self,
+    Orchestrator,
+};
+
+/// Why a polled candidate may (or may not) be taken by this agent now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Claimable {
+    /// No active claim — anyone may claim.
+    Free,
+    /// Claimed by this agent and still within the TTL — resume it.
+    FreshSelf,
+}
+
+/// Classify a polled candidate's claim state from this agent's perspective.
+///
+/// Returns `Ok(None)` when the issue is claimed by someone else, or owned by
+/// this agent but stale (it must be reconciled, not dispatched fresh).
+///
+/// # Errors
+///
+/// Propagates [`Error::BadHeartbeat`] when a present claim's heartbeat cannot
+/// be parsed.
+pub fn claimable_for(
+    issue: &Issue,
+    owner: &x0x_symphony_core::AgentId,
+    clock: &dyn Clock,
+    ttl: chrono::Duration,
+) -> Result<Option<Claimable>> {
+    match &issue.claim {
+        None => Ok(Some(Claimable::Free)),
+        Some(claim) => {
+            if is_fresh_self(claim, owner, clock, ttl)? {
+                Ok(Some(Claimable::FreshSelf))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Outcome of running a single claimed issue to resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Resolution {
+    /// The runner succeeded and the issue was handed off to `review`.
+    Completed,
+    /// The retry budget was exhausted and the issue was moved to `blocked`.
+    Blocked,
+    /// Graceful shutdown cancelled the run; the claim was released with
+    /// `shutdown` and the workspace was preserved.
+    ShutdownReleased,
+}
+
+/// Carries a runner session through `select!` so shutdown can preempt it.
+struct RunTurnOutcome {
+    status: TurnStatus,
+    session: x0x_symphony_core::SessionHandle,
+}
+
+/// Lets `select!` await `run_turn` while keeping the session handle for the
+/// later `stop_session`. The core `Runner` trait takes the session by value, so
+/// we wrap the call and thread the handle back out.
+#[allow(async_fn_in_trait)]
+trait RunTurnExt {
+    /// Run one prompt turn, returning the status and the (still-open) session.
+    ///
+    /// # Errors
+    /// Propagates runner errors.
+    async fn run_turn_prompt(
+        &self,
+        session: x0x_symphony_core::SessionHandle,
+        prompt: Prompt,
+    ) -> Result<RunTurnOutcome>;
+}
+
+impl<R: Runner> RunTurnExt for R {
+    async fn run_turn_prompt(
+        &self,
+        mut session: x0x_symphony_core::SessionHandle,
+        prompt: Prompt,
+    ) -> Result<RunTurnOutcome> {
+        let outcome = self.run_turn(&mut session, prompt).await?;
+        Ok(RunTurnOutcome {
+            status: outcome.status,
+            session,
+        })
+    }
+}
+
+impl<T, R, W> Orchestrator<T, R, W>
+where
+    T: x0x_symphony_core::Tracker,
+    R: Runner,
+    W: Workspace,
+{
+    /// Run one claimed issue through the retry loop to resolution.
+    ///
+    /// The claim is held across retries (heartbeated before each attempt) and
+    /// the workspace is reused across attempts. On success the issue is handed
+    /// off to `review`; on exhaustion it is moved to `blocked`; on shutdown the
+    /// run is cancelled and the claim released with `shutdown`. The workspace is
+    /// **never** destroyed here — `review`/`blocked` are not terminal cleanup
+    /// states, and shutdown explicitly preserves work for resumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when a tracker/runner/workspace call fails for reasons
+    /// other than the run itself failing.
+    pub async fn run_claim(&self, claim: x0x_symphony_core::Claim) -> Result<Resolution> {
+        let issue = self.fetch_claim_issue(&claim).await?;
+        let handle = self.workspace.create(&issue).await?;
+        let workspace_path = handle.path.clone();
+
+        let max_attempts = self.config.retry.max_attempts();
+        let mut attempts = 0_u32;
+        loop {
+            attempts += 1;
+            // Keep the claim fresh while we hold it across the (possibly long) run.
+            let _ = self.tracker.heartbeat(&claim).await;
+
+            let session = self
+                .runner
+                .start_session(SessionContext::new(issue.clone(), workspace_path.clone()))
+                .await?;
+            let prompt = Prompt::new(issue.description.clone());
+            // The run-turn branch takes ownership; clone first so the shutdown
+            // branch still owns a handle to stop the same runner-side session.
+            let run_session = session.clone();
+            let outcome = tokio::select! {
+                biased;
+                () = self.shutdown_signaled() => {
+                    let _ = self.runner.stop_session(session).await;
+                    self.tracker
+                        .release(
+                            &claim,
+                            ReleaseReason::new(ReleaseReasonCode::Shutdown, "graceful shutdown"),
+                        )
+                        .await?;
+                    self.release_slot(&claim);
+                    return Ok(Resolution::ShutdownReleased);
+                }
+                outcome = self.runner.run_turn_prompt(run_session, prompt) => outcome?,
+            };
+            let _ = self.runner.stop_session(outcome.session).await;
+
+            match outcome.status {
+                TurnStatus::Succeeded => {
+                    let handoff = Handoff::new(format!(
+                        "runner '{}' succeeded after {attempts} attempt(s)",
+                        self.runner.name()
+                    ))
+                    .with_file(workspace_path.to_string_lossy().into_owned());
+                    self.tracker.handoff(&claim, handoff).await?;
+                    // handoff clears the claim on the tracker; just free our slot.
+                    self.release_slot(&claim);
+                    return Ok(Resolution::Completed);
+                }
+                TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled
+                    if attempts >= max_attempts =>
+                {
+                    self.tracker
+                        .block(
+                            &claim,
+                            ReleaseReason::new(
+                                ReleaseReasonCode::RetryExhausted,
+                                format!(
+                                    "runner '{}' failed after {attempts} attempt(s)",
+                                    self.runner.name()
+                                ),
+                            ),
+                        )
+                        .await?;
+                    // block() clears the claim on the tracker; free our slot.
+                    self.release_slot(&claim);
+                    return Ok(Resolution::Blocked);
+                }
+                TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled => {
+                    // Retry: back off, then loop. The claim stays in_progress.
+                    sleep(self.config.retry.backoff_after(attempts)).await;
+                }
+            }
+        }
+    }
+
+    /// Fetch the current issue record behind a claim.
+    async fn fetch_claim_issue(&self, claim: &x0x_symphony_core::Claim) -> Result<Issue> {
+        let id = claim.issue_id.clone().ok_or_else(|| Error::NotEligible {
+            id: "(no issue)".to_owned(),
+            reason: "claim carries no issue id".into(),
+        })?;
+        let issues = self.tracker.fetch_by_ids(std::slice::from_ref(&id)).await?;
+        issues.into_iter().next().ok_or_else(|| Error::NotEligible {
+            id: id.to_string(),
+            reason: "issue behind claim not found".into(),
+        })
+    }
+
+    /// Freshly claim a `todo` issue for this agent.
+    pub(crate) async fn claim_issue(&self, id: &IssueId) -> Result<x0x_symphony_core::Claim> {
+        self.tracker
+            .claim(id, &self.config.agent_id)
+            .await
+            .map_err(Into::into)
+    }
+}

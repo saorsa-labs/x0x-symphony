@@ -465,6 +465,34 @@ impl JsonlTracker {
         })
     }
 
+    fn block_claim(&self, claim: &Claim, reason: &ReleaseReason) -> Result<()> {
+        let id = claim_issue_id(claim)?;
+        let message = format!("x0x-symphony: block {id}");
+        self.with_records_mutation(&message, |records| {
+            let record = records.find_mut(&id)?;
+            ensure_claim_owner(&record.issue, claim)?;
+            info!(
+                issue_id = %id,
+                agent_id = %claim.by,
+                reason_code = reason.code.as_str(),
+                reason = reason.message.as_str(),
+                "blocking issue after retry exhaustion"
+            );
+            record.issue.state = IssueState::new("blocked")?;
+            record.issue.claim = None;
+            // Persist the structured reason so an operator or later agent can
+            // see *why* the issue was blocked. Stored in `extra` under a
+            // reserved key as a serialized `ReleaseReason`.
+            record.issue.extra.insert(
+                "blocked_reason".to_owned(),
+                serde_json::to_value(reason).map_err(|source| TrackerError::Json { source })?,
+            );
+            record.issue.updated_at = now_utc();
+            record.dirty = true;
+            Ok(())
+        })
+    }
+
     fn with_records_mutation<F>(&self, commit_message: &str, mutate: F) -> Result<()>
     where
         F: FnOnce(&mut LoadedRecords) -> Result<()>,
@@ -826,6 +854,30 @@ impl Tracker for JsonlTracker {
 
     async fn handoff(&self, claim: &Claim, handoff: Handoff) -> CoreResult<()> {
         self.handoff_claim(claim, handoff)
+            .map_err(SymphonyError::from)
+    }
+
+    async fn fetch_claimed(&self, agent_id: Option<&AgentId>) -> CoreResult<Vec<Issue>> {
+        let records = self.load_records().map_err(SymphonyError::from)?;
+        let claimed = records
+            .records
+            .iter()
+            .filter(|record| record.issue.claim.is_some())
+            .filter(|record| {
+                agent_id.is_none_or(|agent| {
+                    record
+                        .issue
+                        .claim
+                        .as_ref()
+                        .is_some_and(|claim| &claim.by == agent)
+                })
+            })
+            .map(|record| record.issue.clone());
+        Ok(claimed.collect())
+    }
+
+    async fn block(&self, claim: &Claim, reason: ReleaseReason) -> CoreResult<()> {
+        self.block_claim(claim, &reason)
             .map_err(SymphonyError::from)
     }
 }
