@@ -140,6 +140,35 @@ failures are logged as warnings without discarding the runner result.
 workspace because the reached state is configured as terminal; shutdown and
 retry releases preserve workspaces and do not fire `before_remove`.
 
+### Proof artefacts
+
+Every dispatch creates `proofs/<issue-id>/<utc-timestamp>/` under the tracked
+repository. The directory contains `stdout.log`, `stderr.log`, any
+`artifact-*.bin` files emitted by runner artifact events, and a final
+`manifest.json`. Successful handoffs link this relative directory in
+`handoff.proofs_dir` before the handoff is signed.
+
+`manifest.json` is machine-readable JSON with these fields:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `issue_id` | string | Issue identifier for the run. |
+| `agent_id` | string | Agent id that held the claim. |
+| `hostname` | string | Hostname observed by the daemon, or `unknown`. |
+| `runner_kind` | string | Runner capability kind, such as `shell`. |
+| `preset` | string or null | Runner preset name when configured. |
+| `command` | string | Executable command recorded by the runner. |
+| `args` | array of strings | Static argv recorded by the runner. |
+| `env_allowlist` | array of strings | Environment variable names forwarded to the runner. |
+| `exit_code` | integer | Final runner exit code (`0` for success, non-zero for failure/timeout/cancel). |
+| `duration_ms` | integer | Wall-clock duration of the dispatch in milliseconds. |
+| `started_at` | string | RFC3339 UTC dispatch start timestamp. |
+| `ended_at` | string | RFC3339 UTC dispatch end timestamp. |
+| `hooks` | array of strings | Hook outcomes as `<hook>:<status>`, for example `before_run:succeeded`. |
+
+Proof directory cleanup is not implemented in M2; the retention reaper is an
+M5 follow-up.
+
 ## Security model
 
 - **Loopback only.** The daemon binds `127.0.0.1` (or `::1`) and rejects any

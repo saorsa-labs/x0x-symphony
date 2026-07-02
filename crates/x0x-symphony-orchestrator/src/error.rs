@@ -1,5 +1,7 @@
 //! Orchestrator error type.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 use x0x_symphony_core::SymphonyError;
 
@@ -34,5 +36,37 @@ pub enum Error {
         id: String,
         /// Why the issue was rejected.
         reason: String,
+    },
+
+    /// A proof artefact filesystem operation failed.
+    #[error("proof artefact I/O error at {path}: {source}")]
+    ProofIo {
+        /// Path involved in the failed operation.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A proof artefact path failed containment validation.
+    #[error("proof artefact path rejected: {reason}")]
+    ProofContainment {
+        /// Human-readable containment failure.
+        reason: String,
+    },
+
+    /// Serializing proof manifest JSON failed.
+    #[error("proof manifest JSON serialization failed: {source}")]
+    ProofJson {
+        /// Underlying JSON error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// The background proof event writer task failed to join.
+    #[error("proof event writer task failed: {message}")]
+    ProofTask {
+        /// Join failure message.
+        message: String,
     },
 }

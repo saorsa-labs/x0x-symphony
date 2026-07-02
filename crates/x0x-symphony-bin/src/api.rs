@@ -42,6 +42,7 @@ impl<T> OrchestratorHandle for T where T: Send + Sync {}
 #[derive(Clone)]
 pub struct AppState {
     tracker_path: PathBuf,
+    proofs_dir: PathBuf,
     agent_id: AgentId,
     orchestrator: Option<Arc<dyn OrchestratorHandle>>,
     api_token: String,
@@ -215,14 +216,23 @@ impl AppState {
         api_token: String,
         orchestrator: Option<Arc<dyn OrchestratorHandle>>,
     ) -> Self {
+        let proofs_dir = repo_root_from_issues_path(&tracker_path).join("proofs");
         let (events_tx, _events_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             tracker_path,
+            proofs_dir,
             agent_id,
             orchestrator,
             api_token,
             events_tx,
         }
+    }
+
+    /// Return a copy that serves proof artefacts from `proofs_dir`.
+    #[must_use]
+    pub fn with_proofs_dir(mut self, proofs_dir: PathBuf) -> Self {
+        self.proofs_dir = proofs_dir;
+        self
     }
 
     fn tracker(&self) -> JsonlTracker {
@@ -233,7 +243,7 @@ impl AppState {
     }
 
     fn proofs_root(&self) -> PathBuf {
-        repo_root_from_issues_path(&self.tracker_path).join("proofs")
+        self.proofs_dir.clone()
     }
 
     fn notify_task_changed(&self, id: &str) {

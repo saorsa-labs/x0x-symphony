@@ -25,8 +25,8 @@ use tempfile::TempDir;
 use x0x_symphony_core::{
     AgentId, Claim, EventStream, Handoff, Hook, HookEnv, HookOutcome, HookStatus, Issue, IssueId,
     IssueState, LifecycleHooks, PollContext, Prompt, ReleaseReason, ReleaseReasonCode,
-    Result as CoreResult, Runner, RunnerCapabilities, RunnerEvent, SessionContext, SessionHandle,
-    SessionId, TurnOutcome, TurnStatus, UsageReport, Workspace, WorkspaceHandle,
+    Result as CoreResult, Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext,
+    SessionHandle, SessionId, TurnOutcome, TurnStatus, UsageReport, Workspace, WorkspaceHandle,
 };
 use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
@@ -198,12 +198,91 @@ impl Runner for StubRunner {
     }
 }
 
+struct EventfulRunner {
+    status: TurnStatus,
+    events: Vec<RunnerEvent>,
+    artifact: Option<(String, Vec<u8>)>,
+}
+
+impl EventfulRunner {
+    fn success(events: Vec<RunnerEvent>) -> Self {
+        Self {
+            status: TurnStatus::Succeeded,
+            events,
+            artifact: None,
+        }
+    }
+
+    fn failure(events: Vec<RunnerEvent>) -> Self {
+        Self {
+            status: TurnStatus::Failed,
+            events,
+            artifact: None,
+        }
+    }
+
+    fn with_artifact(mut self, name: &str, bytes: &[u8]) -> Self {
+        self.artifact = Some((name.to_owned(), bytes.to_vec()));
+        self
+    }
+}
+
+#[async_trait]
+impl Runner for EventfulRunner {
+    fn name(&self) -> &'static str {
+        "stub"
+    }
+
+    fn capabilities(&self) -> &RunnerCapabilities {
+        static CAPS: std::sync::OnceLock<RunnerCapabilities> = std::sync::OnceLock::new();
+        CAPS.get_or_init(|| RunnerCapabilities::new("stub"))
+    }
+
+    async fn start_session(&self, ctx: SessionContext) -> CoreResult<SessionHandle> {
+        if let Some((name, bytes)) = &self.artifact {
+            std::fs::write(ctx.workspace_path.join(name), bytes)
+                .map_err(|source| x0x_symphony_core::SymphonyError::Runner(source.to_string()))?;
+        }
+        Ok(SessionHandle::new(
+            SessionId::new("eventful-session"),
+            ctx.workspace_path,
+            "now",
+        ))
+    }
+
+    async fn run_turn(
+        &self,
+        _sess: &mut SessionHandle,
+        _prompt: Prompt,
+    ) -> CoreResult<TurnOutcome> {
+        Ok(
+            TurnOutcome::new(self.status.clone(), UsageReport::new()).with_summary(
+                match self.status {
+                    TurnStatus::Succeeded => "exit_code=0",
+                    TurnStatus::Failed => "exit_code=7",
+                    TurnStatus::TimedOut => "turn timed out",
+                    TurnStatus::Cancelled => "turn cancelled",
+                },
+            ),
+        )
+    }
+
+    fn stream_events(&self, _sess: &SessionHandle) -> EventStream {
+        Box::pin(stream::iter(self.events.clone()))
+    }
+
+    async fn stop_session(&self, _sess: SessionHandle) -> CoreResult<UsageReport> {
+        Ok(UsageReport::new())
+    }
+}
+
 // ---------- stub tracker ----------
 
 #[derive(Default)]
 struct StubTracker {
     issues: Mutex<Vec<Issue>>,
     releases: Mutex<Vec<(IssueId, ReleaseReasonCode)>>,
+    handoffs: Mutex<Vec<Handoff>>,
     /// Number of times `heartbeat` was called (proves the periodic task fires).
     heartbeats: Mutex<u32>,
 }
@@ -304,14 +383,17 @@ impl x0x_symphony_core::Tracker for StubTracker {
         }
         Ok(())
     }
-    async fn handoff(&self, claim: &Claim, _handoff: Handoff) -> CoreResult<()> {
+    async fn handoff(&self, claim: &Claim, handoff: Handoff) -> CoreResult<()> {
         let mut issues = lock(&self.issues)?;
         if let Some(id) = &claim.issue_id {
             if let Some(issue) = issues.iter_mut().find(|i| &i.id == id) {
                 issue.claim = None;
+                issue.handoff = Some(handoff.clone());
                 set_state(&mut *issue, "review")?;
             }
         }
+        drop(issues);
+        lock(&self.handoffs)?.push(handoff);
         Ok(())
     }
     async fn block(&self, claim: &Claim, reason: ReleaseReason) -> CoreResult<()> {
@@ -354,13 +436,37 @@ fn config_with_hooks(
     hooks: LifecycleHooks,
     terminal_states: Vec<IssueState>,
 ) -> Result<Config, Box<dyn Error>> {
+    config_with_hooks_and_proofs(
+        retry,
+        concurrency,
+        hooks,
+        terminal_states,
+        default_test_proofs_dir(),
+    )
+}
+
+fn config_with_hooks_and_proofs(
+    retry: RetryPolicy,
+    concurrency: usize,
+    hooks: LifecycleHooks,
+    terminal_states: Vec<IssueState>,
+    proofs_dir: PathBuf,
+) -> Result<Config, Box<dyn Error>> {
     Ok(Config::builder(agent()?)
         .active_states(vec![state("todo")?])
         .terminal_states(terminal_states)
         .global_concurrency(concurrency)
         .retry(retry)
         .hooks(hooks)
+        .proofs_dir(proofs_dir)
         .build())
+}
+
+fn default_test_proofs_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "x0x-symphony-orchestrator-tests-{}",
+        std::process::id()
+    ))
 }
 
 fn record_hook_script(log: &Path) -> String {
@@ -378,6 +484,35 @@ fn read_hook_log(log: &Path) -> Result<Vec<String>, Box<dyn Error>> {
         .lines()
         .map(ToOwned::to_owned)
         .collect())
+}
+
+fn proof_dir_from_handoff(root: &Path, handoff: &Handoff) -> Result<PathBuf, Box<dyn Error>> {
+    let relative = handoff
+        .proofs_dir
+        .as_deref()
+        .ok_or("handoff should link proofs_dir")?;
+    let suffix = relative
+        .strip_prefix("proofs/")
+        .ok_or("proofs_dir should be relative to proofs root")?;
+    Ok(root.join(suffix))
+}
+
+fn only_proof_run(root: &Path, issue_id: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let issue_dir = root.join(issue_id);
+    let mut entries = std::fs::read_dir(issue_dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort();
+    if entries.len() != 1 {
+        return Err(format!("expected one proof run, got {}", entries.len()).into());
+    }
+    Ok(entries.remove(0))
+}
+
+fn manifest(path: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(
+        path.join("manifest.json"),
+    )?)?)
 }
 
 fn fast_retry(max_attempts: u32) -> RetryPolicy {
@@ -625,6 +760,208 @@ async fn end_to_end_smoke_todo_to_review() -> Result<(), Box<dyn Error>> {
     // Workspace created but never destroyed (review is not a terminal cleanup state).
     assert_eq!(guard(&workspace.created).clone().len(), 1);
     assert!(guard(&workspace.destroyed).clone().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn proofs_subtree_and_handoff_link_written_on_success() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let proofs_root = tmp.path().join("proofs");
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9501", "todo")?]));
+    let runner = Arc::new(EventfulRunner::success(vec![
+        RunnerEvent::new(RunnerEventKind::Stdout).with_message("hello stdout\n"),
+        RunnerEvent::new(RunnerEventKind::Stderr).with_message("hello stderr\n"),
+    ]));
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config_with_hooks_and_proofs(
+            fast_retry(1),
+            1,
+            LifecycleHooks::default(),
+            vec![state("done")?, state("cancelled")?],
+            proofs_root.clone(),
+        )?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+
+    assert_eq!(resolution, Resolution::Completed);
+    let handoff = lock(&tracker.handoffs)?
+        .first()
+        .cloned()
+        .ok_or("handoff recorded")?;
+    let run_dir = proof_dir_from_handoff(&proofs_root, &handoff)?;
+    assert!(run_dir.join("manifest.json").is_file());
+    assert!(run_dir.join("stdout.log").is_file());
+    assert!(run_dir.join("stderr.log").is_file());
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join("stdout.log"))?,
+        "hello stdout\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join("stderr.log"))?,
+        "hello stderr\n"
+    );
+    let manifest = manifest(&run_dir)?;
+    assert_eq!(manifest["issue_id"], "XSY-9501");
+    assert_eq!(manifest["agent_id"], "agent-a");
+    assert_eq!(manifest["runner_kind"], "stub");
+    assert_eq!(manifest["preset"], serde_json::Value::Null);
+    assert_eq!(manifest["command"], "stub");
+    assert_eq!(manifest["args"].as_array().ok_or("args array")?.len(), 0);
+    assert_eq!(
+        manifest["env_allowlist"]
+            .as_array()
+            .ok_or("env_allowlist array")?
+            .len(),
+        0
+    );
+    assert_eq!(manifest["exit_code"], 0);
+    assert!(manifest["duration_ms"].as_u64().is_some());
+    assert!(manifest["started_at"].as_str().is_some());
+    assert!(manifest["ended_at"].as_str().is_some());
+    assert_eq!(manifest["hooks"].as_array().ok_or("hooks array")?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn proofs_written_on_failed_dispatch() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let proofs_root = tmp.path().join("proofs");
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9502", "todo")?]));
+    let runner = Arc::new(EventfulRunner::failure(vec![
+        RunnerEvent::new(RunnerEventKind::Stdout).with_message("partial stdout\n"),
+        RunnerEvent::new(RunnerEventKind::Stderr).with_message("partial stderr\n"),
+    ]));
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config_with_hooks_and_proofs(
+            fast_retry(1),
+            1,
+            LifecycleHooks::default(),
+            vec![state("done")?, state("cancelled")?],
+            proofs_root.clone(),
+        )?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+
+    assert_eq!(resolution, Resolution::Blocked);
+    let run_dir = only_proof_run(&proofs_root, "XSY-9502")?;
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join("stdout.log"))?,
+        "partial stdout\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join("stderr.log"))?,
+        "partial stderr\n"
+    );
+    let manifest = manifest(&run_dir)?;
+    assert_eq!(manifest["issue_id"], "XSY-9502");
+    assert_ne!(manifest["exit_code"], 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn malicious_issue_id_refuses_proof_dir_creation() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let malicious_id = IssueId::new("../evil")?;
+    let mut issue = Issue::new(
+        malicious_id.clone(),
+        "../evil",
+        "malicious issue",
+        IssueState::new("in_progress")?,
+        "2026-07-02T00:00:00Z",
+    )?;
+    let owner = agent()?;
+    let claim = Claim::new(
+        Some(malicious_id),
+        owner.clone(),
+        now_iso(),
+        x0x_symphony_core::ShardRole::ManualM1,
+    );
+    issue.claim = Some(claim.clone());
+    let tracker = Arc::new(StubTracker::with(vec![issue]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        tracker,
+        runner,
+        workspace,
+        sysclock(),
+        config_with_hooks_and_proofs(
+            fast_retry(1),
+            1,
+            LifecycleHooks::default(),
+            vec![state("done")?, state("cancelled")?],
+            tmp.path().join("proofs"),
+        )?,
+    );
+
+    let result = orc.run_claim(claim).await;
+
+    assert!(matches!(
+        result,
+        Err(x0x_symphony_orchestrator::Error::ProofContainment { .. })
+    ));
+    assert!(!tmp.path().join("evil").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runner_artifact_event_is_persisted() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let proofs_root = tmp.path().join("proofs");
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9503", "todo")?]));
+    let runner = Arc::new(
+        EventfulRunner::success(vec![
+            RunnerEvent::new(RunnerEventKind::Artifact).with_message("artifact-source.bin")
+        ])
+        .with_artifact("artifact-source.bin", b"artifact bytes"),
+    );
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        tracker,
+        runner,
+        workspace,
+        sysclock(),
+        config_with_hooks_and_proofs(
+            fast_retry(1),
+            1,
+            LifecycleHooks::default(),
+            vec![state("done")?, state("cancelled")?],
+            proofs_root.clone(),
+        )?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+
+    assert_eq!(resolution, Resolution::Completed);
+    let run_dir = only_proof_run(&proofs_root, "XSY-9503")?;
+    assert_eq!(
+        std::fs::read(run_dir.join("artifact-0001.bin"))?,
+        b"artifact bytes"
+    );
     Ok(())
 }
 
@@ -1097,6 +1434,7 @@ async fn heartbeat_keeps_claim_fresh_during_long_run() -> Result<(), Box<dyn Err
         .terminal_states(vec![state("done")?, state("cancelled")?])
         .global_concurrency(1)
         .retry(RetryPolicy::default())
+        .proofs_dir(tmp.path().join("proofs"))
         .claim_ttl(ttl)
         .build();
     let clock = sysclock();
