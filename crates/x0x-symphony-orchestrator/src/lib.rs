@@ -44,8 +44,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use tokio::sync::Notify;
 use x0x_symphony_core::{
-    AgentId, Claim, IssueId, IssueState, PollContext, ReleaseReason, ReleaseReasonCode, Runner,
-    Tracker, Workspace,
+    AgentId, Claim, IssueId, IssueState, LifecycleHooks, PollContext, ReleaseReason,
+    ReleaseReasonCode, Runner, Tracker, Workspace,
 };
 
 use crate::concurrency::Budget as BudgetImpl;
@@ -92,6 +92,8 @@ pub struct Config {
     pub per_state_concurrency: BTreeMap<IssueState, usize>,
     /// Retry policy (backoff + attempts cap).
     pub retry: RetryPolicy,
+    /// Lifecycle hook scripts and timeout.
+    pub hooks: LifecycleHooks,
     /// Claim heartbeat TTL; a claim older than this is stale.
     pub claim_ttl: chrono::Duration,
     /// Maximum time to wait for in-flight runs to release on shutdown.
@@ -113,6 +115,7 @@ impl Config {
             global_concurrency: 1,
             per_state_concurrency: BTreeMap::new(),
             retry: RetryPolicy::default(),
+            hooks: LifecycleHooks::default(),
             claim_ttl: chrono::Duration::minutes(30),
             shutdown_grace: Duration::from_mins(1),
         }
@@ -141,6 +144,7 @@ pub struct ConfigBuilder {
     global_concurrency: usize,
     per_state_concurrency: BTreeMap<IssueState, usize>,
     retry: RetryPolicy,
+    hooks: LifecycleHooks,
     claim_ttl: chrono::Duration,
     shutdown_grace: Duration,
 }
@@ -182,6 +186,12 @@ impl ConfigBuilder {
         self.retry = retry;
         self
     }
+    /// Override lifecycle hook scripts and timeout.
+    #[must_use]
+    pub fn hooks(mut self, hooks: LifecycleHooks) -> Self {
+        self.hooks = hooks;
+        self
+    }
     /// Override the claim TTL.
     #[must_use]
     pub fn claim_ttl(mut self, ttl: chrono::Duration) -> Self {
@@ -205,6 +215,7 @@ impl ConfigBuilder {
             global_concurrency: self.global_concurrency,
             per_state_concurrency: self.per_state_concurrency,
             retry: self.retry,
+            hooks: self.hooks,
             claim_ttl: self.claim_ttl,
             shutdown_grace: self.shutdown_grace,
         }

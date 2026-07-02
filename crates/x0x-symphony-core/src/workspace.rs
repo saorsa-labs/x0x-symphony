@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{Hook, Issue, Result};
+use crate::{Hook, Issue, Result, SymphonyError};
 
 /// Environment passed to a workspace hook.
 ///
@@ -270,8 +270,24 @@ pub trait Workspace: Send + Sync {
     /// Create or reuse a workspace for an issue.
     async fn create(&self, issue: &Issue) -> Result<WorkspaceHandle>;
 
-    /// Execute one configured workspace hook.
+    /// Execute one configured workspace hook at the implementation's default scope.
     async fn run_hook(&self, hook: &Hook, env: &HookEnv) -> Result<HookOutcome>;
+
+    /// Execute one configured workspace hook inside a specific workspace handle.
+    ///
+    /// The default implementation preserves compatibility for older or test
+    /// implementations. Real workspace managers used by dispatch should
+    /// override this method so lifecycle hooks run in the per-issue directory.
+    async fn run_hook_in(
+        &self,
+        _handle: &WorkspaceHandle,
+        _hook: &Hook,
+        _env: &HookEnv,
+    ) -> Result<HookOutcome> {
+        Err(SymphonyError::Workspace(
+            "workspace implementation does not support handle-scoped hooks".into(),
+        ))
+    }
 
     /// Destroy a workspace after a terminal state transition.
     async fn destroy(&self, handle: WorkspaceHandle) -> Result<()>;

@@ -9,7 +9,7 @@ use std::{
 
 use serde_json::{Map, Value};
 use thiserror::Error;
-use x0x_symphony_core::{AgentId, IssueState, SymphonyError, WorkflowDefinition};
+use x0x_symphony_core::{AgentId, IssueState, LifecycleHooks, SymphonyError, WorkflowDefinition};
 use x0x_symphony_orchestrator::{Config as OrchestratorConfig, RetryPolicy};
 use x0x_symphony_runner_shell::RunnerSpec;
 
@@ -73,7 +73,7 @@ pub struct WorkflowConfig {
     pub polling: PollingConfig,
     /// Workspace settings.
     pub workspace: WorkspaceConfig,
-    /// Hook settings that are validated for M1 honesty.
+    /// Lifecycle hook settings.
     pub hooks: HooksConfig,
     /// Agent and orchestrator settings.
     pub agent: AgentConfig,
@@ -108,19 +108,33 @@ pub struct WorkspaceConfig {
     pub root: PathBuf,
 }
 
-/// Required lifecycle hook configuration.
+/// Lifecycle hook configuration parsed from the workflow file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HooksConfig {
     /// Hook timeout in milliseconds.
-    pub timeout_ms: u64,
-    /// Script configured for `after_create`.
-    pub after_create: String,
-    /// Script configured for `before_run`.
-    pub before_run: String,
-    /// Script configured for `after_run`.
-    pub after_run: String,
-    /// Script configured for `before_remove`.
-    pub before_remove: String,
+    pub timeout_ms: u32,
+    /// Script configured for `after_create`; absent or empty means no-op.
+    pub after_create: Option<String>,
+    /// Script configured for `before_run`; absent or empty means no-op.
+    pub before_run: Option<String>,
+    /// Script configured for `after_run`; absent or empty means no-op.
+    pub after_run: Option<String>,
+    /// Script configured for `before_remove`; absent or empty means no-op.
+    pub before_remove: Option<String>,
+}
+
+impl HooksConfig {
+    /// Convert bin-level workflow hooks into core dispatch hook settings.
+    #[must_use]
+    pub fn to_lifecycle_hooks(&self) -> LifecycleHooks {
+        LifecycleHooks {
+            timeout_ms: self.timeout_ms,
+            after_create: self.after_create.clone(),
+            before_run: self.before_run.clone(),
+            after_run: self.after_run.clone(),
+            before_remove: self.before_remove.clone(),
+        }
+    }
 }
 
 /// Agent and orchestrator configuration.
@@ -265,6 +279,7 @@ impl WorkflowConfig {
             .global_concurrency(self.agent.max_concurrent_agents)
             .per_state_concurrency(per_state)
             .retry(retry)
+            .hooks(self.hooks.to_lifecycle_hooks())
             .build())
     }
 }
@@ -347,13 +362,13 @@ fn parse_workspace(
 
 fn parse_hooks(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<HooksConfig> {
     let hooks = required_object(root, "hooks", problems)?;
-    let timeout_ms = required_u64(hooks, "hooks.timeout_ms", problems, 1)?;
+    let timeout_ms = required_u32(hooks, "hooks.timeout_ms", problems, 1)?;
     Some(HooksConfig {
         timeout_ms,
-        after_create: required_string(hooks, "hooks.after_create", problems)?,
-        before_run: required_string(hooks, "hooks.before_run", problems)?,
-        after_run: required_string(hooks, "hooks.after_run", problems)?,
-        before_remove: required_string(hooks, "hooks.before_remove", problems)?,
+        after_create: optional_string(hooks, "hooks.after_create", problems),
+        before_run: optional_string(hooks, "hooks.before_run", problems),
+        after_run: optional_string(hooks, "hooks.after_run", problems),
+        before_remove: optional_string(hooks, "hooks.before_remove", problems),
     })
 }
 
@@ -426,6 +441,22 @@ fn required_string(
             problems.push(format!("missing required key `{path}`"));
             None
         }
+    }
+}
+
+fn optional_string(
+    map: &Map<String, Value>,
+    path: &'static str,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    let key = leaf_key(path);
+    match map.get(key) {
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            problems.push(format!("{path} must be a string"));
+            None
+        }
+        None => None,
     }
 }
 
