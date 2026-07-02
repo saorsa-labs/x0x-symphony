@@ -592,7 +592,7 @@ impl JsonlTracker {
         let id = claim_issue_id(claim)?;
         let message = format!("x0x-symphony: release {id}");
         self.with_records_mutation(&message, |records| {
-            let record = records.find_mut(&id)?;
+            let record = records.find_claim_mut(&id, claim)?;
             ensure_claim_owner(&record.issue, claim)?;
             info!(
                 issue_id = %id,
@@ -1545,6 +1545,26 @@ impl LoadedRecords {
             .iter_mut()
             .find(|record| &record.issue.id == id)
             .ok_or_else(|| TrackerError::IssueNotFound { id: id.clone() })
+    }
+
+    fn find_claim_mut(&mut self, id: &IssueId, claim: &Claim) -> Result<&mut IssueRecord> {
+        let position = self.records.iter().position(|record| {
+            &record.issue.id == id
+                && record
+                    .issue
+                    .claim
+                    .as_ref()
+                    .is_some_and(|current| current.by.eq(&claim.by))
+        });
+        if let Some(index) = position {
+            return Ok(&mut self.records[index]);
+        }
+        if self.records.iter().any(|record| &record.issue.id == id) {
+            return Err(TrackerError::InvalidClaim {
+                reason: format!("issue {id} has no active claim owned by {}", claim.by),
+            });
+        }
+        Err(TrackerError::IssueNotFound { id: id.clone() })
     }
 
     fn has_dirty_records(&self) -> bool {
