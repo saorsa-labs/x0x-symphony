@@ -1,4 +1,6 @@
-use x0x_symphony_runner_shell::{preset, PresetName, RunnerSpec};
+use x0x_symphony_runner_shell::{
+    preset, Backend, PresetName, RunnerSpec, SandboxProfile, UnavailablePolicy,
+};
 
 #[test]
 fn codex_preset_resolves_expected_command_args_env() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,6 +86,54 @@ fn pi_preset_yaml_resolves_to_runnable_spec() -> Result<(), Box<dyn std::error::
     assert_eq!(spec.command, "pi");
     assert_eq!(spec.args, ["--stdin"]);
     assert_eq!(spec.preset, Some(PresetName::Pi));
+    Ok(())
+}
+
+#[test]
+fn workflow_yaml_parses_sandbox_block() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = RunnerSpec::from_workflow_yaml(
+        r#"
+runner:
+  kind: shell
+  command: /bin/cat
+  sandbox:
+    profile: no-network
+    backend: sandbox-exec
+    on_unavailable: fail-closed
+    egress_allow: ["api.example.test"]
+    secrets_deny: ["~/.ssh"]
+    cpu_seconds: 10
+    memory_bytes: 1048576
+"#,
+    )?;
+    let Some(sandbox) = spec.sandbox else {
+        return Err("sandbox block was not parsed".into());
+    };
+
+    assert_eq!(sandbox.profile, SandboxProfile::NoNetwork);
+    assert_eq!(sandbox.backend, Backend::SandboxExec);
+    assert_eq!(sandbox.on_unavailable, UnavailablePolicy::FailClosed);
+    assert_eq!(sandbox.egress_allow, ["api.example.test"]);
+    assert_eq!(sandbox.cpu_seconds, Some(10));
+    assert_eq!(sandbox.memory_bytes, Some(1_048_576));
+
+    Ok(())
+}
+
+#[test]
+fn preset_overrides_prepend_child_sandbox_args() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = RunnerSpec::from_workflow_yaml(
+        r#"
+runner:
+  kind: shell
+  preset: codex
+  codex:
+    sandbox_args: ["--sandbox", "workspace-write"]
+"#,
+    )?;
+
+    assert_eq!(spec.args, ["--sandbox", "workspace-write", "app-server"]);
+
     Ok(())
 }
 

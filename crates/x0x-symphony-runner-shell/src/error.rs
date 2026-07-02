@@ -79,6 +79,25 @@ pub enum Error {
         message: String,
     },
 
+    /// A configured sandbox backend could not be enforced.
+    #[error("sandbox backend {backend} unavailable: {message}")]
+    SandboxUnavailable {
+        /// Effective sandbox backend name.
+        backend: String,
+        /// Human-readable unavailability reason.
+        message: String,
+    },
+
+    /// Sandbox probe filesystem setup or cleanup failed.
+    #[error("sandbox probe I/O error at {path}: {source}")]
+    ProbeIo {
+        /// Path involved in the probe I/O failure.
+        path: std::path::PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: io::Error,
+    },
+
     /// Workflow configuration could not be decoded.
     #[error("failed to decode runner workflow config: {0}")]
     Decode(#[from] serde_json::Error),
