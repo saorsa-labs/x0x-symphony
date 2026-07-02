@@ -448,6 +448,17 @@ impl Workspace for Manager {
             .map_err(Error::into_core)
     }
 
+    async fn run_hook_in(
+        &self,
+        handle: &WorkspaceHandle,
+        hook: &Hook,
+        env: &HookEnv,
+    ) -> x0x_symphony_core::Result<HookOutcome> {
+        Manager::run_hook_in(self, handle, hook, env)
+            .await
+            .map_err(Error::into_core)
+    }
+
     async fn destroy(&self, handle: WorkspaceHandle) -> x0x_symphony_core::Result<()> {
         self.destroy_workspace(handle)
             .map(|_decision| ())

@@ -24,14 +24,15 @@ use futures_util::stream;
 use tempfile::TempDir;
 use x0x_symphony_core::{
     AgentId, Claim, EventStream, Handoff, Hook, HookEnv, HookOutcome, HookStatus, Issue, IssueId,
-    IssueState, PollContext, Prompt, ReleaseReason, ReleaseReasonCode, Result as CoreResult,
-    Runner, RunnerCapabilities, RunnerEvent, SessionContext, SessionHandle, SessionId, TurnOutcome,
-    TurnStatus, UsageReport, Workspace, WorkspaceHandle,
+    IssueState, LifecycleHooks, PollContext, Prompt, ReleaseReason, ReleaseReasonCode,
+    Result as CoreResult, Runner, RunnerCapabilities, RunnerEvent, SessionContext, SessionHandle,
+    SessionId, TurnOutcome, TurnStatus, UsageReport, Workspace, WorkspaceHandle,
 };
 use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
     Orchestrator, SystemClock,
 };
+use x0x_symphony_workspace::{Config as WorkspaceConfig, Manager};
 
 fn make_issue(id: &str, state: &str) -> Result<Issue, Box<dyn Error>> {
     Ok(Issue::new(
@@ -339,12 +340,44 @@ fn now_iso() -> String {
 // ---------- builders ----------
 
 fn config_with(retry: RetryPolicy, concurrency: usize) -> Result<Config, Box<dyn Error>> {
+    config_with_hooks(
+        retry,
+        concurrency,
+        LifecycleHooks::default(),
+        vec![state("done")?, state("cancelled")?],
+    )
+}
+
+fn config_with_hooks(
+    retry: RetryPolicy,
+    concurrency: usize,
+    hooks: LifecycleHooks,
+    terminal_states: Vec<IssueState>,
+) -> Result<Config, Box<dyn Error>> {
     Ok(Config::builder(agent()?)
         .active_states(vec![state("todo")?])
-        .terminal_states(vec![state("done")?, state("cancelled")?])
+        .terminal_states(terminal_states)
         .global_concurrency(concurrency)
         .retry(retry)
+        .hooks(hooks)
         .build())
+}
+
+fn record_hook_script(log: &Path) -> String {
+    format!(
+        "printf '%s|%s|%s|%s|%s\\n' \"$HOOK_PHASE\" \"$PWD\" \"$ISSUE_ID\" \"$AGENT_ID\" \"$CLAIM_ID\" >> '{}'",
+        log.display()
+    )
+}
+
+fn read_hook_log(log: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    if !log.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(std::fs::read_to_string(log)?
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 fn fast_retry(max_attempts: u32) -> RetryPolicy {
@@ -401,6 +434,269 @@ async fn end_to_end_smoke_todo_to_review() -> Result<(), Box<dyn Error>> {
     // Workspace created but never destroyed (review is not a terminal cleanup state).
     assert_eq!(guard(&workspace.created).clone().len(), 1);
     assert!(guard(&workspace.destroyed).clone().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_hooks_fire_in_order_in_workspace_dir() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let log = tmp.path().join("hooks.log");
+    let script = record_hook_script(&log);
+    let hooks = LifecycleHooks::new(1_000)
+        .with_after_create(script.clone())
+        .with_before_run(script.clone())
+        .with_after_run(script.clone())
+        .with_before_remove(script);
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9401", "todo")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(Manager::new(WorkspaceConfig::new(
+        tmp.path().join("workspaces"),
+    ))?);
+    let expected_dir = workspace.canonical_root().join("XSY-9401");
+    let orc = orc(
+        Arc::clone(&tracker),
+        Arc::clone(&runner),
+        Arc::clone(&workspace),
+        sysclock(),
+        config_with_hooks(fast_retry(1), 1, hooks, vec![state("review")?])?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+    assert_eq!(resolution, Resolution::Completed);
+
+    let lines = read_hook_log(&log)?;
+    let records = lines
+        .iter()
+        .map(|line| line.split('|').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let phases = records
+        .iter()
+        .map(|parts| parts.first().copied().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        vec!["after_create", "before_run", "after_run", "before_remove"]
+    );
+    let expected_dir_text = expected_dir.to_string_lossy();
+    for parts in &records {
+        assert_eq!(parts.get(1).copied(), Some(expected_dir_text.as_ref()));
+        assert_eq!(parts.get(2).copied(), Some("XSY-9401"));
+        assert_eq!(parts.get(3).copied(), Some("agent-a"));
+        assert!(
+            parts
+                .get(4)
+                .is_some_and(|claim_id| claim_id.contains("XSY-9401")),
+            "CLAIM_ID should identify the claim: {parts:?}"
+        );
+    }
+    assert!(
+        !expected_dir.exists(),
+        "terminal cleanup should remove workspace"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn before_remove_does_not_fire_on_shutdown_release() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let log = tmp.path().join("before-remove.log");
+    let hooks = LifecycleHooks::new(1_000).with_before_remove(record_hook_script(&log));
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9402", "todo")?]));
+    let runner = Arc::new(StubRunner::hanging());
+    let workspace = Arc::new(Manager::new(WorkspaceConfig::new(
+        tmp.path().join("workspaces"),
+    ))?);
+    let expected_dir = workspace.canonical_root().join("XSY-9402");
+    let orc = Arc::new(orc(
+        Arc::clone(&tracker),
+        runner,
+        Arc::clone(&workspace),
+        sysclock(),
+        config_with_hooks(fast_retry(1), 1, hooks, vec![state("review")?])?,
+    ));
+
+    let claim = orc.claim_next().await?.ok_or("should claim XSY-9402")?;
+    let run_orc = Arc::clone(&orc);
+    let run_task = tokio::spawn(async move { run_orc.run_claim(claim).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let signaled = orc.shutdown().await;
+    assert_eq!(signaled, 1);
+
+    let resolution = run_task.await?;
+    assert_eq!(resolution?, Resolution::ShutdownReleased);
+    assert!(read_hook_log(&log)?.is_empty());
+    assert!(
+        expected_dir.exists(),
+        "shutdown release must preserve workspace"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn after_create_failure_blocks_and_releases_claim() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let hooks = LifecycleHooks::new(1_000).with_after_create("exit 7");
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9403", "todo")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(Manager::new(WorkspaceConfig::new(
+        tmp.path().join("workspaces"),
+    ))?);
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config_with_hooks(fast_retry(1), 1, hooks, vec![state("done")?])?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+    assert_eq!(resolution, Resolution::Blocked);
+
+    let issues = lock(&tracker.issues)?.clone();
+    assert_eq!(issues[0].state, state("blocked")?);
+    assert!(
+        issues[0].claim.is_none(),
+        "blocked issue should release claim"
+    );
+    let reason = issues[0]
+        .extra
+        .get("blocked_reason")
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+        .ok_or("blocked reason message")?;
+    assert!(reason.contains("after_create hook failed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn before_run_failure_blocks_and_releases_claim() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let hooks = LifecycleHooks::new(1_000).with_before_run("exit 9");
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9406", "todo")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(Manager::new(WorkspaceConfig::new(
+        tmp.path().join("workspaces"),
+    ))?);
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config_with_hooks(fast_retry(1), 1, hooks, vec![state("done")?])?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+    assert_eq!(resolution, Resolution::Blocked);
+
+    let issues = lock(&tracker.issues)?.clone();
+    assert_eq!(issues[0].state, state("blocked")?);
+    assert!(
+        issues[0].claim.is_none(),
+        "blocked issue should release claim"
+    );
+    let reason = issues[0]
+        .extra
+        .get("blocked_reason")
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+        .ok_or("blocked reason message")?;
+    assert!(reason.contains("before_run hook failed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn after_run_failure_preserves_successful_runner_output() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let hooks = LifecycleHooks::new(1_000).with_after_run("exit 2");
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9407", "todo")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(Manager::new(WorkspaceConfig::new(
+        tmp.path().join("workspaces"),
+    ))?);
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config_with_hooks(fast_retry(1), 1, hooks, vec![state("done")?])?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+    assert_eq!(resolution, Resolution::Completed);
+
+    let issues = lock(&tracker.issues)?.clone();
+    assert_eq!(issues[0].state, state("review")?);
+    assert!(issues[0].claim.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn hook_timeout_blocks_without_waiting_for_script() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let hooks = LifecycleHooks::new(50).with_after_create("sleep 5");
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9404", "todo")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(Manager::new(WorkspaceConfig::new(
+        tmp.path().join("workspaces"),
+    ))?);
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config_with_hooks(fast_retry(1), 1, hooks, vec![state("done")?])?,
+    );
+
+    let started = std::time::Instant::now();
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+    let elapsed = started.elapsed();
+
+    assert_eq!(resolution, Resolution::Blocked);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "hook timeout should stop the sleeping script quickly, elapsed {elapsed:?}"
+    );
+    let issues = lock(&tracker.issues)?.clone();
+    assert_eq!(issues[0].state, state("blocked")?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_and_absent_hook_scripts_are_noops() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let log = tmp.path().join("hooks.log");
+    let script = record_hook_script(&log);
+    let hooks = LifecycleHooks::new(1_000)
+        .with_after_create("")
+        .with_before_run(script.clone())
+        .with_after_run(script);
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9405", "todo")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(Manager::new(WorkspaceConfig::new(
+        tmp.path().join("workspaces"),
+    ))?);
+    let expected_dir = workspace.canonical_root().join("XSY-9405");
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        Arc::clone(&workspace),
+        sysclock(),
+        config_with_hooks(fast_retry(1), 1, hooks, vec![state("done")?])?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+    assert_eq!(resolution, Resolution::Completed);
+
+    let phases = read_hook_log(&log)?
+        .iter()
+        .map(|line| line.split('|').next().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(phases, vec!["before_run", "after_run"]);
+    assert!(
+        expected_dir.exists(),
+        "non-terminal review should preserve workspace"
+    );
     Ok(())
 }
 

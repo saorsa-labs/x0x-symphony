@@ -3,14 +3,14 @@
 Operational guidance for running an x0x-symphony agent against a local
 `issues/issues.jsonl` backlog.
 
-This guide describes the **M1 shipped behaviour** of `x0x-symphonyd` and the
+This guide describes the current shipped behaviour of `x0x-symphonyd` and the
 `x0x-symphony` CLI. It is kept consistent with what the code actually does —
-where an M1 boundary exists it is stated explicitly rather than papered over.
+where a boundary exists it is stated explicitly rather than papered over.
 
 For the interim security posture see [`security.md`](./security.md); for the
 architecture see [`../design/symphony.md`](../design/symphony.md).
 
-## M1 scope (what ships)
+## Current scope (what ships)
 
 M1 is a single-host vertical slice:
 
@@ -22,6 +22,9 @@ M1 is a single-host vertical slice:
 - **Workspace:** per-issue workspace created under `workspace.root/<sanitized-id>/`
   with path-containment + ID-sanitization (see `containment.rs`, red-team
   audited against §4.1).
+- **Lifecycle hooks:** `after_create`, `before_run`, and `after_run` execute
+  inside the per-issue workspace during dispatch; `before_remove` executes only
+  immediately before an actual terminal workspace cleanup.
 - **Orchestrator:** polls the tracker, claims under global + per-state
   concurrency caps, retries failed turns with capped exponential backoff,
   moves an issue to `blocked` on retry exhaustion, reconciles stale claims on
@@ -29,18 +32,8 @@ M1 is a single-host vertical slice:
 - **Daemon + CLI:** `x0x-symphonyd` serves a loopback-only HTTP API behind a
   bearer token; `x0x-symphony` is the operator CLI.
 
-### M1 boundaries (what M1 does NOT do — stated, not hidden)
+### Current boundaries (what still does NOT ship — stated, not hidden)
 
-- **Lifecycle hooks are validated but not executed per issue.** `config check`
-  requires and validates the four hook scripts (`after_create`, `before_run`,
-  `after_run`, `before_remove`) and their `timeout_ms`, so a malformed
-  `WORKFLOW.md` is rejected up front. The workspace crate **has** the tested
-  hook-running machinery (`Manager::run_hook` with timeouts + process-group
-  kill, covered by `proof_hook_timeout_kills_forked_child_process_group`), but
-  the M1 orchestrator dispatch path calls only `Workspace::create()` to obtain
-  the session path and does **not** invoke per-issue hooks at run time. Wiring
-  per-issue hook execution through dispatch is a tracked follow-up. **Do not
-  configure hooks expecting them to run in M1.**
 - **No distributed workers, no sandbox, no MLS.** The runner is an unsandboxed
   child process; execution is local-backlog-only until M3. The operator vouches
   for every command in `WORKFLOW.md` (see [`security.md`](./security.md)).
@@ -85,7 +78,7 @@ non-zero on any missing/invalid key, printing one clear error per problem:
 | `tracker` | `kind` (`git_issues`), `path` |
 | `polling` | `interval_ms` (≥ 1) |
 | `workspace` | `root` (`~` expanded) |
-| `hooks` | `timeout_ms`, `after_create`, `before_run`, `after_run`, `before_remove` |
+| `hooks` | `timeout_ms`; `after_create`, `before_run`, `after_run`, and `before_remove` are optional scripts (absent or empty = disabled) |
 | `agent` | `max_concurrent_agents`, `max_concurrent_agents_by_state`, `max_turns`, `max_retry_backoff_ms` |
 | `runner` | `kind` (`shell`); the `runner:` block is then resolved by `RunnerSpec::from_workflow_config` (so `runner.preset` is accepted) |
 
@@ -96,7 +89,27 @@ x0x-symphony config check --config WORKFLOW.md   # prints "config ok" or a list 
 x0x-symphony config show   --config WORKFLOW.md   # prints the parsed configuration
 ```
 
-## Security model (M1)
+### Lifecycle hooks
+
+Configured hook scripts run with `/bin/bash -euo pipefail -c` in the per-issue
+workspace directory. The hook process environment is explicit and does not
+inherit the daemon environment. Dispatch supplies:
+
+- `ISSUE_ID`
+- `AGENT_ID`
+- `WORKSPACE_DIR`
+- `CLAIM_ID`
+- `HOOK_PHASE` (`after_create`, `before_run`, `after_run`, or `before_remove`)
+
+`hooks.timeout_ms` applies independently to each hook. Timed-out hooks are
+killed with their process group where the platform supports it. `after_create`
+and `before_run` failures block the issue and clear the claim; `after_run`
+failures are logged as warnings without discarding the runner result.
+`before_remove` runs only when a dispatch transition is about to destroy a
+workspace because the reached state is configured as terminal; shutdown and
+retry releases preserve workspaces and do not fire `before_remove`.
+
+## Security model
 
 - **Loopback only.** The daemon binds `127.0.0.1` (or `::1`) and rejects any
   non-loopback bind such as `0.0.0.0` at startup. There is no flag to disable
@@ -217,4 +230,4 @@ the permanent backend), see the crate-level documentation of
 | Daemon exits with a schema violation at startup | `issues/issues.jsonl` has a malformed or blank line. Re-init the file empty (0 bytes) — do **not** seed it with `echo ""`, which adds a blank line. |
 | Daemon refuses to start: "bind address must be loopback" | `--bind` was set to a non-loopback address. Use `127.0.0.1:0`. |
 | Issue stuck in `in_progress` after a crash | Restart the daemon; startup reconciliation releases the stale claim (it has expired past `claim_ttl`). |
-| Hooks not running | Expected in M1 — see "M1 boundaries" above. Hooks are validated by `config check` but not executed per issue. |
+| Hooks not running | Confirm the script key is present and non-empty, `hooks.timeout_ms` is long enough, and the lifecycle point actually occurs. `before_remove` only runs when a workspace is about to be destroyed for a configured terminal state. |

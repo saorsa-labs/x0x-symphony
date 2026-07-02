@@ -14,9 +14,11 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tracing::warn;
 use x0x_symphony_core::{
-    Handoff, Issue, IssueId, Prompt, ReleaseReason, ReleaseReasonCode, Runner, SessionContext,
-    Tracker, TurnStatus, Workspace,
+    Claim, Handoff, HookEnv, HookName, HookOutcome, HookStatus, Issue, IssueId, Prompt,
+    ReleaseReason, ReleaseReasonCode, Runner, SessionContext, Tracker, TurnStatus, Workspace,
+    WorkspaceHandle,
 };
 
 use crate::{clock::Clock, error::Result, reconcile::is_fresh_self, Orchestrator};
@@ -178,6 +180,25 @@ impl<R: Runner> RunTurnExt for R {
     }
 }
 
+fn describe_hook_outcome(outcome: &HookOutcome) -> String {
+    let status = match &outcome.status {
+        HookStatus::Succeeded => "succeeded",
+        HookStatus::Failed => "failed",
+        HookStatus::TimedOut => "timed_out",
+    };
+    match outcome.exit_code {
+        Some(code) => format!("status={status}, exit_code={code}"),
+        None => format!("status={status}"),
+    }
+}
+
+fn claim_env_id(claim: &Claim) -> String {
+    match &claim.issue_id {
+        Some(issue_id) => format!("{}:{}:{}", issue_id.as_str(), claim.by.as_str(), claim.at),
+        None => format!("{}:{}", claim.by.as_str(), claim.at),
+    }
+}
+
 impl<T, R, W> Orchestrator<T, R, W>
 where
     // `T` is shared with the background heartbeat task spawned below; `R`/`W`
@@ -194,9 +215,9 @@ where
     /// as long as the run is in flight, so a run that outlasts the TTL keeps its
     /// claim fresh. On success the issue is handed off to `review`; on exhaustion
     /// it is moved to `blocked`; on shutdown the run is cancelled and the claim
-    /// released with `shutdown`. The workspace is **never** destroyed here —
-    /// `review`/`blocked` are not terminal cleanup states, and shutdown
-    /// explicitly preserves work for resumption.
+    /// released with `shutdown`. Workspaces are destroyed only when the state
+    /// reached by the dispatch transition is configured as terminal; retry and
+    /// shutdown releases preserve the workspace for resumption.
     ///
     /// # Ownership contract
     ///
@@ -223,10 +244,26 @@ where
         let handle = self.workspace.create(&issue).await?;
         let workspace_path = handle.path.clone();
 
+        if self
+            .block_if_hook_failed(&mut guard, &claim, &handle, HookName::AfterCreate)
+            .await?
+        {
+            self.cleanup_if_terminal(&claim, &handle, "blocked").await?;
+            return Ok(Resolution::Blocked);
+        }
+
         let max_attempts = self.config.retry.max_attempts();
         let mut attempts = 0_u32;
         loop {
             attempts += 1;
+            if self
+                .block_if_hook_failed(&mut guard, &claim, &handle, HookName::BeforeRun)
+                .await?
+            {
+                self.cleanup_if_terminal(&claim, &handle, "blocked").await?;
+                return Ok(Resolution::Blocked);
+            }
+
             let session = self
                 .runner
                 .start_session(SessionContext::new(issue.clone(), workspace_path.clone()))
@@ -252,6 +289,8 @@ where
             };
             let _ = self.runner.stop_session(outcome.session).await;
 
+            self.warn_after_run_hook_failure(&claim, &handle).await;
+
             match outcome.status {
                 TurnStatus::Succeeded => {
                     let handoff = Handoff::new(format!(
@@ -261,6 +300,7 @@ where
                     .with_file(workspace_path.to_string_lossy().into_owned());
                     guard.cancel_heartbeat();
                     self.tracker.handoff(&claim, handoff).await?;
+                    self.cleanup_if_terminal(&claim, &handle, "review").await?;
                     return Ok(Resolution::Completed);
                 }
                 TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled
@@ -279,6 +319,7 @@ where
                             ),
                         )
                         .await?;
+                    self.cleanup_if_terminal(&claim, &handle, "blocked").await?;
                     return Ok(Resolution::Blocked);
                 }
                 TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled => {
@@ -288,6 +329,156 @@ where
                 }
             }
         }
+    }
+
+    async fn block_if_hook_failed(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        handle: &WorkspaceHandle,
+        phase: HookName,
+    ) -> Result<bool> {
+        let phase_name = phase.as_str();
+        match self.run_hook_phase(claim, handle, phase).await {
+            Ok(None) => Ok(false),
+            Ok(Some(outcome)) if outcome.status.is_success() => Ok(false),
+            Ok(Some(outcome)) => {
+                self.block_for_hook_failure(
+                    guard,
+                    claim,
+                    phase_name,
+                    describe_hook_outcome(&outcome),
+                )
+                .await?;
+                Ok(true)
+            }
+            Err(error) => {
+                self.block_for_hook_failure(guard, claim, phase_name, error.to_string())
+                    .await?;
+                Ok(true)
+            }
+        }
+    }
+
+    async fn block_for_hook_failure(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        phase_name: &str,
+        detail: String,
+    ) -> Result<()> {
+        guard.cancel_heartbeat();
+        self.tracker
+            .block(
+                claim,
+                ReleaseReason::new(
+                    ReleaseReasonCode::Other,
+                    format!("{phase_name} hook failed: {detail}"),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn warn_after_run_hook_failure(&self, claim: &Claim, handle: &WorkspaceHandle) {
+        match self.run_hook_phase(claim, handle, HookName::AfterRun).await {
+            Ok(
+                None
+                | Some(HookOutcome {
+                    status: HookStatus::Succeeded,
+                    ..
+                }),
+            ) => {}
+            Ok(Some(outcome)) => {
+                warn!(
+                    issue_id = handle.issue_id.as_str(),
+                    detail = %describe_hook_outcome(&outcome),
+                    "after_run hook failed; preserving runner outcome"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    issue_id = handle.issue_id.as_str(),
+                    error = %error,
+                    "after_run hook errored; preserving runner outcome"
+                );
+            }
+        }
+    }
+
+    async fn cleanup_if_terminal(
+        &self,
+        claim: &Claim,
+        handle: &WorkspaceHandle,
+        state_name: &str,
+    ) -> Result<()> {
+        if !self
+            .config
+            .terminal_states
+            .iter()
+            .any(|state| state.as_str() == state_name)
+        {
+            return Ok(());
+        }
+
+        if self.before_remove_allows_cleanup(claim, handle).await {
+            self.workspace.destroy(handle.clone()).await?;
+        }
+        Ok(())
+    }
+
+    async fn before_remove_allows_cleanup(&self, claim: &Claim, handle: &WorkspaceHandle) -> bool {
+        match self
+            .run_hook_phase(claim, handle, HookName::BeforeRemove)
+            .await
+        {
+            Ok(
+                None
+                | Some(HookOutcome {
+                    status: HookStatus::Succeeded,
+                    ..
+                }),
+            ) => true,
+            Ok(Some(outcome)) => {
+                warn!(
+                    issue_id = handle.issue_id.as_str(),
+                    detail = %describe_hook_outcome(&outcome),
+                    "before_remove hook failed; preserving workspace"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    issue_id = handle.issue_id.as_str(),
+                    error = %error,
+                    "before_remove hook errored; preserving workspace"
+                );
+                false
+            }
+        }
+    }
+
+    async fn run_hook_phase(
+        &self,
+        claim: &Claim,
+        handle: &WorkspaceHandle,
+        phase: HookName,
+    ) -> Result<Option<HookOutcome>> {
+        let Some(hook) = self.config.hooks.hook(phase) else {
+            return Ok(None);
+        };
+        let env = self.hook_env(claim, handle, hook.name.as_str());
+        let outcome = self.workspace.run_hook_in(handle, &hook, &env).await?;
+        Ok(Some(outcome))
+    }
+
+    fn hook_env(&self, claim: &Claim, handle: &WorkspaceHandle, phase_name: &str) -> HookEnv {
+        HookEnv::new()
+            .with_var("ISSUE_ID", handle.issue_id.as_str())
+            .with_var("AGENT_ID", self.config.agent_id.as_str())
+            .with_var("WORKSPACE_DIR", handle.path.to_string_lossy().into_owned())
+            .with_var("CLAIM_ID", claim_env_id(claim))
+            .with_var("HOOK_PHASE", phase_name)
     }
 
     /// Fetch the current issue record behind a claim.

@@ -21,5 +21,5 @@ pub use runner::{
     SessionHandle, SessionId, TurnOutcome, TurnStatus, UsageReport,
 };
 pub use tracker::{PollContext, ReleaseReason, ReleaseReasonCode, Tracker};
-pub use workflow::{Hook, HookName, WorkflowDefinition, WorkflowPath};
+pub use workflow::{Hook, HookName, LifecycleHooks, WorkflowDefinition, WorkflowPath};
 pub use workspace::{HookEnv, HookOutcome, HookStatus, Workspace, WorkspaceHandle};

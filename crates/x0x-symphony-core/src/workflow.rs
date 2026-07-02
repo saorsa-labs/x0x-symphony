@@ -167,3 +167,105 @@ impl Hook {
         }
     }
 }
+
+/// Owned lifecycle hook configuration used by dispatch.
+///
+/// Empty or absent scripts are treated as no-ops for that lifecycle point. The
+/// timeout applies to every configured hook script.
+///
+/// # Examples
+///
+/// ```
+/// use x0x_symphony_core::{HookName, LifecycleHooks};
+///
+/// let hooks = LifecycleHooks::new(1_000).with_before_run("just fmt-check");
+/// assert_eq!(hooks.hook(HookName::BeforeRun).map(|hook| hook.timeout_ms), Some(1_000));
+/// assert!(hooks.hook(HookName::AfterRun).is_none());
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LifecycleHooks {
+    /// Timeout applied to each hook script, in milliseconds.
+    pub timeout_ms: u32,
+    /// Script configured for `after_create`; `None` or empty means no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_create: Option<String>,
+    /// Script configured for `before_run`; `None` or empty means no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_run: Option<String>,
+    /// Script configured for `after_run`; `None` or empty means no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_run: Option<String>,
+    /// Script configured for `before_remove`; `None` or empty means no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_remove: Option<String>,
+}
+
+impl Default for LifecycleHooks {
+    fn default() -> Self {
+        Self {
+            timeout_ms: 60_000,
+            after_create: None,
+            before_run: None,
+            after_run: None,
+            before_remove: None,
+        }
+    }
+}
+
+impl LifecycleHooks {
+    /// Construct hook configuration with no scripts and the given timeout.
+    #[must_use]
+    pub fn new(timeout_ms: u32) -> Self {
+        Self {
+            timeout_ms,
+            ..Self::default()
+        }
+    }
+
+    /// Return a copy with an `after_create` script.
+    #[must_use]
+    pub fn with_after_create(mut self, script: impl Into<String>) -> Self {
+        self.after_create = Some(script.into());
+        self
+    }
+
+    /// Return a copy with a `before_run` script.
+    #[must_use]
+    pub fn with_before_run(mut self, script: impl Into<String>) -> Self {
+        self.before_run = Some(script.into());
+        self
+    }
+
+    /// Return a copy with an `after_run` script.
+    #[must_use]
+    pub fn with_after_run(mut self, script: impl Into<String>) -> Self {
+        self.after_run = Some(script.into());
+        self
+    }
+
+    /// Return a copy with a `before_remove` script.
+    #[must_use]
+    pub fn with_before_remove(mut self, script: impl Into<String>) -> Self {
+        self.before_remove = Some(script.into());
+        self
+    }
+
+    /// Build a concrete hook for `name`, or `None` when that point is disabled.
+    #[must_use]
+    pub fn hook(&self, name: HookName) -> Option<Hook> {
+        let script = match name {
+            HookName::AfterCreate => self.after_create.as_deref(),
+            HookName::BeforeRun => self.before_run.as_deref(),
+            HookName::AfterRun => self.after_run.as_deref(),
+            HookName::BeforeRemove => self.before_remove.as_deref(),
+        }?;
+        if script.trim().is_empty() {
+            return None;
+        }
+        Some(Hook::new(
+            name,
+            script.to_owned(),
+            u64::from(self.timeout_ms),
+        ))
+    }
+}
