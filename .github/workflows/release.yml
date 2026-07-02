@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Mirror x0x release concurrency without publishing: a rerun for the same
+# tag/ref cancels the older in-flight validation build.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# contents: write is intentionally reserved for the M5 release jobs that will
+# create GitHub releases/assets. This M1 stub does not publish or sign anything.
+permissions:
+  contents: write
+
+jobs:
+  validate-release-metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "Release stub running for tag ${GITHUB_REF_NAME}."
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "::notice::Manual release-stub dry run on ${GITHUB_REF}; select a v* test tag such as v0.0.0-test to mirror a tag push."
+          else
+            echo "::error::Release workflow only supports v* tag pushes and manual dry runs."
+            exit 1
+          fi
+
+  # x0x issue #128 lesson: do not build a release tag unless CI succeeds for
+  # that tagged commit. Because the current CI workflow is branch/PR scoped,
+  # this stub gates the release matrix by re-running the canonical `just check`
+  # on the checked-out ref before any release build starts.
+  ci-gate:
+    name: CI gate (just check)
+    needs: validate-release-metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Require canonical CI success for this ref
+        run: just check
+
+  # Publish/sign/notarize jobs are deferred to M5 (XSY-0035/0036). This stub
+  # validates the build matrix on tag push and uploads build outputs only for
+  # verification. Per-binary packaging lands when x0x-symphony-bin exists
+  # (XSY-0007); do not reference daemon/CLI binaries before then.
+  build-release:
+    name: Build ${{ matrix.platform }}
+    needs: [validate-release-metadata, ci-gate]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64-gnu
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            use_zigbuild: true
+
+          - platform: linux-x64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            use_zigbuild: true
+
+          - platform: linux-arm64-gnu
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            use_zigbuild: true
+
+          - platform: macos-x64
+            os: macos-14
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            use_zigbuild: false
+
+          - platform: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            use_zigbuild: false
+
+          - platform: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            use_zigbuild: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Install Zig for Linux cargo-zigbuild targets
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild for Linux targets
+        if: matrix.use_zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Build workspace with cargo-zigbuild (Linux)
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --workspace --all-features --release --target ${{ matrix.target }}
+
+      - name: Build workspace with cargo (native)
+        if: ${{ !matrix.use_zigbuild }}
+        run: cargo build --workspace --all-features --release --target ${{ matrix.target }}
+
+      - name: Stage build artifacts for verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="release-artifacts/${{ matrix.platform }}"
+          release_dir="target/${{ matrix.target }}/release"
+          mkdir -p "${staging}"
+
+          {
+            echo "platform=${{ matrix.platform }}"
+            echo "target=${{ matrix.target }}"
+            echo "archive=${{ matrix.archive }}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "builder=$([[ '${{ matrix.use_zigbuild }}' == 'true' ]] && echo cargo-zigbuild || echo cargo)"
+            echo "note=Workspace build only; per-binary packaging lands with x0x-symphony-bin (XSY-0007)."
+          } > "${staging}/BUILD-METADATA.txt"
+
+          if [[ -d "${release_dir}" ]]; then
+            shopt -s nullglob
+            artifacts=("${release_dir}"/*.rlib "${release_dir}"/*.rmeta "${release_dir}"/*.d)
+            if (( ${#artifacts[@]} > 0 )); then
+              cp "${artifacts[@]}" "${staging}/"
+            else
+              echo "::notice::No top-level library artifacts found in ${release_dir}; uploading build metadata for verification."
+            fi
+          else
+            echo "::warning::Release directory ${release_dir} was not found after build."
+          fi
+
+          ls -la "${staging}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-${{ matrix.platform }}
+          path: release-artifacts/${{ matrix.platform }}/
+          if-no-files-found: error
