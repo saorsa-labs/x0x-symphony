@@ -103,8 +103,8 @@ This rule is stated in both the XSY-0017 schema doc and the XSY-0020 design.
 - **Sign** via `POST /agent/sign` with mandatory domain-separation `context`:
   `x0x-symphony-claim-v1` for claims, `x0x-symphony-handoff-v1` for handoffs.
   The daemon signs the canonical DST `[0xF0]|magic|len(u32 BE)|context|payload`
-  (see x0x `src/api/agent_signing.rs`); symphony **reproduces this DST exactly**
-  for `POST /agent/verify`.
+  (see x0x `src/api/agent_signing.rs`); symphony sends the **raw payload** to
+  `POST /agent/verify` because x0xd reconstructs the same DST internally.
 - **Envelope stored at sign time**: `signature_b64` + `algorithm`
   (`x0x.agent-sign.v2.ml-dsa-65`) + `context` + `public_key_b64`. x0xd's sign
   response returns the ML-DSA-65 public key (which `GET /agent` does *not*

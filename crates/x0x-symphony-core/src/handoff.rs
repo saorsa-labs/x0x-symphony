@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::{IssueId, SignatureEnvelope};
+
 /// Status for a validation command recorded in a handoff.
 ///
 /// # Examples
@@ -125,6 +127,15 @@ pub struct Handoff {
     /// Optional relative path to large proof artefacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proofs_dir: Option<String>,
+    /// Issue this signed handoff belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_id: Option<IssueId>,
+    /// x0x agent id that must match the signature envelope signer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_agent_id: Option<String>,
+    /// Signature envelope over the handoff payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<SignatureEnvelope>,
 }
 
 impl Handoff {
@@ -146,6 +157,9 @@ impl Handoff {
             validation: Vec::new(),
             follow_up: Vec::new(),
             proofs_dir: None,
+            issue_id: None,
+            signer_agent_id: None,
+            signature: None,
         }
     }
 
@@ -211,6 +225,20 @@ impl Handoff {
     #[must_use]
     pub fn with_proofs_dir(mut self, proofs_dir: impl Into<String>) -> Self {
         self.proofs_dir = Some(proofs_dir.into());
+        self
+    }
+
+    /// Return a copy bound to an issue id for signing.
+    #[must_use]
+    pub fn with_issue_id(mut self, issue_id: IssueId) -> Self {
+        self.issue_id = Some(issue_id);
+        self
+    }
+
+    /// Return a copy bound to the x0x signer id for signing.
+    #[must_use]
+    pub fn with_signer_agent_id(mut self, signer_agent_id: impl Into<String>) -> Self {
+        self.signer_agent_id = Some(signer_agent_id.into());
         self
     }
 }

@@ -16,7 +16,7 @@ const fn default_issue_schema_version() -> u32 {
 /// Stable tracker identifier for an issue.
 ///
 /// `IssueId` is a newtype rather than a raw string so tracker code cannot
-/// accidentally pass an agent identifier where an issue identifier is expected.
+/// accidentally pass an agent identifier where an issue identifier is required.
 ///
 /// # Examples
 ///

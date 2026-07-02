@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, IssueId};
+use crate::{AgentId, IssueId, SignatureEnvelope};
 
 /// Role held by a claimant inside an issue's frozen shard slate.
 ///
@@ -131,9 +131,9 @@ pub struct Claim {
     pub heartbeat_at: String,
     /// Claimant's role in the issue's shard slate.
     pub shard_role: ShardRole,
-    /// Signature over the claim payload. M1 manual claims may omit this.
+    /// Signature envelope over the claim payload. Local-dev claims may omit this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
+    pub signature: Option<SignatureEnvelope>,
 }
 
 impl Claim {

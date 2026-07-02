@@ -149,7 +149,7 @@ struct RunTurnOutcome {
 /// later `stop_session`. The core `Runner` trait takes the session by value, so
 /// we wrap the call and thread the handle back out.
 ///
-/// `#[allow(async_fn_in_trait)]`: this is a private helper trait whose async
+/// The async-fn-in-trait allowance below is scoped to this private helper trait whose async
 /// future is awaited locally inside `run_claim`'s `select!` and is never spawned
 /// or sent across threads, so the lint's `Send`-bound concern does not apply.
 /// Declared and signed off in the XSY-0006 audit follow-up.

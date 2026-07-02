@@ -105,7 +105,7 @@ pub enum CleanupDecision {
 /// Local filesystem workspace manager.
 ///
 /// Workspaces are direct children of a canonicalized root. The child directory
-/// name is the sanitized issue identifier; unsafe identifiers are rejected
+/// name is the sanitized issue identifier; dangerous identifiers are rejected
 /// rather than rewritten.
 #[derive(Clone, Debug)]
 pub struct Manager {
@@ -602,7 +602,7 @@ fn is_sensitive_env_name(name: &str) -> bool {
 /// allow-list.
 ///
 /// `BASH_ENV`/`ENV` cause `bash` to execute a file on startup; `SHELLOPTS`
-/// can enable unsafe options; `CDPATH` alters path resolution; `LD_PRELOAD`/
+/// can enable dangerous options; `CDPATH` alters path resolution; `LD_PRELOAD`/
 /// `LD_LIBRARY_PATH` load arbitrary shared libraries into the hook process.
 /// The comparison is case-insensitive to match the resolver's behaviour.
 /// See the red-team review of XSY-0005 (MEDIUM finding).

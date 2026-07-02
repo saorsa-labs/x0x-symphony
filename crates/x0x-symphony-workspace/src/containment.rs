@@ -109,7 +109,7 @@ pub enum ContainmentError {
         stem: String,
     },
 
-    /// A path expected to be absolute was relative.
+    /// A path that must be absolute was relative.
     #[error("workspace path is not absolute: {path}", path = .path.display())]
     RelativePath {
         /// Rejected path.
@@ -225,7 +225,10 @@ pub fn sanitize_issue_identifier(raw: &str) -> Result<SanitizedIdentifier, Conta
     // `.`) matches a Windows reserved device name. These pass the ASCII
     // whitelist but resolve to devices rather than directories on Windows.
     // See the red-team review of XSY-0005 (MEDIUM finding).
-    let stem = raw.split('.').next().unwrap_or(raw);
+    let stem = match raw.split('.').next() {
+        Some(value) => value,
+        None => raw,
+    };
     let upper_stem = stem.to_ascii_uppercase();
     if is_reserved_windows_device_name(&upper_stem) {
         return Err(ContainmentError::ReservedDeviceName { stem: upper_stem });

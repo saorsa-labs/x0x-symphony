@@ -60,7 +60,11 @@ impl RetryPolicy {
         let multiplier = 1_u64 << factor;
         let base_nanos = self.base.as_nanos().min(u128::from(u64::MAX));
         let raw_nanos = base_nanos.saturating_mul(u128::from(multiplier));
-        let nanos = u64::try_from(raw_nanos).unwrap_or(u64::MAX);
+        let capped = raw_nanos.min(u128::from(u64::MAX));
+        let bytes = capped.to_le_bytes();
+        let nanos = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
         Duration::from_nanos(nanos).min(self.max)
     }
 

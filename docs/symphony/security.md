@@ -81,8 +81,9 @@ This posture is **not**:
 - **A sandbox.** There is no process isolation, syscall filtering, or
   filesystem namespace confinement until XSY-0027 at M4. The runner has
   the full privileges of the `x0x-symphonyd` process.
-- **Signature verification.** Claims and handoffs are *not* signed or
-  verified during M1–M2. ML-DSA-65 signing arrives with XSY-0020 at M3.
+- **A process boundary.** Signing claims and handoffs does not isolate the
+  runner. ML-DSA-65 signatures authenticate tracker metadata; process
+  sandboxing still arrives with XSY-0027 at M4.
 - **Trust-gated dispatch.** There is no trust-level evaluation before
   M3. All dispatched work is local and operator-controlled, so the trust
   gate is not yet exercised.
@@ -95,13 +96,64 @@ signature + trust level (XSY-0039) from the moment that path exists.
 
 ---
 
+## Signed claims and handoffs (XSY-0020)
+
+`signing.policy = required` signs claim and handoff payloads at the async
+Tracker boundary. The sync JSONL helpers still only parse, mutate, and serialize
+records; they never perform HTTP. Required signing uses a prepare → sign → commit
+sequence: build the unsigned payload without writing, call x0xd, re-read and
+re-check ownership/state, then write the signed record once. If the record
+changed during signing, the signature is discarded and no unsigned fallback is
+written.
+
+The stored `signature` envelope contains:
+
+- `algorithm`: `x0x.agent-sign.v2.ml-dsa-65`
+- `context`: `x0x-symphony-claim-v1` or `x0x-symphony-handoff-v1`
+- `public_key_b64` and `signature_b64`: x0xd's ML-DSA-65 public key and
+  detached signature
+- `payload_sha256`: hex SHA-256 of the raw claim/handoff signing payload bytes
+- `signer_agent_id`: x0x agent id returned by `/agent/sign`
+
+Symphony sends raw claim/handoff payload bytes to both `/agent/sign` and
+`/agent/verify`. x0xd reconstructs the external domain-separated buffer
+internally on both endpoints:
+
+```text
+[0xF0] || b"x0x.external-agent-sign.v1" || context_len(u32 BE) || context || payload
+```
+
+Do not pre-wrap payloads with that DST before verification; doing so would ask
+x0xd to verify `DST(context, DST(context, payload))`.
+
+Verification on read checks, in order: envelope algorithm/context, payload
+SHA-256, signer/owner binding, trusted-key belonging, and x0xd's
+`/agent/verify` result. The trusted-key resolver for M2 accepts only the local
+x0xd agent key learned from `/agent/sign` (or a bootstrap sign probe). A record
+is rejected if the envelope public key differs from the resolver's key for the
+signer, even when `/agent/verify` would return true for the supplied key.
+Invalid or unsigned claim/handoff records are dropped from async read results
+with a WARN log in Required mode; Disabled mode skips signing and verification
+for local development.
+
+Handoff signatures bind two additive fields into the signed payload:
+`issue_id` and `signer_agent_id`. They are required whenever
+`handoff.signature` is present and prevent replaying a valid handoff onto a
+different issue.
+
+Claim `heartbeat_at` is intentionally excluded from the claim signing payload.
+It is a mutable liveness signal, not an attestation; heartbeat refreshes keep
+the original signature valid and do not call x0xd.
+
+---
+
 ## Future hardening
 
 The following issues extend or supersede this posture, in milestone order:
 
 | Issue | Milestone | What it adds |
 |-------|-----------|--------------|
-| [XSY-0020](../../issues/issues.jsonl) | M3 | ML-DSA-65 signing + verification of claim and handoff payloads |
+| [XSY-0020](../../issues/issues.jsonl) | M2 | ML-DSA-65 signing + verification of claim and handoff payloads |
 | [XSY-0022](../../issues/issues.jsonl) | M3 | Trust-gated dispatch: rejects non-trusted agents on sensitive tasks |
 | [XSY-0039](../../issues/issues.jsonl) | M3 | Dispatch gate: orchestrator refuses network-sourced issues without verified signature + trust |
 | [XSY-0027](../../issues/issues.jsonl) | M4 | Sandbox profiles (firejail / sandbox-exec) — extends *this file* with profile mapping |

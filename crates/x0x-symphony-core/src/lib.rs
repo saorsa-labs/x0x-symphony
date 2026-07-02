@@ -8,6 +8,7 @@ pub mod error;
 pub mod handoff;
 pub mod issue;
 pub mod runner;
+pub mod signing;
 pub mod tracker;
 pub mod workflow;
 pub mod workspace;
@@ -20,6 +21,7 @@ pub use runner::{
     EventStream, Prompt, Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext,
     SessionHandle, SessionId, TurnOutcome, TurnStatus, UsageReport,
 };
+pub use signing::{sha256_hex, SignatureEnvelope, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM};
 pub use tracker::{PollContext, ReleaseReason, ReleaseReasonCode, Tracker};
 pub use workflow::{Hook, HookName, LifecycleHooks, WorkflowDefinition, WorkflowPath};
 pub use workspace::{HookEnv, HookOutcome, HookStatus, Workspace, WorkspaceHandle};
