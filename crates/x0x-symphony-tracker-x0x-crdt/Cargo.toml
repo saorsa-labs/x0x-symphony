@@ -1,0 +1,31 @@
+[package]
+name = "x0x-symphony-tracker-x0x-crdt"
+description = "x0xd TaskList CRDT Tracker adapter for x0x-symphony."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures-core = "0.3"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+x0x-symphony-core = { path = "../x0x-symphony-core" }
+x0x-symphony-tracker-git-jsonl = { path = "../x0x-symphony-tracker-git-jsonl" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true
