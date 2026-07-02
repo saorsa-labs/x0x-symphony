@@ -78,9 +78,9 @@ This posture is **not**:
 
 - **A sandbox when `[runner.sandbox]` is absent.** Local development may
   still opt out by omitting the block. When a sandbox block is present,
-  the shell runner transforms the structured command plan before process
-  spawn and preserves the existing env-clear, stdio, timeout, and process
-  group layers.
+  the shell runner prepares the structured command plan into a wrapped command
+  before process spawn and preserves the existing env-clear, stdio, timeout,
+  and process group layers.
 - **Signature verification.** Claims and handoffs are *not* signed or
   verified during M1–M2. ML-DSA-65 signing arrives with XSY-0020 at M3.
 - **Trust-gated dispatch.** There is no trust-level evaluation before
@@ -99,9 +99,10 @@ signature + trust level (XSY-0039) from the moment that path exists.
 
 The shell runner accepts an optional `[runner.sandbox]` / `runner.sandbox:`
 block. If omitted, behavior is unchanged and local work runs unsandboxed.
-If present, the runner resolves a backend at construction time, mutates a
-`CommandPlan` before building `tokio::process::Command`, then applies the
-existing env-clear, stdio-pipe, timeout, and process-group layers.
+If present, the runner resolves a backend at construction time, prepares a
+`CommandPlan` into a `WrappedCommand` plus `SandboxSession`, then builds
+`tokio::process::Command` and applies the existing env-clear, stdio-pipe,
+timeout, and process-group layers.
 
 Profiles:
 

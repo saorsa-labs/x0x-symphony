@@ -1,9 +1,9 @@
 //! Host sandbox profile planning for the shell runner.
 //!
-//! The sandbox layer rewrites a structured [`CommandPlan`] before the runner
-//! builds `tokio::process::Command`. It never attempts to inspect a built
-//! command because Tokio's command type intentionally has no getters for argv,
-//! cwd, or environment.
+//! The sandbox layer prepares a structured [`CommandPlan`] into a [`WrappedCommand`]
+//! before the runner builds `tokio::process::Command`. It never attempts to inspect
+//! a built command because Tokio's command type intentionally has no getters for
+//! argv, cwd, or environment.
 
 use std::{
     collections::BTreeMap,
@@ -30,7 +30,7 @@ const LANDLOCK_BINARY: &str = "landlock-restrict";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_NOT_APPLICABLE_EXIT: i32 = 77;
 
-/// A command's raw execution fields before it is converted into a Tokio command.
+/// The runner's desired command before sandboxing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandPlan {
     /// Executable name or absolute path.
@@ -58,6 +58,60 @@ impl CommandPlan {
             cwd,
             env,
         }
+    }
+}
+
+/// The sandboxed command the runner spawns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrappedCommand {
+    /// Executable name or absolute path after sandbox wrapping.
+    pub program: String,
+    /// Argument vector passed without shell interpolation after sandbox wrapping.
+    pub args: Vec<String>,
+    /// Working directory used when spawning the wrapped command.
+    pub cwd: PathBuf,
+    /// Complete child environment after runner and sandbox additions.
+    pub env: BTreeMap<String, String>,
+}
+
+impl From<CommandPlan> for WrappedCommand {
+    fn from(plan: CommandPlan) -> Self {
+        Self {
+            program: plan.program,
+            args: plan.args,
+            cwd: plan.cwd,
+            env: plan.env,
+        }
+    }
+}
+
+/// Result of preparing a command for sandboxed execution.
+pub struct PreparedCommand {
+    /// Wrapped command to spawn.
+    pub command: WrappedCommand,
+    /// Per-session sandbox lifecycle handle.
+    pub session: Box<dyn SandboxSession>,
+}
+
+/// Per-session sandbox resources that must be released after execution.
+#[async_trait]
+pub trait SandboxSession: Send {
+    /// Release backend resources associated with this prepared command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when backend cleanup fails.
+    async fn shutdown(&mut self) -> Result<()>;
+}
+
+/// Lifecycle handle for unsandboxed or externally self-cleaning commands.
+#[derive(Debug, Default)]
+pub struct NoopSession;
+
+#[async_trait]
+impl SandboxSession for NoopSession {
+    async fn shutdown(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -315,13 +369,16 @@ pub struct ProbeReport {
 /// Object-safe sandbox interface used by the runner.
 #[async_trait]
 pub trait Sandbox: Send + Sync {
-    /// Mutate a command plan before the Tokio command is built.
+    /// Prepare a command for sandboxed execution.
+    ///
+    /// The command plan's `cwd` is per call, and `source` controls fail-closed
+    /// behavior for future network-sourced work.
     ///
     /// # Errors
     ///
     /// Returns an error when the configured backend is unavailable under a
     /// fail-closed policy or when the plan cannot be represented safely.
-    async fn transform(&self, plan: &mut CommandPlan) -> Result<()>;
+    async fn prepare(&self, plan: CommandPlan, source: IssueSource) -> Result<PreparedCommand>;
 
     /// Run the backend self-test and return a structured report.
     ///
@@ -367,7 +424,7 @@ impl HostSandbox {
         })
     }
 
-    fn handle_unavailable(&self, plan: &CommandPlan) -> Result<bool> {
+    fn handle_unavailable(&self, plan: &CommandPlan, source: IssueSource) -> Result<bool> {
         if self.spec.backend != Backend::None && self.backend_available {
             return Ok(false);
         }
@@ -376,7 +433,9 @@ impl HostSandbox {
         } else {
             format!("{} is unavailable", self.spec.backend.as_str())
         };
-        if self.spec.on_unavailable == UnavailablePolicy::FailClosed {
+        if source == IssueSource::NetworkSourced
+            || self.spec.on_unavailable == UnavailablePolicy::FailClosed
+        {
             return Err(Error::SandboxUnavailable {
                 backend: self.spec.backend.as_str().to_owned(),
                 message,
@@ -390,18 +449,18 @@ impl HostSandbox {
         Ok(true)
     }
 
-    fn transform_available(&self, plan: &mut CommandPlan) {
+    fn wrap_available(&self, plan: &mut CommandPlan) {
         match self.spec.backend {
-            Backend::SandboxRuntime => self.transform_sandbox_runtime(plan),
-            Backend::Bubblewrap => self.transform_bubblewrap(plan),
-            Backend::Landlock => self.transform_landlock(plan),
-            Backend::SandboxExec => self.transform_sandbox_exec(plan),
+            Backend::SandboxRuntime => self.wrap_sandbox_runtime(plan),
+            Backend::Bubblewrap => self.wrap_bubblewrap(plan),
+            Backend::Landlock => self.wrap_landlock(plan),
+            Backend::SandboxExec => self.wrap_sandbox_exec(plan),
             Backend::Auto | Backend::None => {}
         }
         self.apply_resource_limits(plan);
     }
 
-    fn transform_sandbox_runtime(&self, plan: &mut CommandPlan) {
+    fn wrap_sandbox_runtime(&self, plan: &mut CommandPlan) {
         let mut args = vec![
             "run".to_owned(),
             "--profile".to_owned(),
@@ -425,7 +484,7 @@ impl HostSandbox {
         replace_with_wrapper(plan, SRT_BINARY, args);
     }
 
-    fn transform_bubblewrap(&self, plan: &mut CommandPlan) {
+    fn wrap_bubblewrap(&self, plan: &mut CommandPlan) {
         let mut args = bubblewrap_namespace_args(&self.spec);
         args.extend(["--ro-bind".to_owned(), "/".to_owned(), "/".to_owned()]);
         if self.spec.profile.workspace_read_only() {
@@ -457,7 +516,7 @@ impl HostSandbox {
         replace_with_wrapper(plan, BWRAP_BINARY, args);
     }
 
-    fn transform_landlock(&self, plan: &mut CommandPlan) {
+    fn wrap_landlock(&self, plan: &mut CommandPlan) {
         let mut args = Vec::new();
         if self.spec.profile.workspace_read_only() {
             args.push("--ro".to_owned());
@@ -478,7 +537,7 @@ impl HostSandbox {
         replace_with_wrapper(plan, LANDLOCK_BINARY, args);
     }
 
-    fn transform_sandbox_exec(&self, plan: &mut CommandPlan) {
+    fn wrap_sandbox_exec(&self, plan: &mut CommandPlan) {
         let profile = sandbox_exec_profile(&self.spec, &plan.cwd);
         let args = vec!["-p".to_owned(), profile];
         replace_with_wrapper(plan, SANDBOX_EXEC_PATH, args);
@@ -502,15 +561,30 @@ impl HostSandbox {
         if let Some(path) = env::var_os("PATH").and_then(os_string_into_string) {
             env.insert("PATH".to_owned(), path);
         }
-        let mut plan = CommandPlan::new(program, args, workspace.to_path_buf(), env);
-        if let Err(error) = self.transform(&mut plan).await {
+        let plan = CommandPlan::new(program, args, workspace.to_path_buf(), env);
+        let prepared = match self.prepare(plan, IssueSource::Local).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return ProbeCheck {
+                    name: name.to_owned(),
+                    status: ProbeStatus::NotApplicable,
+                    detail: format!("probe could not prepare command: {error}"),
+                };
+            }
+        };
+        let PreparedCommand {
+            command,
+            mut session,
+        } = prepared;
+        let run = run_probe_plan(&command).await;
+        if let Err(error) = session.shutdown().await {
             return ProbeCheck {
                 name: name.to_owned(),
-                status: ProbeStatus::NotApplicable,
-                detail: format!("probe could not transform command: {error}"),
+                status: ProbeStatus::Fail,
+                detail: format!("probe sandbox shutdown failed: {error}"),
             };
         }
-        match run_probe_plan(&plan).await {
+        match run {
             ProbeRun::Blocked(detail) => ProbeCheck {
                 name: name.to_owned(),
                 status: ProbeStatus::Pass,
@@ -532,12 +606,18 @@ impl HostSandbox {
 
 #[async_trait]
 impl Sandbox for HostSandbox {
-    async fn transform(&self, plan: &mut CommandPlan) -> Result<()> {
-        if self.handle_unavailable(plan)? {
-            return Ok(());
+    async fn prepare(&self, mut plan: CommandPlan, source: IssueSource) -> Result<PreparedCommand> {
+        if self.handle_unavailable(&plan, source)? {
+            return Ok(PreparedCommand {
+                command: WrappedCommand::from(plan),
+                session: Box::new(NoopSession),
+            });
         }
-        self.transform_available(plan);
-        Ok(())
+        self.wrap_available(&mut plan);
+        Ok(PreparedCommand {
+            command: WrappedCommand::from(plan),
+            session: Box::new(NoopSession),
+        })
     }
 
     async fn probe(&self) -> Result<ProbeReport> {
@@ -549,27 +629,6 @@ impl Sandbox for HostSandbox {
         })?;
 
         let mut checks = Vec::new();
-        if self.spec.backend == Backend::None || !self.backend_available {
-            for name in [
-                "write-outside-workspace",
-                "secret-read",
-                "host-pid-invisible",
-                "non-allowlisted-network",
-            ] {
-                checks.push(ProbeCheck {
-                    name: name.to_owned(),
-                    status: ProbeStatus::NotApplicable,
-                    detail: "backend unavailable".to_owned(),
-                });
-            }
-            cleanup_probe_root(&root)?;
-            return Ok(ProbeReport {
-                backend: self.spec.backend,
-                profile: self.spec.profile,
-                checks,
-            });
-        }
-
         let outside = root.join("outside.txt");
         checks.push(
             self.probe_check(
@@ -954,7 +1013,7 @@ enum ProbeRun {
     NotApplicable(String),
 }
 
-async fn run_probe_plan(plan: &CommandPlan) -> ProbeRun {
+async fn run_probe_plan(plan: &WrappedCommand) -> ProbeRun {
     let mut command = Command::new(&plan.program);
     command
         .args(&plan.args)
@@ -1020,7 +1079,16 @@ mod tests {
         }
     }
 
-    fn assert_profile_mapping(backend: Backend, profile: SandboxProfile, plan: &CommandPlan) {
+    async fn prepared_command(sandbox: &HostSandbox, plan: CommandPlan) -> Result<WrappedCommand> {
+        let PreparedCommand {
+            command,
+            mut session,
+        } = sandbox.prepare(plan, IssueSource::Local).await?;
+        session.shutdown().await?;
+        Ok(command)
+    }
+
+    fn assert_profile_mapping(backend: Backend, profile: SandboxProfile, plan: &WrappedCommand) {
         match backend {
             Backend::SandboxRuntime => {
                 assert_eq!(plan.program, SRT_BINARY);
@@ -1036,7 +1104,7 @@ mod tests {
         }
     }
 
-    fn assert_bubblewrap_profile(profile: SandboxProfile, plan: &CommandPlan) {
+    fn assert_bubblewrap_profile(profile: SandboxProfile, plan: &WrappedCommand) {
         assert_eq!(plan.program, BWRAP_BINARY);
         let workspace_flag = if profile.workspace_read_only() {
             "--ro-bind"
@@ -1061,7 +1129,7 @@ mod tests {
         }
     }
 
-    fn assert_landlock_profile(profile: SandboxProfile, plan: &CommandPlan) {
+    fn assert_landlock_profile(profile: SandboxProfile, plan: &WrappedCommand) {
         assert_eq!(plan.program, LANDLOCK_BINARY);
         let workspace_flag = if profile.workspace_read_only() {
             "--ro"
@@ -1086,7 +1154,7 @@ mod tests {
         }
     }
 
-    fn assert_sandbox_exec_profile(profile: SandboxProfile, plan: &CommandPlan) {
+    fn assert_sandbox_exec_profile(profile: SandboxProfile, plan: &WrappedCommand) {
         assert_eq!(plan.program, SANDBOX_EXEC_PATH);
         let profile_text = plan.args.get(1).map(String::as_str).unwrap_or_default();
         if profile.workspace_read_only() {
@@ -1121,12 +1189,13 @@ mod tests {
                 SandboxProfile::CiOnly,
             ] {
                 let sandbox = available_sandbox(spec(profile, backend));
-                let mut plan = plan();
 
-                let result = sandbox.transform(&mut plan).await;
+                let result = prepared_command(&sandbox, plan()).await;
 
                 assert!(result.is_ok());
-                assert_profile_mapping(backend, profile, &plan);
+                if let Ok(command) = result {
+                    assert_profile_mapping(backend, profile, &command);
+                }
             }
         }
     }
@@ -1138,17 +1207,17 @@ mod tests {
         let Ok(sandbox) = sandbox else {
             unreachable!("test spec is valid");
         };
-        let mut plan = plan();
-
-        let result = sandbox.transform(&mut plan).await;
+        let result = prepared_command(&sandbox, plan()).await;
 
         assert!(result.is_ok());
-        assert_eq!(plan.program, BWRAP_BINARY);
-        assert!(plan
-            .args
-            .windows(3)
-            .any(|window| window == ["--ro-bind", "/tmp/repo", WORKSPACE_MOUNT,]));
-        assert!(plan.args.iter().any(|arg| arg == "--unshare-all"));
+        if let Ok(command) = result {
+            assert_eq!(command.program, BWRAP_BINARY);
+            assert!(command
+                .args
+                .windows(3)
+                .any(|window| window == ["--ro-bind", "/tmp/repo", WORKSPACE_MOUNT,]));
+            assert!(command.args.iter().any(|arg| arg == "--unshare-all"));
+        }
     }
 
     #[tokio::test]
@@ -1158,16 +1227,16 @@ mod tests {
         let Ok(sandbox) = sandbox else {
             unreachable!("test spec is valid");
         };
-        let mut plan = plan();
-
-        let result = sandbox.transform(&mut plan).await;
+        let result = prepared_command(&sandbox, plan()).await;
 
         assert!(result.is_ok());
-        assert_eq!(plan.program, SANDBOX_EXEC_PATH);
-        let profile = plan.args.get(1).map(String::as_str).unwrap_or_default();
-        assert!(profile.contains("(allow file-write* (subpath \"/tmp/repo\"))"));
-        assert!(profile.contains("network-outbound"));
-        assert!(profile.contains("/home/me/.ssh"));
+        if let Ok(command) = result {
+            assert_eq!(command.program, SANDBOX_EXEC_PATH);
+            let profile = command.args.get(1).map(String::as_str).unwrap_or_default();
+            assert!(profile.contains("(allow file-write* (subpath \"/tmp/repo\"))"));
+            assert!(profile.contains("network-outbound"));
+            assert!(profile.contains("/home/me/.ssh"));
+        }
     }
 
     #[tokio::test]
@@ -1177,20 +1246,20 @@ mod tests {
         let Ok(sandbox) = sandbox else {
             unreachable!("test spec is valid");
         };
-        let mut plan = plan();
-
-        let result = sandbox.transform(&mut plan).await;
+        let result = prepared_command(&sandbox, plan()).await;
 
         assert!(result.is_ok());
-        assert_eq!(plan.program, SRT_BINARY);
-        assert!(plan
-            .args
-            .windows(2)
-            .any(|window| window == ["--profile", "ci-only"]));
-        assert!(plan
-            .args
-            .windows(2)
-            .any(|window| window == ["--egress-allow", "api.example.test"]));
+        if let Ok(command) = result {
+            assert_eq!(command.program, SRT_BINARY);
+            assert!(command
+                .args
+                .windows(2)
+                .any(|window| window == ["--profile", "ci-only"]));
+            assert!(command
+                .args
+                .windows(2)
+                .any(|window| window == ["--egress-allow", "api.example.test"]));
+        }
     }
 
     #[tokio::test]
@@ -1200,17 +1269,17 @@ mod tests {
         let Ok(sandbox) = sandbox else {
             unreachable!("test spec is valid");
         };
-        let mut plan = plan();
-
-        let result = sandbox.transform(&mut plan).await;
+        let result = prepared_command(&sandbox, plan()).await;
 
         assert!(result.is_ok());
-        assert_eq!(plan.program, LANDLOCK_BINARY);
-        assert!(plan
-            .args
-            .windows(2)
-            .any(|window| window == ["--rw", "/tmp/repo"]));
-        assert!(plan.args.iter().any(|arg| arg == "--no-network"));
+        if let Ok(command) = result {
+            assert_eq!(command.program, LANDLOCK_BINARY);
+            assert!(command
+                .args
+                .windows(2)
+                .any(|window| window == ["--rw", "/tmp/repo"]));
+            assert!(command.args.iter().any(|arg| arg == "--no-network"));
+        }
     }
 
     #[tokio::test]
@@ -1220,9 +1289,7 @@ mod tests {
         let Ok(sandbox) = sandbox else {
             unreachable!("test spec is valid");
         };
-        let mut plan = plan();
-
-        let result = sandbox.transform(&mut plan).await;
+        let result = sandbox.prepare(plan(), IssueSource::Local).await;
 
         assert!(matches!(result, Err(Error::SandboxUnavailable { .. })));
     }
@@ -1235,13 +1302,37 @@ mod tests {
         let Ok(sandbox) = sandbox else {
             unreachable!("test spec is valid");
         };
-        let mut plan = plan();
-        let original = plan.clone();
+        let original = plan();
 
-        let result = sandbox.transform(&mut plan).await;
+        let result = prepared_command(&sandbox, original.clone()).await;
 
         assert!(result.is_ok());
-        assert_eq!(plan, original);
+        if let Ok(command) = result {
+            assert_eq!(command, WrappedCommand::from(original));
+        }
+    }
+
+    #[tokio::test]
+    async fn network_sourced_none_prepare_fails_closed_and_local_warn_unwrapped() {
+        let mut spec = spec(SandboxProfile::RepoWrite, Backend::None);
+        spec.on_unavailable = UnavailablePolicy::Warn;
+        let sandbox = HostSandbox::from_resolved(spec.clone(), false);
+        let Ok(sandbox) = sandbox else {
+            unreachable!("test spec is valid");
+        };
+
+        let network_result = sandbox.prepare(plan(), IssueSource::NetworkSourced).await;
+
+        assert!(matches!(
+            network_result,
+            Err(Error::SandboxUnavailable { .. })
+        ));
+        let original = plan();
+        let local_result = prepared_command(&sandbox, original.clone()).await;
+        assert!(local_result.is_ok());
+        if let Ok(command) = local_result {
+            assert_eq!(command, WrappedCommand::from(original));
+        }
     }
 
     #[test]
