@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/x0x-symphony-core",
     "crates/x0x-symphony-tracker-git-jsonl",
+    "crates/x0x-symphony-tracker-x0x-crdt",
     "crates/x0x-symphony-runner-shell",
     "crates/x0x-symphony-workspace",
     "crates/x0x-symphony-orchestrator",
