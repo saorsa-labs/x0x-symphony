@@ -12,6 +12,7 @@ documented inline.
 
 ```jsonc
 {
+  "schema_version": 1,
   "id":          "XSY-0001",
   "identifier":  "XSY-0001",
   "title":       "Short imperative title",
@@ -26,6 +27,26 @@ documented inline.
   "updated_at":  "2026-04-28T00:00:00Z"
 }
 ```
+
+`schema_version` is written on every record. Version `1` is the M2 freeze.
+Legacy records without the field are read as v1 and upgraded on the next write.
+
+## Schema versioning & freeze (M2)
+
+M2 is the schema freeze point. `schema_version: 1` freezes the issue, issue
+reference, state, shard, claim, and handoff fields that exist at M2.
+
+Schema evolution after v1 is **additive-only**:
+
+- New fields must be optional and require a `schema_version` bump.
+- Existing v1 fields are never renamed, removed, or re-typed.
+- Unknown top-level fields are preserved verbatim across read/write cycles.
+
+Signatures (XSY-0020) cover the EXACT stored payload bytes — the serialized
+claim/handoff as written — never a re-derived canonical projection. Therefore
+additive schema growth (new optional fields) can never invalidate an existing
+signature. `BTreeMap`-ordered unknown-field preservation supports deterministic
+stored bytes for this rule.
 
 ## Optional fields
 
@@ -147,9 +168,10 @@ A `todo` issue with any non-terminal blocker must not be dispatched.
 3. Use ISO-8601 UTC timestamps.
 4. Agents may move their issue to `review`; humans move reviewed work
    to `done`.
-5. Preserve unknown fields so future adapters can extend the model.
-6. `shard` is written once at creation and never edited by agents.
-7. `claim` is written and refreshed only by the orchestrator.
+5. Preserve unknown fields verbatim so future adapters can extend the model.
+6. Additive schema changes require optional fields and a `schema_version` bump.
+7. `shard` is written once at creation and never edited by agents.
+8. `claim` is written and refreshed only by the orchestrator.
 
 ## CRDT adapter mapping
 
