@@ -32,7 +32,8 @@ use x0x_symphony_core::{
 use crate::{
     env,
     error::{Error, Result},
-    CommandPlan, EventOverflowPolicy, HostSandbox, RunnerSpec, Sandbox,
+    CommandPlan, EventOverflowPolicy, HostSandbox, IssueSource, NoopSession, PreparedCommand,
+    RunnerSpec, Sandbox, SandboxSession, WrappedCommand,
 };
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -116,82 +117,134 @@ impl ShellRunner {
         child_env: BTreeMap<String, String>,
     ) -> Result<TurnOutcome> {
         let started = Instant::now();
-        let mut command = self.command_for_session(sess, child_env).await?;
-        let mut child = command.spawn().map_err(|source| Error::Spawn {
-            command: self.spec.command.clone(),
-            source,
-        })?;
-
-        let stdin = take_pipe(child.stdin.take(), "stdin", &self.spec.command, &mut child)?;
-        let stdout = take_pipe(
-            child.stdout.take(),
-            "stdout",
-            &self.spec.command,
-            &mut child,
-        )?;
-        let stderr = take_pipe(
-            child.stderr.take(),
-            "stderr",
-            &self.spec.command,
-            &mut child,
-        )?;
-
-        let writer = tokio::spawn(write_prompt(stdin, prompt, events.clone()));
-        let stdout_reader = tokio::spawn(stream_reader(
-            stdout,
-            RunnerEventKind::Stdout,
-            events.clone(),
-        ));
-        let stderr_reader = tokio::spawn(stream_reader(
-            stderr,
-            RunnerEventKind::Stderr,
-            events.clone(),
-        ));
-
-        let status =
-            wait_with_timeout(&mut child, self.spec.turn_timeout(), &self.spec.command).await?;
-        join_background_task(writer, "stdin writer", &events).await;
-        join_background_task(stdout_reader, "stdout reader", &events).await;
-        join_background_task(stderr_reader, "stderr reader", &events).await;
-
-        let duration_ms = elapsed_ms(started);
-        let usage = UsageReport::new().with_duration_ms(duration_ms);
-        let outcome = outcome_from_wait_status(status, usage);
-        let completion_message = match outcome.summary.clone() {
-            Some(summary) => summary,
-            None => "turn completed".to_owned(),
+        let PreparedProcessCommand {
+            mut command,
+            mut sandbox_session,
+        } = self.command_for_session(sess, child_env).await?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(source) => {
+                shutdown_after_spawn_error(&mut *sandbox_session).await;
+                return Err(Error::Spawn {
+                    command: self.spec.command.clone(),
+                    source,
+                });
+            }
         };
-        events.send(
-            RunnerEvent::new(RunnerEventKind::TurnCompleted).with_message(completion_message),
-        );
-        Ok(outcome)
+
+        let outcome = async {
+            let stdin = take_pipe(child.stdin.take(), "stdin", &self.spec.command, &mut child)?;
+            let stdout = take_pipe(
+                child.stdout.take(),
+                "stdout",
+                &self.spec.command,
+                &mut child,
+            )?;
+            let stderr = take_pipe(
+                child.stderr.take(),
+                "stderr",
+                &self.spec.command,
+                &mut child,
+            )?;
+
+            let writer = tokio::spawn(write_prompt(stdin, prompt, events.clone()));
+            let stdout_reader = tokio::spawn(stream_reader(
+                stdout,
+                RunnerEventKind::Stdout,
+                events.clone(),
+            ));
+            let stderr_reader = tokio::spawn(stream_reader(
+                stderr,
+                RunnerEventKind::Stderr,
+                events.clone(),
+            ));
+
+            let status =
+                wait_with_timeout(&mut child, self.spec.turn_timeout(), &self.spec.command).await?;
+            join_background_task(writer, "stdin writer", &events).await;
+            join_background_task(stdout_reader, "stdout reader", &events).await;
+            join_background_task(stderr_reader, "stderr reader", &events).await;
+
+            let duration_ms = elapsed_ms(started);
+            let usage = UsageReport::new().with_duration_ms(duration_ms);
+            let outcome = outcome_from_wait_status(status, usage);
+            let completion_message = match outcome.summary.clone() {
+                Some(summary) => summary,
+                None => "turn completed".to_owned(),
+            };
+            events.send(
+                RunnerEvent::new(RunnerEventKind::TurnCompleted).with_message(completion_message),
+            );
+            Ok(outcome)
+        }
+        .await;
+        finish_sandbox_session(outcome, &mut *sandbox_session).await
     }
 
     async fn command_for_session(
         &self,
         sess: &SessionHandle,
         child_env: BTreeMap<String, String>,
-    ) -> Result<Command> {
-        let mut plan = CommandPlan::new(
+    ) -> Result<PreparedProcessCommand> {
+        let plan = CommandPlan::new(
             self.spec.command.clone(),
             self.spec.args.clone(),
             sess.workspace_path.clone(),
             child_env,
         );
-        if let Some(sandbox) = &self.sandbox {
-            sandbox.transform(&mut plan).await?;
+        let PreparedCommand { command, session } = if let Some(sandbox) = &self.sandbox {
+            sandbox.prepare(plan, IssueSource::Local).await?
+        } else {
+            PreparedCommand {
+                command: WrappedCommand::from(plan),
+                session: Box::new(NoopSession),
+            }
+        };
+        Ok(PreparedProcessCommand {
+            command: command_from_wrapped(command),
+            sandbox_session: session,
+        })
+    }
+}
+
+struct PreparedProcessCommand {
+    command: Command,
+    sandbox_session: Box<dyn SandboxSession>,
+}
+
+fn command_from_wrapped(plan: WrappedCommand) -> Command {
+    let mut command = Command::new(&plan.program);
+    command
+        .args(&plan.args)
+        .current_dir(&plan.cwd)
+        .env_clear()
+        .envs(plan.env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_process_group(&mut command);
+    command
+}
+
+async fn shutdown_after_spawn_error(session: &mut dyn SandboxSession) {
+    if let Err(error) = session.shutdown().await {
+        tracing::warn!(%error, "sandbox session shutdown failed after spawn error");
+    }
+}
+
+async fn finish_sandbox_session(
+    outcome: Result<TurnOutcome>,
+    session: &mut dyn SandboxSession,
+) -> Result<TurnOutcome> {
+    let shutdown = session.shutdown().await;
+    match (outcome, shutdown) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_outcome), Err(error)) => Err(error),
+        (Err(run_error), Err(shutdown_error)) => {
+            tracing::warn!(%run_error, "runner failed before sandbox session shutdown failed");
+            Err(shutdown_error)
         }
-        let mut command = Command::new(&plan.program);
-        command
-            .args(&plan.args)
-            .current_dir(&plan.cwd)
-            .env_clear()
-            .envs(plan.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_process_group(&mut command);
-        Ok(command)
     }
 }
 
@@ -580,4 +633,265 @@ fn kill_process_group(child: &mut Child, command: &str) -> Result<()> {
         command: command.to_owned(),
         message: error.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use futures_util::StreamExt;
+    use tempfile::tempdir;
+    use x0x_symphony_core::{Issue, IssueId, IssueState};
+
+    use super::*;
+    use crate::{ProbeReport, SandboxSpec};
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    struct RecordingSandbox {
+        spec: SandboxSpec,
+        shutdowns: Arc<AtomicUsize>,
+        prepared_cwds: Arc<Mutex<Vec<PathBuf>>>,
+        injected_env: Option<(String, String)>,
+        command_override: Option<String>,
+    }
+
+    impl RecordingSandbox {
+        fn new() -> Self {
+            Self {
+                spec: SandboxSpec::default(),
+                shutdowns: Arc::new(AtomicUsize::new(0)),
+                prepared_cwds: Arc::new(Mutex::new(Vec::new())),
+                injected_env: None,
+                command_override: None,
+            }
+        }
+
+        fn with_injected_env(mut self, key: &str, value: &str) -> Self {
+            self.injected_env = Some((key.to_owned(), value.to_owned()));
+            self
+        }
+
+        fn with_command_override(mut self, command: String) -> Self {
+            self.command_override = Some(command);
+            self
+        }
+
+        fn shutdown_count(&self) -> usize {
+            self.shutdowns.load(AtomicOrdering::SeqCst)
+        }
+
+        fn prepared_cwds(&self) -> Result<Vec<PathBuf>> {
+            self.prepared_cwds
+                .lock()
+                .map(|cwds| cwds.clone())
+                .map_err(|_| Error::SessionRegistryPoisoned)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sandbox for RecordingSandbox {
+        async fn prepare(&self, plan: CommandPlan, source: IssueSource) -> Result<PreparedCommand> {
+            assert_eq!(source, IssueSource::Local);
+            let mut command = WrappedCommand::from(plan);
+            if let Some((key, value)) = &self.injected_env {
+                command.env.insert(key.clone(), value.clone());
+            }
+            if let Some(program) = &self.command_override {
+                command.program = program.clone();
+            }
+            self.prepared_cwds
+                .lock()
+                .map_err(|_| Error::SessionRegistryPoisoned)?
+                .push(command.cwd.clone());
+            Ok(PreparedCommand {
+                command,
+                session: Box::new(RecordingSession {
+                    shutdowns: Arc::clone(&self.shutdowns),
+                }),
+            })
+        }
+
+        async fn probe(&self) -> Result<ProbeReport> {
+            Ok(ProbeReport {
+                backend: self.spec.backend,
+                profile: self.spec.profile,
+                checks: Vec::new(),
+            })
+        }
+
+        fn spec(&self) -> &SandboxSpec {
+            &self.spec
+        }
+    }
+
+    struct RecordingSession {
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxSession for RecordingSession {
+        async fn shutdown(&mut self) -> Result<()> {
+            self.shutdowns.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrapped_command_env_reaches_spawned_child() -> TestResult {
+        let workspace = tempdir()?;
+        let spec = RunnerSpec::new("/bin/sh")?
+            .with_args([
+                "-c".to_owned(),
+                "printf '%s' \"$SANDBOX_INJECTED\"".to_owned(),
+            ])
+            .with_turn_timeout_ms(2_000);
+        let sandbox = Arc::new(
+            RecordingSandbox::new().with_injected_env("SANDBOX_INJECTED", "visible-from-sandbox"),
+        );
+        let runner = runner_with_sandbox(spec, sandbox.clone())?;
+        let mut handle = runner
+            .start_session(session_context(workspace.path())?)
+            .await?;
+
+        let outcome = runner.run_turn(&mut handle, Prompt::new("")).await?;
+
+        assert_eq!(outcome.status, TurnStatus::Succeeded);
+        assert!(stdout_text(&runner, &handle)
+            .await
+            .contains("visible-from-sandbox"));
+        assert_eq!(sandbox.shutdown_count(), 1);
+        runner.stop_session(handle).await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_receives_distinct_cwd_for_each_session() -> TestResult {
+        let workspace_one = tempdir()?;
+        let workspace_two = tempdir()?;
+        let spec = RunnerSpec::new("/bin/pwd")?.with_turn_timeout_ms(2_000);
+        let sandbox = Arc::new(RecordingSandbox::new());
+        let runner = runner_with_sandbox(spec, sandbox.clone())?;
+        let mut first = runner
+            .start_session(session_context(workspace_one.path())?)
+            .await?;
+        let mut second = runner
+            .start_session(session_context(workspace_two.path())?)
+            .await?;
+
+        let first_outcome = runner.run_turn(&mut first, Prompt::new("")).await?;
+        let second_outcome = runner.run_turn(&mut second, Prompt::new("")).await?;
+
+        assert_eq!(first_outcome.status, TurnStatus::Succeeded);
+        assert_eq!(second_outcome.status, TurnStatus::Succeeded);
+        assert!(stdout_text(&runner, &first)
+            .await
+            .contains(&path_string(workspace_one.path())));
+        assert!(stdout_text(&runner, &second)
+            .await
+            .contains(&path_string(workspace_two.path())));
+        assert_eq!(
+            sandbox.prepared_cwds()?,
+            vec![
+                workspace_one.path().to_path_buf(),
+                workspace_two.path().to_path_buf()
+            ]
+        );
+        assert_eq!(sandbox.shutdown_count(), 2);
+        runner.stop_session(first).await?;
+        runner.stop_session(second).await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_session_shutdown_runs_once_on_failed_child_exit() -> TestResult {
+        let workspace = tempdir()?;
+        let spec = RunnerSpec::new("/bin/sh")?
+            .with_args(["-c".to_owned(), "exit 7".to_owned()])
+            .with_turn_timeout_ms(2_000);
+        let sandbox = Arc::new(RecordingSandbox::new());
+        let runner = runner_with_sandbox(spec, sandbox.clone())?;
+        let mut handle = runner
+            .start_session(session_context(workspace.path())?)
+            .await?;
+
+        let outcome = runner.run_turn(&mut handle, Prompt::new("")).await?;
+
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        assert_eq!(sandbox.shutdown_count(), 1);
+        runner.stop_session(handle).await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_session_shutdown_runs_before_spawn_error_returns() -> TestResult {
+        let workspace = tempdir()?;
+        let missing = workspace.path().join("missing-command");
+        let spec = RunnerSpec::new("/bin/echo")?.with_turn_timeout_ms(2_000);
+        let sandbox =
+            Arc::new(RecordingSandbox::new().with_command_override(path_string(&missing)));
+        let runner = runner_with_sandbox(spec, sandbox.clone())?;
+        let mut handle = runner
+            .start_session(session_context(workspace.path())?)
+            .await?;
+
+        let result = runner.run_turn(&mut handle, Prompt::new("")).await;
+
+        assert!(result.is_err());
+        assert_eq!(sandbox.shutdown_count(), 1);
+        runner.stop_session(handle).await?;
+        Ok(())
+    }
+
+    fn runner_with_sandbox(spec: RunnerSpec, sandbox: Arc<dyn Sandbox>) -> Result<ShellRunner> {
+        spec.validate()?;
+        Ok(ShellRunner {
+            spec: Arc::new(spec),
+            sandbox: Some(sandbox),
+            capabilities: RunnerCapabilities::new("shell"),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            next_session: AtomicU64::new(1),
+        })
+    }
+
+    fn session_context(workspace: &Path) -> TestResult<SessionContext> {
+        let issue = Issue::new(
+            IssueId::new("XSY-0027")?,
+            "XSY-0027",
+            "Sandbox trait reshape",
+            IssueState::new("todo")?,
+            "2026-07-02T00:00:00Z",
+        )?;
+        Ok(SessionContext::new(issue, workspace.to_path_buf()))
+    }
+
+    async fn stdout_text(runner: &ShellRunner, handle: &SessionHandle) -> String {
+        let mut stream = runner.stream_events(handle);
+        let mut stdout = String::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(20), stream.next()).await
+        {
+            if event.kind == RunnerEventKind::Stdout {
+                if let Some(message) = event.message {
+                    stdout.push_str(&message);
+                }
+            }
+        }
+        stdout
+    }
+
+    fn path_string(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
 }

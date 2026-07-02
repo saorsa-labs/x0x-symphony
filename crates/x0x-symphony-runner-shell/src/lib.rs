@@ -13,7 +13,8 @@ pub use error::{Error, Result};
 pub use preset::PresetName;
 pub use runner::ShellRunner;
 pub use sandbox::{
-    Backend, CommandPlan, HostSandbox, IssueSource, ProbeCheck, ProbeReport, ProbeStatus, Sandbox,
-    SandboxProfile, SandboxSpec, UnavailablePolicy,
+    Backend, CommandPlan, HostSandbox, IssueSource, NoopSession, PreparedCommand, ProbeCheck,
+    ProbeReport, ProbeStatus, Sandbox, SandboxProfile, SandboxSession, SandboxSpec,
+    UnavailablePolicy, WrappedCommand,
 };
 pub use spec::{EventOverflowPolicy, RunnerSpec};
