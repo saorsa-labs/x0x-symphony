@@ -276,7 +276,9 @@ impl<T, R, W> Orchestrator<T, R, W> {
 
 impl<T, R, W> Orchestrator<T, R, W>
 where
-    T: Tracker,
+    // `T` must be shareable across the heartbeat task spawned by `run_claim`;
+    // `R`/`W` are driven only on the calling task and need no extra bounds.
+    T: Tracker + Send + Sync + 'static,
     R: Runner,
     W: Workspace,
 {

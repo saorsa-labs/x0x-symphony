@@ -379,3 +379,66 @@ fn base_issue_object() -> Map<String, Value> {
     );
     object
 }
+
+#[tokio::test]
+async fn block_and_fetch_claimed_round_trip_blocked_reason_survives() -> TestResult {
+    let repo = init_repo()?;
+    let tracker = JsonlTracker::new(repo.path());
+    let issue = tracker.create_issue(
+        IssueDraft::new("Orchestrator blocked reason round-trip")?
+            .with_description("block() must persist a structured reason that survives reload."),
+    )?;
+    let id = issue.id.clone();
+
+    let agent = AgentId::new("agent-a")?;
+    let claim = tracker.claim(&id, &agent).await?;
+
+    // A freshly-claimed issue is visible via fetch_claimed for this agent.
+    let claimed = tracker.fetch_claimed(Some(&agent)).await?;
+    assert_eq!(claimed.len(), 1, "claim should be visible to its owner");
+    assert_eq!(claimed[0].id, id);
+
+    // Move it to blocked with a structured reason (as the orchestrator does on
+    // retry exhaustion).
+    let reason = ReleaseReason::new(ReleaseReasonCode::RetryExhausted, "runner failed 3x");
+    tracker.block(&claim, reason.clone()).await?;
+
+    // The claim is cleared: no claimed issues remain for this agent.
+    let claimed_after = tracker.fetch_claimed(Some(&agent)).await?;
+    assert!(
+        claimed_after.is_empty(),
+        "block must clear the claim; got {claimed_after:?}"
+    );
+
+    // Reload through the public reader path and assert the reason survived.
+    let fetched = tracker.fetch_by_ids(std::slice::from_ref(&id)).await?;
+    assert_eq!(fetched.len(), 1);
+    let blocked = &fetched[0];
+    assert_eq!(blocked.state, IssueState::new("blocked")?);
+    assert!(blocked.claim.is_none(), "block must clear the claim field");
+    let stored = blocked
+        .extra
+        .get("blocked_reason")
+        .ok_or("blocked_reason missing from extra")?;
+    let restored: ReleaseReason =
+        serde_json::from_value(stored.clone()).map_err(|e| io::Error::other(e.to_string()))?;
+    assert_eq!(restored, reason, "blocked_reason must round-trip exactly");
+
+    // Byte-stable serialization: the on-disk line must parse and re-serialize to
+    // itself, and the blocked_reason must be present in the parsed record.
+    let path = repo.path().join("issues").join("issues.jsonl");
+    let line = fs::read_to_string(&path)?
+        .lines()
+        .find(|l| l.contains("\"id\":\"XSY-"))
+        .ok_or("issue line present on disk")?
+        .to_owned();
+    let parsed = parse_issue_line(1, &line)?;
+    assert_eq!(parsed.id, id);
+    assert!(parsed.extra.contains_key("blocked_reason"));
+    assert_eq!(
+        serialize_issue(&parsed)?,
+        line,
+        "serialization must be byte-stable across a parse/serialize round-trip"
+    );
+    Ok(())
+}

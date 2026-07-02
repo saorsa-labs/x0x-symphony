@@ -29,7 +29,8 @@ use x0x_symphony_core::{
     TurnStatus, UsageReport, Workspace, WorkspaceHandle,
 };
 use x0x_symphony_orchestrator::{
-    dispatch::Resolution, retry::RetryPolicy, Clock, Config, ManualClock, Orchestrator, SystemClock,
+    dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
+    Orchestrator, SystemClock,
 };
 
 fn make_issue(id: &str, state: &str) -> Result<Issue, Box<dyn Error>> {
@@ -75,6 +76,9 @@ struct StubWorkspace {
     root: PathBuf,
     created: Mutex<Vec<PathBuf>>,
     destroyed: Mutex<Vec<PathBuf>>,
+    /// When true, `create` fails — used to exercise the budget-slot guard on the
+    /// `?` error path of `run_claim`.
+    create_fails: bool,
 }
 
 #[async_trait]
@@ -83,6 +87,11 @@ impl Workspace for StubWorkspace {
         &self.root
     }
     async fn create(&self, issue: &Issue) -> CoreResult<WorkspaceHandle> {
+        if self.create_fails {
+            return Err(x0x_symphony_core::SymphonyError::Tracker(
+                "stub create failed".into(),
+            ));
+        }
         let path = self.root.join(issue.identifier.as_str());
         std::fs::create_dir_all(&path)
             .map_err(|e| x0x_symphony_core::SymphonyError::Tracker(e.to_string()))?;
@@ -109,6 +118,8 @@ enum RunBehavior {
     Succeed,
     Fail,
     Hang,
+    /// Succeeds after sleeping for the given duration (exercises the heartbeat path).
+    SucceedAfter(std::time::Duration),
 }
 
 struct StubRunner {
@@ -129,6 +140,11 @@ impl StubRunner {
     const fn hanging() -> Self {
         Self {
             behavior: RunBehavior::Hang,
+        }
+    }
+    fn succeeding_after(delay: std::time::Duration) -> Self {
+        Self {
+            behavior: RunBehavior::SucceedAfter(delay),
         }
     }
 }
@@ -162,6 +178,10 @@ impl Runner for StubRunner {
         match self.behavior {
             RunBehavior::Succeed => Ok(TurnOutcome::new(TurnStatus::Succeeded, UsageReport::new())),
             RunBehavior::Fail => Ok(TurnOutcome::new(TurnStatus::Failed, UsageReport::new())),
+            RunBehavior::SucceedAfter(delay) => {
+                tokio::time::sleep(delay).await;
+                Ok(TurnOutcome::new(TurnStatus::Succeeded, UsageReport::new()))
+            }
             RunBehavior::Hang => {
                 // Never completes in tests; preempted by graceful shutdown.
                 std::future::pending::<()>().await;
@@ -183,6 +203,8 @@ impl Runner for StubRunner {
 struct StubTracker {
     issues: Mutex<Vec<Issue>>,
     releases: Mutex<Vec<(IssueId, ReleaseReasonCode)>>,
+    /// Number of times `heartbeat` was called (proves the periodic task fires).
+    heartbeats: Mutex<u32>,
 }
 
 impl StubTracker {
@@ -266,6 +288,8 @@ impl x0x_symphony_core::Tracker for StubTracker {
                 }
             }
         }
+        drop(issues);
+        *lock(&self.heartbeats)? += 1;
         Ok(())
     }
     async fn release(&self, claim: &Claim, reason: ReleaseReason) -> CoreResult<()> {
@@ -307,7 +331,9 @@ impl x0x_symphony_core::Tracker for StubTracker {
 }
 
 fn now_iso() -> String {
-    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    // Millis precision so sub-second TTLs (used by the heartbeat test) compare
+    // accurately against the injected clock in `is_fresh_self`.
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 // ---------- builders ----------
@@ -561,6 +587,108 @@ async fn reconcile_releases_stale_and_keeps_fresh_self_claims() -> Result<(), Bo
     assert_eq!(
         foreign.claim.as_ref().ok_or("foreign claim present")?.by,
         other
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn heartbeat_keeps_claim_fresh_during_long_run() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9201", "todo")?]));
+    // Run (500 ms) outlasts the claim TTL (200 ms); without a periodic heartbeat
+    // the claim would go stale long before completion.
+    let runner = Arc::new(StubRunner::succeeding_after(
+        std::time::Duration::from_millis(500),
+    ));
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().to_path_buf(),
+        ..StubWorkspace::default()
+    });
+    let ttl = chrono::Duration::milliseconds(200); // -> heartbeat interval 50 ms
+    let config = Config::builder(agent()?)
+        .active_states(vec![state("todo")?])
+        .terminal_states(vec![state("done")?, state("cancelled")?])
+        .global_concurrency(1)
+        .retry(RetryPolicy::default())
+        .claim_ttl(ttl)
+        .build();
+    let clock = sysclock();
+    let orc = Arc::new(orc(
+        Arc::clone(&tracker),
+        Arc::clone(&runner),
+        Arc::clone(&workspace),
+        Arc::clone(&clock),
+        config,
+    ));
+
+    // Drive the run in a task so we can inspect the claim mid-flight.
+    let orc_run = Arc::clone(&orc);
+    let run_task = tokio::spawn(async move { orc_run.run_once().await });
+
+    // Mid-run: enough elapsed time for several 50 ms heartbeats.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let heartbeats = *lock(&tracker.heartbeats)?;
+    assert!(
+        heartbeats >= 2,
+        "periodic heartbeat must fire during a long run; saw {heartbeats}"
+    );
+
+    // The claim must still be fresh (the heartbeat task refreshed it).
+    let owner = agent()?;
+    let issues = lock(&tracker.issues)?.clone();
+    let in_flight = issues
+        .iter()
+        .find(|i| i.id.as_str() == "XSY-9201")
+        .ok_or("issue present")?;
+    let claim = in_flight.claim.as_ref().ok_or("claim still held mid-run")?;
+    assert!(
+        is_fresh_self(claim, &owner, clock.as_ref(), ttl)?,
+        "claim must remain fresh while the heartbeat task runs"
+    );
+
+    let resolution = run_task.await??.ok_or("an issue should run")?;
+    assert_eq!(resolution, Resolution::Completed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn budget_slot_released_on_workspace_create_error() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let tracker = Arc::new(StubTracker::with(vec![
+        make_issue("XSY-9301", "todo")?,
+        make_issue("XSY-9302", "todo")?,
+    ]));
+    let runner = Arc::new(StubRunner::succeeding());
+    // Workspace whose create() always fails, forcing the `?` error path.
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().to_path_buf(),
+        create_fails: true,
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        Arc::clone(&tracker),
+        Arc::clone(&runner),
+        Arc::clone(&workspace),
+        sysclock(),
+        config_with(RetryPolicy::default(), 1)?,
+    );
+
+    // Claim the first issue; this acquires the single budget slot.
+    let first = orc.claim_next().await?.ok_or("should claim first issue")?;
+    // run_claim fails inside at workspace.create(); the HeldClaim guard must
+    // free the slot on this `?` error path.
+    let result = orc.run_claim(first).await;
+    assert!(
+        result.is_err(),
+        "workspace.create failure must surface as an error"
+    );
+
+    // Slot must now be free: a second claim succeeds (cap=1 would block a leak).
+    let second = orc.claim_next().await?;
+    assert!(
+        second.is_some(),
+        "budget slot must be released on the error path"
     );
     Ok(())
 }

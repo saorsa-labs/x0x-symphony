@@ -10,18 +10,19 @@
 //! and registers the claim as in-flight (done by [`Orchestrator::claim_next`]
 //! and the resume path). `run_claim` releases that slot on every exit path.
 
+use std::{sync::Arc, time::Duration};
+
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use x0x_symphony_core::{
     Handoff, Issue, IssueId, Prompt, ReleaseReason, ReleaseReasonCode, Runner, SessionContext,
-    TurnStatus, Workspace,
+    Tracker, TurnStatus, Workspace,
 };
 
-use crate::{
-    clock::Clock,
-    error::{Error, Result},
-    reconcile::is_fresh_self,
-    Orchestrator,
-};
+use crate::{clock::Clock, error::Result, reconcile::is_fresh_self, Orchestrator};
+// `Error` is referenced only via `Error::NotEligible` / `Error::PoisonedState`;
+// re-exported through `error` for the variants below.
+use crate::error::Error;
 
 /// Why a polled candidate may (or may not) be taken by this agent now.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +60,71 @@ pub fn claimable_for(
     }
 }
 
+/// RAII owner of a held claim's cleanup while [`Orchestrator::run_claim`] runs.
+///
+/// It guarantees that the concurrency-budget slot acquired by `claim_next` is
+/// freed on **every** exit path — success, block, shutdown, or `?` error — by
+/// releasing it in `Drop`, and that the background heartbeat task is aborted at
+/// the transition point ([`Self::cancel_heartbeat`]) rather than only on drop.
+/// This is the single source of truth for slot release inside `run_claim`;
+/// there are no manual `release_slot` calls in that method.
+struct HeldClaim<'a, T, R, W> {
+    orch: &'a Orchestrator<T, R, W>,
+    claim: &'a x0x_symphony_core::Claim,
+    heartbeat: Option<JoinHandle<()>>,
+}
+
+impl<'a, T, R, W> HeldClaim<'a, T, R, W> {
+    fn new(orch: &'a Orchestrator<T, R, W>, claim: &'a x0x_symphony_core::Claim) -> Self {
+        Self {
+            orch,
+            claim,
+            heartbeat: None,
+        }
+    }
+
+    /// Spawn a background task that refreshes the claim's heartbeat at `interval`
+    /// for as long as the run is in flight. It is cancelled either at a
+    /// transition via [`Self::cancel_heartbeat`] or when this guard drops.
+    ///
+    /// The task captures only an `Arc<T>` clone of the tracker and an owned
+    /// clone of the claim, so the spawned future is `Send` whenever `T` is.
+    fn spawn_heartbeat(
+        &mut self,
+        tracker: Arc<T>,
+        claim: x0x_symphony_core::Claim,
+        interval: Duration,
+    ) where
+        T: Tracker + Send + Sync + 'static,
+    {
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                // Heartbeats are best-effort: a failure must not abort the run.
+                let _ = tracker.heartbeat(&claim).await;
+            }
+        });
+        self.heartbeat = Some(handle);
+    }
+
+    /// Abort the heartbeat task at a transition (handoff/block/shutdown) so it
+    /// does not fire on an already-released claim before the guard itself drops.
+    fn cancel_heartbeat(&mut self) {
+        if let Some(handle) = self.heartbeat.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl<T, R, W> Drop for HeldClaim<'_, T, R, W> {
+    fn drop(&mut self) {
+        // Abort first, then release the slot, so a still-running heartbeat can
+        // never observe a half-released claim.
+        self.cancel_heartbeat();
+        self.orch.release_slot(self.claim);
+    }
+}
+
 /// Outcome of running a single claimed issue to resolution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Resolution {
@@ -80,6 +146,11 @@ struct RunTurnOutcome {
 /// Lets `select!` await `run_turn` while keeping the session handle for the
 /// later `stop_session`. The core `Runner` trait takes the session by value, so
 /// we wrap the call and thread the handle back out.
+///
+/// `#[allow(async_fn_in_trait)]`: this is a private helper trait whose async
+/// future is awaited locally inside `run_claim`'s `select!` and is never spawned
+/// or sent across threads, so the lint's `Send`-bound concern does not apply.
+/// Declared and signed off in the XSY-0006 audit follow-up.
 #[allow(async_fn_in_trait)]
 trait RunTurnExt {
     /// Run one prompt turn, returning the status and the (still-open) session.
@@ -109,24 +180,45 @@ impl<R: Runner> RunTurnExt for R {
 
 impl<T, R, W> Orchestrator<T, R, W>
 where
-    T: x0x_symphony_core::Tracker,
+    // `T` is shared with the background heartbeat task spawned below; `R`/`W`
+    // are driven only on the calling task and need no extra bounds.
+    T: x0x_symphony_core::Tracker + Send + Sync + 'static,
     R: Runner,
     W: Workspace,
 {
     /// Run one claimed issue through the retry loop to resolution.
     ///
-    /// The claim is held across retries (heartbeated before each attempt) and
-    /// the workspace is reused across attempts. On success the issue is handed
-    /// off to `review`; on exhaustion it is moved to `blocked`; on shutdown the
-    /// run is cancelled and the claim released with `shutdown`. The workspace is
-    /// **never** destroyed here — `review`/`blocked` are not terminal cleanup
-    /// states, and shutdown explicitly preserves work for resumption.
+    /// The claim is held across retries and the workspace is reused across
+    /// attempts. A background heartbeat task refreshes the claim at
+    /// [`crate::Config::heartbeat_interval`] (one quarter of the claim TTL) for
+    /// as long as the run is in flight, so a run that outlasts the TTL keeps its
+    /// claim fresh. On success the issue is handed off to `review`; on exhaustion
+    /// it is moved to `blocked`; on shutdown the run is cancelled and the claim
+    /// released with `shutdown`. The workspace is **never** destroyed here —
+    /// `review`/`blocked` are not terminal cleanup states, and shutdown
+    /// explicitly preserves work for resumption.
+    ///
+    /// # Ownership contract
+    ///
+    /// The caller first acquires a budget slot and registers the claim as
+    /// in-flight (done by [`Orchestrator::claim_next`] and the resume path). The
+    /// internal `HeldClaim` guard created here owns slot release and heartbeat
+    /// cancellation, so the slot is freed on **every** exit path, including the
+    /// `?` error paths below.
     ///
     /// # Errors
     ///
     /// Returns [`Error`] when a tracker/runner/workspace call fails for reasons
     /// other than the run itself failing.
     pub async fn run_claim(&self, claim: x0x_symphony_core::Claim) -> Result<Resolution> {
+        // Guard: owns the budget slot + heartbeat task; releases on EVERY exit.
+        let mut guard = HeldClaim::new(self, &claim);
+        guard.spawn_heartbeat(
+            Arc::clone(&self.tracker),
+            claim.clone(),
+            self.config.heartbeat_interval(),
+        );
+
         let issue = self.fetch_claim_issue(&claim).await?;
         let handle = self.workspace.create(&issue).await?;
         let workspace_path = handle.path.clone();
@@ -135,9 +227,6 @@ where
         let mut attempts = 0_u32;
         loop {
             attempts += 1;
-            // Keep the claim fresh while we hold it across the (possibly long) run.
-            let _ = self.tracker.heartbeat(&claim).await;
-
             let session = self
                 .runner
                 .start_session(SessionContext::new(issue.clone(), workspace_path.clone()))
@@ -150,13 +239,13 @@ where
                 biased;
                 () = self.shutdown_signaled() => {
                     let _ = self.runner.stop_session(session).await;
+                    guard.cancel_heartbeat();
                     self.tracker
                         .release(
                             &claim,
                             ReleaseReason::new(ReleaseReasonCode::Shutdown, "graceful shutdown"),
                         )
                         .await?;
-                    self.release_slot(&claim);
                     return Ok(Resolution::ShutdownReleased);
                 }
                 outcome = self.runner.run_turn_prompt(run_session, prompt) => outcome?,
@@ -170,14 +259,14 @@ where
                         self.runner.name()
                     ))
                     .with_file(workspace_path.to_string_lossy().into_owned());
+                    guard.cancel_heartbeat();
                     self.tracker.handoff(&claim, handoff).await?;
-                    // handoff clears the claim on the tracker; just free our slot.
-                    self.release_slot(&claim);
                     return Ok(Resolution::Completed);
                 }
                 TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled
                     if attempts >= max_attempts =>
                 {
+                    guard.cancel_heartbeat();
                     self.tracker
                         .block(
                             &claim,
@@ -190,12 +279,11 @@ where
                             ),
                         )
                         .await?;
-                    // block() clears the claim on the tracker; free our slot.
-                    self.release_slot(&claim);
                     return Ok(Resolution::Blocked);
                 }
                 TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled => {
-                    // Retry: back off, then loop. The claim stays in_progress.
+                    // Retry: back off, then loop. The claim stays in_progress
+                    // and the heartbeat task keeps it fresh.
                     sleep(self.config.retry.backoff_after(attempts)).await;
                 }
             }
