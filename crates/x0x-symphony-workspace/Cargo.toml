@@ -22,7 +22,7 @@ nix = { version = "0.30", default-features = false, features = ["process", "sign
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true
