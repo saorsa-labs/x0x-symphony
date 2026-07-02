@@ -37,6 +37,18 @@ jobs:
       - name: Run canonical workspace validation
         run: just check
 
+      - name: Run live x0xd signing integration tests (if configured)
+        env:
+          X0XD_URL: ${{ secrets.X0XD_URL }}
+          X0XD_TOKEN: ${{ secrets.X0XD_TOKEN }}
+        run: |
+          if [ -z "${X0XD_URL}" ]; then
+            echo "Skipping live x0xd signing tests; configure X0XD_URL (and optional X0XD_TOKEN) to enable them."
+            echo "Manual run: X0XD_URL=http://127.0.0.1:<port> cargo test -p x0x-symphony-tracker-git-jsonl --test live_signing -- --ignored --nocapture"
+            exit 0
+          fi
+          RUSTFLAGS="-D warnings" cargo test --workspace -- --ignored
+
   doc-test:
     name: just doc-test (rustdoc examples)
     runs-on: ubuntu-latest
