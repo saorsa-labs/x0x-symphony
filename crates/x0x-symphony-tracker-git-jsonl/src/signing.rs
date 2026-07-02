@@ -68,6 +68,17 @@ pub struct AgentInfo {
     pub agent_id: String,
 }
 
+/// Outcome of a signature verification attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifyOutcome {
+    /// The signature was verified for the supplied payload and public key.
+    Valid,
+    /// The signature or envelope is invalid and the record should be ignored.
+    Invalid(String),
+    /// Verification could not be completed because x0xd transport failed.
+    TransportError(String),
+}
+
 /// Async signing/verification client used by the tracker boundary.
 #[async_trait]
 pub trait SigningClient: Send + Sync {
@@ -81,7 +92,7 @@ pub trait SigningClient: Send + Sync {
         payload: &[u8],
         signature: &[u8],
         public_key: &[u8],
-    ) -> Result<bool>;
+    ) -> Result<VerifyOutcome>;
 
     /// Return the local x0xd agent identity.
     async fn agent_identity(&self) -> Result<AgentInfo>;
@@ -163,6 +174,15 @@ pub enum SigningError {
     /// The trusted key resolver rejected the signer.
     #[error("trusted key rejected: {0}")]
     UntrustedKey(String),
+}
+
+impl SigningError {
+    pub(crate) const fn is_verify_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::Request { .. } | Self::Decode { .. } | Self::Http { .. }
+        )
+    }
 }
 
 /// HTTP client for x0xd's external signing endpoints.
@@ -336,12 +356,13 @@ impl SigningClient for X0xdClient {
         payload: &[u8],
         signature: &[u8],
         public_key: &[u8],
-    ) -> Result<bool> {
+    ) -> Result<VerifyOutcome> {
         if payload.len() > MAX_SIGNING_PAYLOAD_BYTES {
-            return Err(SigningError::PayloadTooLarge {
-                max: MAX_SIGNING_PAYLOAD_BYTES,
-                actual: payload.len(),
-            });
+            return Ok(VerifyOutcome::Invalid(format!(
+                "payload exceeds maximum signable size of {} bytes: {}",
+                MAX_SIGNING_PAYLOAD_BYTES,
+                payload.len()
+            )));
         }
         let request = AgentVerifyRequest {
             context: context.to_owned(),
@@ -350,8 +371,24 @@ impl SigningClient for X0xdClient {
             public_key_b64: BASE64.encode(public_key),
             algorithm: SIGN_ALGORITHM.to_owned(),
         };
-        let response: AgentVerifyResponse = self.post_json("/agent/verify", &request).await?;
-        Ok(response.valid)
+        match self
+            .post_json::<AgentVerifyResponse, _>("/agent/verify", &request)
+            .await
+        {
+            Ok(response) => {
+                if response.valid {
+                    Ok(VerifyOutcome::Valid)
+                } else {
+                    Ok(VerifyOutcome::Invalid(
+                        "x0xd verify endpoint returned false".to_owned(),
+                    ))
+                }
+            }
+            Err(error) if error.is_verify_transport() => {
+                Ok(VerifyOutcome::TransportError(error.to_string()))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn agent_identity(&self) -> Result<AgentInfo> {
