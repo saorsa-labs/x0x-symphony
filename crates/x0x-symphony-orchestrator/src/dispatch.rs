@@ -269,7 +269,7 @@ where
     ///
     /// The claim is held across retries and the workspace is reused across
     /// attempts. A background heartbeat task refreshes the claim at
-    /// [`crate::Config::heartbeat_interval`] (one quarter of the claim TTL) for
+    /// one quarter of the issue's claim TTL for
     /// as long as the run is in flight, so a run that outlasts the TTL keeps its
     /// claim fresh. On success the issue is handed off to `review`; on exhaustion
     /// it is moved to `blocked`; on shutdown the run is cancelled and the claim
@@ -292,13 +292,12 @@ where
     pub async fn run_claim(&self, claim: x0x_symphony_core::Claim) -> Result<Resolution> {
         // Guard: owns the budget slot + heartbeat task; releases on EVERY exit.
         let mut guard = HeldClaim::new(self, &claim);
+        let issue = self.fetch_claim_issue(&claim).await?;
         guard.spawn_heartbeat(
             Arc::clone(&self.tracker),
             claim.clone(),
-            self.config.heartbeat_interval(),
+            self.issue_heartbeat_interval(&issue),
         );
-
-        let issue = self.fetch_claim_issue(&claim).await?;
         let mut proof = ProofRun::start(
             &self.config.proofs_dir,
             &issue,

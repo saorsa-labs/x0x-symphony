@@ -45,11 +45,10 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
 use tokio::sync::Notify;
 use x0x_symphony_core::{
-    AgentId, Claim, IssueId, IssueState, LifecycleHooks, PollContext, ReleaseReason,
-    ReleaseReasonCode, Runner, Tracker, Workspace,
+    AgentId, Claim, Issue, IssueId, IssueState, LifecycleHooks, PollContext, ReleaseReason,
+    ReleaseReasonCode, Runner, ShardRole, Tracker, Workspace,
 };
 
 use crate::concurrency::Budget as BudgetImpl;
@@ -135,15 +134,10 @@ impl Config {
         self
     }
 
-    /// Heartbeat interval: one quarter of the claim TTL, never zero.
+    /// Heartbeat interval for manual claims: one quarter of the default claim TTL, never zero.
     #[must_use]
     pub fn heartbeat_interval(&self) -> Duration {
-        let quarter_ms = self.claim_ttl.num_milliseconds().max(0) / 4;
-        let mut millis = 0;
-        if let Ok(value) = u64::try_from(quarter_ms) {
-            millis = value;
-        }
-        Duration::from_millis(millis.max(1))
+        reconcile::heartbeat_interval_for_ttl(self.claim_ttl)
     }
 
     fn poll_context(&self) -> PollContext {
@@ -277,9 +271,19 @@ impl<T, R, W> Orchestrator<T, R, W> {
         }
     }
 
-    /// Claim TTL as a `chrono::Duration`.
+    /// Default claim TTL as a `chrono::Duration`.
     fn ttl(&self) -> chrono::Duration {
         self.config.claim_ttl
+    }
+
+    /// Claim TTL for `issue`, using the frozen shard TTL when present.
+    fn issue_ttl(&self, issue: &Issue) -> chrono::Duration {
+        reconcile::issue_claim_ttl(issue, self.ttl())
+    }
+
+    /// Heartbeat refresh interval for `issue`, using the frozen shard TTL when present.
+    fn issue_heartbeat_interval(&self, issue: &Issue) -> Duration {
+        reconcile::issue_heartbeat_interval(issue, self.ttl())
     }
 
     /// `true` once shutdown has been requested.
@@ -341,7 +345,7 @@ where
                 &issue,
                 &self.config.agent_id,
                 self.clock.as_ref(),
-                self.ttl(),
+                self.issue_ttl(&issue),
             )?
             else {
                 continue;
@@ -397,24 +401,35 @@ where
 
     /// Startup reconciliation.
     ///
-    /// Releases stale self-owned claims with `expired_heartbeat`; counts fresh
-    /// self-owned claims as resumable and foreign claims as observed. Does not
-    /// touch foreign claims. Fresh self-owned claims are kept (`in_progress`) so a
+    /// Releases stale self-owned claims with `expired_heartbeat`, counts fresh
+    /// self-owned claims as resumable, lets this agent take over from a stale
+    /// primary when it is in the backup slate, and abandons this agent's losing
+    /// side of a duplicate-claim conflict according to ADR-0002 lower-index
+    /// precedence. Fresh self-owned claims are kept (`in_progress`) so a
     /// subsequent [`Self::run`] can resume them.
     ///
     /// # Errors
     /// Propagates tracker or heartbeat-parse errors.
     pub async fn reconcile(&self) -> Result<ReconcileSummary> {
-        let claimed = self
-            .tracker
-            .fetch_claimed(Some(&self.config.agent_id))
-            .await?;
-        let now: DateTime<Utc> = self.clock.now();
-        let ttl = self.ttl();
-        let mut summary = ReconcileSummary::default();
+        let claimed = self.tracker.fetch_claimed(None).await?;
+        let now = self.clock.now();
+        let mut by_issue: BTreeMap<IssueId, Vec<Issue>> = BTreeMap::new();
         for issue in claimed {
+            if issue.claim.is_some() {
+                by_issue.entry(issue.id.clone()).or_default().push(issue);
+            }
+        }
+
+        let mut summary = ReconcileSummary::default();
+        for (_id, issues) in by_issue {
+            if self.reconcile_conflict(&issues, &mut summary).await? {
+                continue;
+            }
+            let Some(issue) = issues.first() else {
+                continue;
+            };
             let Some(claim) = &issue.claim else { continue };
-            match reconcile::classify(claim, &self.config.agent_id, now, ttl)? {
+            match reconcile::classify(claim, &self.config.agent_id, now, self.issue_ttl(issue))? {
                 ClaimStance::FreshSelf => summary.resumed += 1,
                 ClaimStance::StaleSelf => {
                     self.tracker
@@ -428,13 +443,84 @@ where
                         .await?;
                     summary.released += 1;
                 }
-                // fetch_claimed(Some(self)) only returns this agent's claims, so
-                // a foreign classification should not occur; if it does, leave
-                // the claim untouched rather than acting on another agent's work.
+                ClaimStance::Foreign
+                    if self.should_take_over_stale_primary(issue, claim, now)? =>
+                {
+                    self.tracker
+                        .release(
+                            claim,
+                            ReleaseReason::new(
+                                ReleaseReasonCode::ExpiredHeartbeat,
+                                "stale primary heartbeat; backup taking over",
+                            ),
+                        )
+                        .await?;
+                    self.tracker.claim(&issue.id, &self.config.agent_id).await?;
+                    summary.taken_over += 1;
+                }
                 ClaimStance::Foreign => {}
             }
         }
         Ok(summary)
+    }
+
+    async fn reconcile_conflict(
+        &self,
+        issues: &[Issue],
+        summary: &mut ReconcileSummary,
+    ) -> Result<bool> {
+        let claims = issues
+            .iter()
+            .filter_map(|issue| issue.claim.as_ref())
+            .collect::<Vec<_>>();
+        if claims.len() <= 1 {
+            return Ok(false);
+        }
+        let Some(winner) = reconcile::winning_conflict_claim(claims.iter().copied()) else {
+            return Ok(true);
+        };
+        for claim in claims {
+            if claim != winner && claim.by.eq(&self.config.agent_id) {
+                self.tracker
+                    .release(
+                        claim,
+                        ReleaseReason::new(
+                            ReleaseReasonCode::Conflict,
+                            format!(
+                                "duplicate claim abandoned; winner {} has shard rank {}",
+                                winner.by,
+                                winner.shard_role.rank()
+                            ),
+                        ),
+                    )
+                    .await?;
+                summary.conflicts_abandoned += 1;
+            }
+        }
+        Ok(true)
+    }
+
+    fn should_take_over_stale_primary(
+        &self,
+        issue: &Issue,
+        claim: &Claim,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let Some(shard) = issue.shard.as_ref() else {
+            return Ok(false);
+        };
+        if !shard.primary.eq(&claim.by) || claim.shard_role != ShardRole::Primary {
+            return Ok(false);
+        }
+        let Some(self_role @ ShardRole::Backup(_)) =
+            reconcile::agent_shard_role(issue, &self.config.agent_id)
+        else {
+            return Ok(false);
+        };
+        if claim.shard_role.rank() >= self_role.rank() {
+            return Ok(false);
+        }
+        reconcile::is_heartbeat_stale(claim, now, self.issue_ttl(issue))
     }
 
     /// Request graceful shutdown.

@@ -69,10 +69,9 @@ impl ManualClock {
 
 impl Clock for ManualClock {
     fn now(&self) -> DateTime<Utc> {
-        if let Ok(guard) = self.current.lock() {
-            *guard
-        } else {
-            Utc::now()
+        match self.current.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
         }
     }
 }
