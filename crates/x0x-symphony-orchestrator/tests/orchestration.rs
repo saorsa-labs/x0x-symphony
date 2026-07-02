@@ -407,7 +407,198 @@ fn sysclock() -> Arc<dyn Clock> {
     Arc::new(SystemClock) as Arc<dyn Clock>
 }
 
+fn manual_clock(at: &str) -> Result<Arc<dyn Clock>, Box<dyn Error>> {
+    Ok(Arc::new(ManualClock::new(parse_ts(at)?)) as Arc<dyn Clock>)
+}
+
+fn workspace_manager(tmp: &TempDir) -> Result<Arc<Manager>, Box<dyn Error>> {
+    Ok(Arc::new(Manager::new(WorkspaceConfig::new(
+        tmp.path().join("workspaces"),
+    ))?))
+}
+
+fn create_workspace_dir(manager: &Manager, issue_id: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let path = manager.issue_path(issue_id)?;
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn orphan_config() -> Result<Config, Box<dyn Error>> {
+    config_with_hooks(
+        RetryPolicy::default(),
+        1,
+        LifecycleHooks::default(),
+        vec![state("done")?, state("cancelled")?, state("duplicate")?],
+    )
+}
+
 // ---------- tests ----------
+
+#[tokio::test]
+async fn orphan_sweep_quarantines_done_and_tracker_missing_workspaces() -> Result<(), Box<dyn Error>>
+{
+    let tmp = TempDir::new()?;
+    let workspace = workspace_manager(&tmp)?;
+    let done_path = create_workspace_dir(&workspace, "XSY-9701")?;
+    let missing_path = create_workspace_dir(&workspace, "XSY-9702")?;
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9701", "done")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let orc = orc(
+        Arc::clone(&tracker),
+        Arc::clone(&runner),
+        Arc::clone(&workspace),
+        manual_clock("2026-07-02T12:34:56Z")?,
+        orphan_config()?,
+    );
+
+    let summary = orc.sweep_orphans().await?;
+
+    assert_eq!(summary.preserved_count(), 0);
+    assert_eq!(summary.quarantined_count(), 2);
+    assert_eq!(summary.refused_count(), 0);
+    assert!(!done_path.exists());
+    assert!(!missing_path.exists());
+    assert!(workspace
+        .canonical_root()
+        .join(".orphaned")
+        .join("20260702T123456Z")
+        .join("XSY-9701")
+        .is_dir());
+    assert!(workspace
+        .canonical_root()
+        .join(".orphaned")
+        .join("20260702T123456Z")
+        .join("XSY-9702")
+        .is_dir());
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphan_sweep_preserves_non_terminal_workspace_without_live_claim(
+) -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let workspace = workspace_manager(&tmp)?;
+    let todo_path = create_workspace_dir(&workspace, "XSY-9703")?;
+    let review_path = create_workspace_dir(&workspace, "XSY-9704")?;
+    let tracker = Arc::new(StubTracker::with(vec![
+        make_issue("XSY-9703", "todo")?,
+        make_issue("XSY-9704", "review")?,
+    ]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let orc = orc(
+        Arc::clone(&tracker),
+        Arc::clone(&runner),
+        Arc::clone(&workspace),
+        manual_clock("2026-07-02T12:34:56Z")?,
+        orphan_config()?,
+    );
+
+    let summary = orc.sweep_orphans().await?;
+
+    assert_eq!(summary.preserved_count(), 2);
+    assert_eq!(summary.quarantined_count(), 0);
+    assert_eq!(summary.refused_count(), 0);
+    assert!(todo_path.is_dir());
+    assert!(review_path.is_dir());
+    assert!(!workspace.canonical_root().join(".orphaned").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphan_sweep_preserves_live_self_claim_workspace() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let workspace = workspace_manager(&tmp)?;
+    let live_path = create_workspace_dir(&workspace, "XSY-9705")?;
+    let owner = agent()?;
+    let tracker = Arc::new(StubTracker::with(vec![claimed_issue(
+        "XSY-9705",
+        &owner,
+        "2026-07-02T12:34:56Z".to_owned(),
+    )?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let orc = orc(
+        Arc::clone(&tracker),
+        Arc::clone(&runner),
+        Arc::clone(&workspace),
+        manual_clock("2026-07-02T12:34:56Z")?,
+        orphan_config()?,
+    );
+
+    let summary = orc.sweep_orphans().await?;
+
+    assert_eq!(summary.preserved_count(), 1);
+    assert_eq!(summary.quarantined_count(), 0);
+    assert_eq!(summary.refused_count(), 0);
+    assert!(live_path.is_dir());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn orphan_sweep_refuses_symlink_escape_without_moving_it() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let workspace = workspace_manager(&tmp)?;
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside)?;
+    let symlink_path = workspace.canonical_root().join("XSY-9706");
+    std::os::unix::fs::symlink(&outside, &symlink_path)?;
+    let invalid_name_path = workspace.canonical_root().join("XSY-..-9706");
+    std::fs::create_dir_all(&invalid_name_path)?;
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9706", "done")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let orc = orc(
+        Arc::clone(&tracker),
+        Arc::clone(&runner),
+        Arc::clone(&workspace),
+        manual_clock("2026-07-02T12:34:56Z")?,
+        orphan_config()?,
+    );
+
+    let summary = orc.sweep_orphans().await?;
+
+    assert_eq!(summary.preserved_count(), 0);
+    assert_eq!(summary.quarantined_count(), 0);
+    assert_eq!(summary.refused_count(), 2);
+    assert!(std::fs::symlink_metadata(&symlink_path)?
+        .file_type()
+        .is_symlink());
+    assert!(invalid_name_path.is_dir());
+    assert!(outside.is_dir());
+    assert!(!workspace.canonical_root().join(".orphaned").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphan_sweep_is_idempotent_after_quarantine() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let workspace = workspace_manager(&tmp)?;
+    let orphan_path = create_workspace_dir(&workspace, "XSY-9707")?;
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9707", "done")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let orc = orc(
+        Arc::clone(&tracker),
+        Arc::clone(&runner),
+        Arc::clone(&workspace),
+        manual_clock("2026-07-02T12:34:56Z")?,
+        orphan_config()?,
+    );
+
+    let first = orc.sweep_orphans().await?;
+    let second = orc.sweep_orphans().await?;
+
+    assert_eq!(first.quarantined_count(), 1);
+    assert_eq!(second.preserved_count(), 0);
+    assert_eq!(second.quarantined_count(), 0);
+    assert_eq!(second.refused_count(), 0);
+    assert!(!orphan_path.exists());
+    assert!(workspace
+        .canonical_root()
+        .join(".orphaned")
+        .join("20260702T123456Z")
+        .join("XSY-9707")
+        .is_dir());
+    Ok(())
+}
 
 #[tokio::test]
 async fn end_to_end_smoke_todo_to_review() -> Result<(), Box<dyn Error>> {

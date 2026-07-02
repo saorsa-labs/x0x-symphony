@@ -44,6 +44,36 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// Creating an orphan quarantine directory failed.
+    #[error("failed to create orphan quarantine directory {path}: {source}", path = .path.display())]
+    CreateQuarantineDir {
+        /// Directory path.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Reading workspace root entries failed.
+    #[error("failed to read workspace root {path}: {source}", path = .path.display())]
+    ReadDir {
+        /// Directory path.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Reading one workspace root entry failed.
+    #[error("failed to read workspace root entry under {path}: {source}", path = .path.display())]
+    ReadDirEntry {
+        /// Directory being scanned.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: io::Error,
+    },
+
     /// Reading workspace metadata failed.
     #[error("failed to read workspace metadata {path}: {source}", path = .path.display())]
     Metadata {
@@ -62,6 +92,27 @@ pub enum Error {
         /// Underlying I/O failure.
         #[source]
         source: io::Error,
+    },
+
+    /// Moving a workspace into quarantine failed.
+    #[error("failed to move workspace directory {from} to quarantine {to}: {source}", from = .from.display(), to = .to.display())]
+    MoveDir {
+        /// Source workspace path.
+        from: PathBuf,
+        /// Quarantine destination path.
+        to: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// A quarantine path failed containment validation.
+    #[error("invalid orphan quarantine path {path}: {reason}", path = .path.display())]
+    InvalidQuarantinePath {
+        /// Rejected path.
+        path: PathBuf,
+        /// Human-readable reason.
+        reason: &'static str,
     },
 
     /// Hook environment key or value validation failed.

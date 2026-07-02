@@ -22,6 +22,7 @@ pub mod clock;
 pub mod concurrency;
 pub mod dispatch;
 pub mod error;
+pub mod orphans;
 pub mod reconcile;
 pub mod retry;
 
@@ -29,6 +30,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use concurrency::Budget;
 pub use dispatch::{claimable_for, Claimable, Resolution};
 pub use error::{Error, Result};
+pub use orphans::{OrphanSweepSummary, QuarantinedOrphan, RefusedOrphan};
 pub use reconcile::{classify, is_fresh_self, parse_heartbeat, ClaimStance, ReconcileSummary};
 pub use retry::RetryPolicy;
 
