@@ -1,0 +1,46 @@
+[package]
+name = "x0x-symphony-bin"
+description = "Daemon and CLI binaries for x0x-symphony."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "x0x-symphonyd"
+path = "src/bin/x0x-symphonyd.rs"
+
+[[bin]]
+name = "x0x-symphony"
+path = "src/bin/x0x-symphony.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+hex = "0.4"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal", "sync", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+x0x-symphony-core = { path = "../x0x-symphony-core" }
+x0x-symphony-orchestrator = { path = "../x0x-symphony-orchestrator" }
+x0x-symphony-runner-shell = { path = "../x0x-symphony-runner-shell" }
+x0x-symphony-tracker-git-jsonl = { path = "../x0x-symphony-tracker-git-jsonl" }
+x0x-symphony-workspace = { path = "../x0x-symphony-workspace" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

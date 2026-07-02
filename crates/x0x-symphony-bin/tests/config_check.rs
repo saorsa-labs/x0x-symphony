@@ -1,0 +1,90 @@
+use std::{error::Error, path::PathBuf};
+
+use clap::Parser;
+use x0x_symphony_bin::cli::{self, CommandLine};
+
+#[tokio::test]
+async fn repository_workflow_passes_config_check() -> Result<(), Box<dyn Error>> {
+    let workflow = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("WORKFLOW.md");
+    let workflow_arg = workflow.to_string_lossy().into_owned();
+    let output = run_cli(&["x0x-symphony", "config", "check", "--config", &workflow_arg]).await?;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "config ok\n");
+    assert_eq!(output.stderr, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_required_blocks_fail_config_check() -> Result<(), Box<dyn Error>> {
+    for block in [
+        "tracker",
+        "polling",
+        "workspace",
+        "hooks",
+        "agent",
+        "runner",
+    ] {
+        let dir = tempfile::tempdir()?;
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        std::fs::write(&workflow_path, workflow_missing(block))?;
+        let workflow_arg = workflow_path.to_string_lossy().into_owned();
+        let output =
+            run_cli(&["x0x-symphony", "config", "check", "--config", &workflow_arg]).await?;
+        assert_eq!(output.exit_code, 1);
+        assert_eq!(output.stdout, "");
+        assert!(
+            output
+                .stderr
+                .contains(&format!("error: missing required key `{block}`")),
+            "stderr was: {}",
+            output.stderr
+        );
+    }
+    Ok(())
+}
+
+async fn run_cli(args: &[&str]) -> Result<cli::Output, Box<dyn Error>> {
+    let command_line = CommandLine::try_parse_from(args)?;
+    cli::run(command_line).await.map_err(Into::into)
+}
+
+fn workflow_missing(block: &str) -> String {
+    let mut content = String::from("---\n");
+    if block != "tracker" {
+        content.push_str("tracker:\n  kind: git_issues\n  path: issues/issues.jsonl\n");
+    }
+    if block != "polling" {
+        content.push_str("polling:\n  interval_ms: 1\n");
+    }
+    if block != "workspace" {
+        content.push_str("workspace:\n  root: /tmp/xsy-workspaces\n");
+    }
+    if block != "hooks" {
+        content.push_str(concat!(
+            "hooks:\n",
+            "  timeout_ms: 1\n",
+            "  after_create: \"true\"\n",
+            "  before_run: \"true\"\n",
+            "  after_run: \"true\"\n",
+            "  before_remove: \"true\"\n",
+        ));
+    }
+    if block != "agent" {
+        content.push_str(concat!(
+            "agent:\n",
+            "  max_concurrent_agents: 1\n",
+            "  max_concurrent_agents_by_state:\n",
+            "    todo: 1\n",
+            "  max_turns: 2\n",
+            "  max_retry_backoff_ms: 1000\n",
+        ));
+    }
+    if block != "runner" {
+        content.push_str("runner:\n  kind: shell\n  command: echo\n");
+    }
+    content.push_str("---\nPrompt\n");
+    content
+}
