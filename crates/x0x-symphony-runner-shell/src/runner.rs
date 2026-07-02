@@ -32,7 +32,7 @@ use x0x_symphony_core::{
 use crate::{
     env,
     error::{Error, Result},
-    RunnerSpec,
+    EventOverflowPolicy, RunnerSpec,
 };
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -192,8 +192,11 @@ impl Runner for ShellRunner {
         let child_env = env::build_child_env(&self.spec, &ctx).map_err(SymphonyError::from)?;
         let session_number = self.next_session.fetch_add(1, Ordering::Relaxed);
         let session_id = SessionId::new(format!("shell-{session_number}"));
-        let (events, receiver) =
-            BoundedEventQueue::new(self.spec.event_capacity, self.spec.event_high_water_mark);
+        let (events, receiver) = BoundedEventQueue::new(
+            self.spec.event_capacity,
+            self.spec.event_high_water_mark,
+            self.spec.event_overflow_policy,
+        );
         let handle = SessionHandle::new(session_id.clone(), ctx.workspace_path, now_rfc3339());
         events.send(RunnerEvent::new(RunnerEventKind::SessionStarted));
 
@@ -271,12 +274,14 @@ struct BoundedEventQueue {
     sender: mpsc::Sender<RunnerEvent>,
     receiver: Arc<Mutex<mpsc::Receiver<RunnerEvent>>>,
     high_water_mark: usize,
+    overflow_policy: EventOverflowPolicy,
 }
 
 impl BoundedEventQueue {
     fn new(
         capacity: usize,
         high_water_mark: usize,
+        overflow_policy: EventOverflowPolicy,
     ) -> (Self, Arc<Mutex<mpsc::Receiver<RunnerEvent>>>) {
         let (sender, receiver) = mpsc::channel(capacity);
         let receiver = Arc::new(Mutex::new(receiver));
@@ -285,6 +290,7 @@ impl BoundedEventQueue {
                 sender,
                 receiver: Arc::clone(&receiver),
                 high_water_mark,
+                overflow_policy,
             },
             receiver,
         )
@@ -294,7 +300,12 @@ impl BoundedEventQueue {
         self.warn_if_high_water();
         match self.sender.try_send(event) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(event)) => self.drop_oldest_and_send(event),
+            Err(mpsc::error::TrySendError::Full(event)) => match self.overflow_policy {
+                // Exhaustive match: adding a future variant (e.g. `Block`)
+                // forces the compiler to decide how to handle backpressure
+                // here, so a new policy can never be silently ignored.
+                EventOverflowPolicy::DropOldest => self.drop_oldest_and_send(event),
+            },
             Err(mpsc::error::TrySendError::Closed(_event)) => {
                 tracing::warn!("dropping runner event because receiver is closed");
             }

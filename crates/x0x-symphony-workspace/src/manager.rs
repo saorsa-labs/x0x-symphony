@@ -9,6 +9,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(unix)]
+use tokio::process::Child;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
@@ -331,6 +333,9 @@ impl Manager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Place the hook child in its own process group so a timeout can kill
+        // any grandchildren the hook forked (mirrors the runner's PG-kill).
+        configure_process_group(&mut command);
 
         let mut child = command.spawn().map_err(|source| Error::HookSpawn {
             hook: hook_name,
@@ -359,11 +364,13 @@ impl Manager {
                 });
             }
             Err(_elapsed) => {
-                if let Err(source) = child.start_kill() {
+                // Kill the whole process group, not just the direct bash
+                // child, so forked grandchildren die with the hook.
+                if let Err(error) = kill_process_group(&mut child) {
                     warn!(
                         hook = hook_name,
-                        error = %source,
-                        "failed to kill timed-out hook process"
+                        error = %error,
+                        "failed to kill timed-out hook process group"
                     );
                 }
                 if let Err(source) = child.wait().await {
@@ -597,4 +604,41 @@ fn is_dangerous_env_name(name: &str) -> bool {
         "LD_LIBRARY_PATH",
     ];
     DANGEROUS.contains(&name.to_ascii_uppercase().as_str())
+}
+
+/// Place the spawned hook child in its own process group so a timeout can
+/// signal the entire group. No-op off Unix; mirroring the runner's PG-kill.
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+/// Kill the hook child's process group on timeout. On Unix this signals the
+/// negative process id (the whole group) so forked grandchildren die with the
+/// bash child; off Unix it falls back to the direct child only. Mirrors the
+/// runner's `kill_process_group`.
+#[cfg(unix)]
+fn kill_process_group(child: &mut Child) -> std::result::Result<(), String> {
+    use nix::{
+        errno::Errno,
+        sys::signal::{kill, Signal},
+        unistd::Pid,
+    };
+    let Some(child_id) = child.id() else {
+        return Ok(());
+    };
+    let pgid = i32::try_from(child_id)
+        .map_err(|error| format!("child id does not fit process id: {error}"))?;
+    match kill(Pid::from_raw(-pgid), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut Child) -> std::result::Result<(), String> {
+    child.start_kill().map_err(|error| error.to_string())
 }

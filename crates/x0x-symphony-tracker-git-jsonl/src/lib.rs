@@ -5,6 +5,35 @@
 //! `issues/issues.jsonl`. It is deliberately temporary: ADR-0003 states that
 //! v1.0 ships without external or file-backed trackers, and XSY-0024 deletes
 //! this adapter when the M3 `x0x_crdt` tracker becomes the permanent backend.
+//!
+//! # Concurrency and lock semantics (operators must read this)
+//!
+//! State transitions are serialized on a single host with a file lock:
+//!
+//! 1. **Lock path.** The adapter locks `<git-dir>/index.lock` — the *same*
+//!    path `git` uses for its own index updates — using `create_new`
+//!    (exclusive create). The lock guard is released *before* the adapter
+//!    runs `git add`/`git commit`, so git can re-acquire its own index lock.
+//!    Consequence: **concurrent operator `git` operations** (e.g. a manual
+//!    `git commit`, `git add`, or a second symphony process) contend on this
+//!    one path. If contention exceeds the retry budget the adapter returns
+//!    [`TrackerError::LockExhausted`] rather than corrupting the file.
+//!
+//! 2. **Stale foreign locks are not removed.** The guard's `Drop` impl deletes
+//!    only the lock file *this process* created. If a previous process
+//!    crashed while holding `index.lock`, the orphaned file persists and
+//!    `create_new` keeps failing `AlreadyExists` until `LockExhausted`. A
+//!    human must remove the stale `<git-dir>/index.lock` by hand. (Removing
+//!    foreign locks automatically would require a liveliness probe and is
+//!    tracked as a resilience follow-up; see XSY-0040.)
+//!
+//! 3. **Commits skip hooks.** The adapter commits with `git commit
+//!    --no-verify`. This is deliberate: the tracker owns the repository's
+//!    issue lines and must not be blocked by pre-commit/pre-push hooks the
+//!    operator may have installed. Operators who rely on hooks for policy
+//!    must enforce it out-of-band.
+//!
+//! See `docs/symphony/operator.md` for the operator-facing summary.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]

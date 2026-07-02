@@ -904,6 +904,7 @@ name = "x0x-symphony-workspace"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "nix",
  "tempfile",
  "thiserror",
  "tokio",
