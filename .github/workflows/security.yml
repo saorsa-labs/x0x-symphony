@@ -1,0 +1,37 @@
+name: Security Audit
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC.
+    - cron: '0 6 * * *'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run cargo audit
+        # Because this workflow runs on pull_request, a cargo-audit failure fails the PR check.
+        # x0x-symphony has no ant-quic/saorsa-gossip Cargo deps, so audit runs against its own Cargo.lock only.
+        run: cargo audit
