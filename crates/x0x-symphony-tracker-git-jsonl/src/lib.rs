@@ -41,13 +41,13 @@
 pub mod signing;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime},
 };
@@ -64,7 +64,9 @@ use x0x_symphony_core::{
     SymphonyError, Tracker, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
 };
 
-use crate::signing::{SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver};
+use crate::signing::{
+    SignResponse, SigningClient, SigningError, SigningPolicy, TrustedKeyResolver, VerifyOutcome,
+};
 
 /// Result alias used by the git JSONL tracker adapter.
 pub type Result<T> = std::result::Result<T, TrackerError>;
@@ -159,6 +161,13 @@ pub enum TrackerError {
     /// Signing or verification failed.
     #[error("signing error: {0}")]
     Signing(String),
+
+    /// Signature validity is unknown because verification transport failed.
+    #[error("signature verification transport error: {reason}")]
+    VerifyTransport {
+        /// Verification dependency or transport failure.
+        reason: String,
+    },
 
     /// Core domain validation failed while constructing an adapter value.
     #[error(transparent)]
@@ -282,6 +291,16 @@ impl SigningRuntime {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct VerifyCacheKey {
+    issue_id: IssueId,
+    context: String,
+    payload_sha256: String,
+    signature_b64: String,
+    public_key_b64: String,
+    signer_agent_id: String,
+}
+
 /// Builder for [`JsonlTracker`].
 #[derive(Clone)]
 pub struct JsonlTrackerBuilder {
@@ -402,6 +421,7 @@ impl JsonlTrackerBuilder {
             signing: self.signing,
             shard_workers: self.shard_workers,
             shard_replication_factor: self.shard_replication_factor,
+            verify_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -434,6 +454,7 @@ pub struct JsonlTracker {
     signing: SigningRuntime,
     shard_workers: Vec<AgentId>,
     shard_replication_factor: usize,
+    verify_cache: Arc<Mutex<HashMap<VerifyCacheKey, VerifyOutcome>>>,
 }
 
 impl std::fmt::Debug for JsonlTracker {
@@ -705,145 +726,188 @@ impl JsonlTracker {
         Ok(handoff)
     }
 
-    async fn filter_verified_issues(&self, issues: Vec<Issue>) -> Vec<Issue> {
+    async fn filter_verified_issues(&self, issues: Vec<Issue>) -> Result<Vec<Issue>> {
         if self.signing.policy == SigningPolicy::Disabled {
-            return issues;
+            return Ok(issues);
         }
         let mut verified = Vec::with_capacity(issues.len());
         for issue in issues {
-            if self.verify_issue(&issue).await {
-                verified.push(issue);
+            match self.verify_issue(&issue).await {
+                VerifyOutcome::Valid => verified.push(issue),
+                VerifyOutcome::Invalid(reason) => {
+                    warn!(
+                        issue_id = %issue.id,
+                        reason = reason.as_str(),
+                        "dropping issue with invalid signature"
+                    );
+                }
+                VerifyOutcome::TransportError(reason) => {
+                    return Err(TrackerError::VerifyTransport {
+                        reason: format!("issue {}: {reason}", issue.id),
+                    });
+                }
             }
         }
-        verified
+        Ok(verified)
     }
 
-    async fn verify_issue(&self, issue: &Issue) -> bool {
-        if let Err(error) = self.verify_issue_result(issue).await {
-            warn!(issue_id = %issue.id, error = %error, "dropping issue with invalid signature");
-            false
-        } else {
-            true
-        }
-    }
-
-    async fn verify_issue_result(&self, issue: &Issue) -> Result<()> {
+    async fn verify_issue(&self, issue: &Issue) -> VerifyOutcome {
         if let Some(claim) = &issue.claim {
-            self.verify_claim(issue, claim).await?;
+            let outcome = self.verify_claim(issue, claim).await;
+            if outcome != VerifyOutcome::Valid {
+                return outcome;
+            }
         }
         if let Some(handoff) = &issue.handoff {
-            self.verify_handoff(issue, handoff).await?;
+            return self.verify_handoff(issue, handoff).await;
         }
-        Ok(())
+        VerifyOutcome::Valid
     }
 
-    async fn verify_claim(&self, issue: &Issue, claim: &Claim) -> Result<()> {
+    async fn verify_claim(&self, issue: &Issue, claim: &Claim) -> VerifyOutcome {
         if claim.issue_id.as_ref() != Some(&issue.id) {
-            return Err(TrackerError::Signing(format!(
+            return VerifyOutcome::Invalid(format!(
                 "claim issue_id does not match parent issue {}",
                 issue.id
-            )));
+            ));
         }
-        let envelope = claim.signature.as_ref().ok_or_else(|| {
-            TrackerError::Signing(format!("claim for issue {} is unsigned", issue.id))
-        })?;
+        let Some(envelope) = claim.signature.as_ref() else {
+            return VerifyOutcome::Invalid(format!("claim for issue {} is unsigned", issue.id));
+        };
         if envelope.signer_agent_id != claim.by.to_string() {
-            return Err(TrackerError::Signing(format!(
+            return VerifyOutcome::Invalid(format!(
                 "claim owner {} does not match signer {}",
                 claim.by, envelope.signer_agent_id
-            )));
+            ));
         }
-        let payload = claim.signing_payload_bytes().map_err(TrackerError::from)?;
-        self.verify_envelope(envelope, CLAIM_CONTEXT, &payload)
+        let payload = match claim.signing_payload_bytes() {
+            Ok(payload) => payload,
+            Err(error) => return VerifyOutcome::Invalid(error.to_string()),
+        };
+        self.verify_envelope(&issue.id, envelope, CLAIM_CONTEXT, &payload)
             .await
     }
 
-    async fn verify_handoff(&self, issue: &Issue, handoff: &Handoff) -> Result<()> {
-        let envelope = handoff.signature.as_ref().ok_or_else(|| {
-            TrackerError::Signing(format!("handoff for issue {} is unsigned", issue.id))
-        })?;
+    async fn verify_handoff(&self, issue: &Issue, handoff: &Handoff) -> VerifyOutcome {
+        let Some(envelope) = handoff.signature.as_ref() else {
+            return VerifyOutcome::Invalid(format!("handoff for issue {} is unsigned", issue.id));
+        };
         if handoff.issue_id.as_ref() != Some(&issue.id) {
-            return Err(TrackerError::Signing(format!(
+            return VerifyOutcome::Invalid(format!(
                 "handoff issue_id does not match parent issue {}",
                 issue.id
-            )));
+            ));
         }
-        let signer_agent_id = handoff.signer_agent_id.as_ref().ok_or_else(|| {
-            TrackerError::Signing(format!(
+        let Some(signer_agent_id) = handoff.signer_agent_id.as_ref() else {
+            return VerifyOutcome::Invalid(format!(
                 "handoff for issue {} is missing signer_agent_id",
                 issue.id
-            ))
-        })?;
+            ));
+        };
         if signer_agent_id != &envelope.signer_agent_id {
-            return Err(TrackerError::Signing(format!(
+            return VerifyOutcome::Invalid(format!(
                 "handoff signer binding {signer_agent_id} does not match envelope signer {}",
                 envelope.signer_agent_id
-            )));
+            ));
         }
-        let payload = handoff
-            .signing_payload_bytes()
-            .map_err(TrackerError::from)?;
-        self.verify_envelope(envelope, HANDOFF_CONTEXT, &payload)
+        let payload = match handoff.signing_payload_bytes() {
+            Ok(payload) => payload,
+            Err(error) => return VerifyOutcome::Invalid(error.to_string()),
+        };
+        self.verify_envelope(&issue.id, envelope, HANDOFF_CONTEXT, &payload)
             .await
     }
 
     async fn verify_envelope(
         &self,
+        issue_id: &IssueId,
         envelope: &SignatureEnvelope,
         target_context: &str,
         payload: &[u8],
-    ) -> Result<()> {
+    ) -> VerifyOutcome {
         if envelope.algorithm != SIGN_ALGORITHM {
-            return Err(TrackerError::Signing(format!(
+            return VerifyOutcome::Invalid(format!(
                 "unsupported signing algorithm {}",
                 envelope.algorithm
-            )));
+            ));
         }
         if envelope.context != target_context {
-            return Err(TrackerError::Signing(format!(
+            return VerifyOutcome::Invalid(format!(
                 "signature context {} does not match {target_context}",
                 envelope.context
-            )));
+            ));
         }
         let actual_digest = sha256_hex(payload);
         if envelope.payload_sha256 != actual_digest {
-            return Err(TrackerError::Signing(format!(
+            return VerifyOutcome::Invalid(format!(
                 "payload digest {} does not match {actual_digest}",
                 envelope.payload_sha256
-            )));
+            ));
         }
-        let envelope_key = BASE64
-            .decode(&envelope.public_key_b64)
-            .map_err(|source| TrackerError::Signing(format!("invalid public_key_b64: {source}")))?;
-        let trusted_key = self
-            .signing
-            .resolver()?
-            .resolve(&envelope.signer_agent_id)
-            .await
-            .map_err(signing_error)?;
+        let envelope_key = match BASE64.decode(&envelope.public_key_b64) {
+            Ok(key) => key,
+            Err(source) => {
+                return VerifyOutcome::Invalid(format!("invalid public_key_b64: {source}"));
+            }
+        };
+        let resolver = match self.signing.resolver() {
+            Ok(resolver) => resolver,
+            Err(error) => return VerifyOutcome::TransportError(error.to_string()),
+        };
+        let trusted_key = match resolver.resolve(&envelope.signer_agent_id).await {
+            Ok(key) => key,
+            Err(error) => return signing_error_to_verify_outcome(&error),
+        };
         if envelope_key != trusted_key {
-            return Err(TrackerError::Signing(format!(
+            return VerifyOutcome::Invalid(format!(
                 "envelope public key does not belong to signer {}",
                 envelope.signer_agent_id
-            )));
+            ));
         }
-        let signature = BASE64
-            .decode(&envelope.signature_b64)
-            .map_err(|source| TrackerError::Signing(format!("invalid signature_b64: {source}")))?;
+        let signature = match BASE64.decode(&envelope.signature_b64) {
+            Ok(signature) => signature,
+            Err(source) => {
+                return VerifyOutcome::Invalid(format!("invalid signature_b64: {source}"));
+            }
+        };
+        let cache_key = VerifyCacheKey {
+            issue_id: issue_id.clone(),
+            context: target_context.to_owned(),
+            payload_sha256: actual_digest,
+            signature_b64: envelope.signature_b64.clone(),
+            public_key_b64: envelope.public_key_b64.clone(),
+            signer_agent_id: envelope.signer_agent_id.clone(),
+        };
+        if let Some(outcome) = self.cached_verify_outcome(&cache_key) {
+            return outcome;
+        }
+        let client = match self.signing.client() {
+            Ok(client) => client,
+            Err(error) => return VerifyOutcome::TransportError(error.to_string()),
+        };
         // Send raw claim/handoff payload bytes. x0xd reconstructs the external
         // DST internally for both /agent/sign and /agent/verify.
-        let valid = self
-            .signing
-            .client()?
+        let outcome = match client
             .verify(target_context, payload, &signature, &envelope_key)
             .await
-            .map_err(signing_error)?;
-        if valid {
-            Ok(())
-        } else {
-            Err(TrackerError::Signing(
-                "x0xd verify endpoint returned false".to_owned(),
-            ))
+        {
+            Ok(outcome) => outcome,
+            Err(error) => signing_error_to_verify_outcome(&error),
+        };
+        if !matches!(outcome, VerifyOutcome::TransportError(_)) {
+            self.cache_verify_outcome(cache_key, outcome.clone());
+        }
+        outcome
+    }
+
+    fn cached_verify_outcome(&self, key: &VerifyCacheKey) -> Option<VerifyOutcome> {
+        let cache = self.verify_cache.lock().ok()?;
+        cache.get(key).cloned()
+    }
+
+    fn cache_verify_outcome(&self, key: VerifyCacheKey, outcome: VerifyOutcome) {
+        if let Ok(mut cache) = self.verify_cache.lock() {
+            cache.insert(key, outcome);
         }
     }
 
@@ -1175,7 +1239,10 @@ impl Tracker for JsonlTracker {
             .filter(|record| blockers_are_terminal(&record.issue, &records, &terminal_states))
             .map(|record| record.issue.clone())
             .collect::<Vec<_>>();
-        candidates = self.filter_verified_issues(candidates).await;
+        candidates = self
+            .filter_verified_issues(candidates)
+            .await
+            .map_err(SymphonyError::from)?;
         candidates.sort_by(|left, right| {
             priority_sort_key(left)
                 .cmp(&priority_sort_key(right))
@@ -1192,7 +1259,9 @@ impl Tracker for JsonlTracker {
                 issues.push(record.issue.clone());
             }
         }
-        Ok(self.filter_verified_issues(issues).await)
+        self.filter_verified_issues(issues)
+            .await
+            .map_err(SymphonyError::from)
     }
 
     async fn claim(&self, id: &IssueId, agent_id: &AgentId) -> CoreResult<Claim> {
@@ -1250,7 +1319,9 @@ impl Tracker for JsonlTracker {
             })
             .map(|record| record.issue.clone())
             .collect::<Vec<_>>();
-        Ok(self.filter_verified_issues(claimed).await)
+        self.filter_verified_issues(claimed)
+            .await
+            .map_err(SymphonyError::from)
     }
 
     async fn block(&self, claim: &Claim, reason: ReleaseReason) -> CoreResult<()> {
@@ -1483,6 +1554,14 @@ fn envelope_from_sign_response(
 
 fn signing_error(error: impl std::fmt::Display) -> TrackerError {
     TrackerError::Signing(error.to_string())
+}
+
+fn signing_error_to_verify_outcome(error: &SigningError) -> VerifyOutcome {
+    if error.is_verify_transport() {
+        VerifyOutcome::TransportError(error.to_string())
+    } else {
+        VerifyOutcome::Invalid(error.to_string())
+    }
 }
 
 fn now_utc() -> String {

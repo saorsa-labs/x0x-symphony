@@ -24,6 +24,7 @@ use x0x_symphony_tracker_git_jsonl::{
     parse_issue_line, serialize_issue,
     signing::{
         AgentInfo, SignResponse, SigningClient, SigningError, SigningPolicy, TrustedKeyResolver,
+        VerifyOutcome,
     },
     IssueDraft, JsonlTracker, TrackerError,
 };
@@ -820,6 +821,120 @@ async fn verify_endpoint_false_drops_record() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn verify_invalid_signature_drops_record() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Invalid signature")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = tracker.claim(&issue.id, &agent).await?;
+
+    let mut tampered = tracker.load_issues()?.remove(0);
+    tampered
+        .claim
+        .as_mut()
+        .and_then(|claim| claim.signature.as_mut())
+        .ok_or("missing signature")?
+        .signature_b64 = BASE64.encode(b"definitely-invalid");
+    write_single_issue(repo.path(), &tampered)?;
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn verify_transport_error_surfaces_as_error() -> TestResult {
+    let repo = init_plain()?;
+    let signer = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = signer.create_issue(IssueDraft::new("Transport failure")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = signer.claim(&issue.id, &agent).await?;
+
+    let verifier = MockSigningClient {
+        verify_transport: MockVerifyTransport::Unavailable,
+        ..MockSigningClient::default()
+    };
+    let verifying_tracker = signed_tracker(repo.path(), verifier, trusted_resolver());
+    let ctx = PollContext::new(
+        vec![IssueState::new("in_progress")?],
+        vec![IssueState::new("done")?],
+    );
+    let error = verifying_tracker
+        .fetch_candidates(&ctx)
+        .await
+        .err()
+        .ok_or("transport failure was silently accepted")?;
+    let message = error.to_string();
+    assert!(message.contains("signature verification transport error"));
+    assert!(message.contains("x0xd unavailable"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn verify_cache_avoids_repeated_calls() -> TestResult {
+    let repo = init_plain()?;
+    let client = MockSigningClient::default();
+    let tracker = signed_tracker(repo.path(), client.clone(), trusted_resolver());
+    let issue = tracker.create_issue(IssueDraft::new("Cached verify")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = tracker.claim(&issue.id, &agent).await?;
+
+    let first = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    let second = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_eq!(client.verify_call_count()?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn verify_cache_invalidates_on_payload_change() -> TestResult {
+    let repo = init_plain()?;
+    let client = MockSigningClient::default();
+    let tracker = signed_tracker(repo.path(), client.clone(), trusted_resolver());
+    let issue = tracker.create_issue(IssueDraft::new("Cache invalidation")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = tracker.claim(&issue.id, &agent).await?;
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(client.verify_call_count()?, 1);
+
+    let mut changed = tracker.load_issues()?.remove(0);
+    let claim = changed.claim.as_mut().ok_or("missing claim")?;
+    claim.at = "2026-07-02T03:00:00Z".to_owned();
+    let payload = claim.signing_payload_bytes()?;
+    let envelope = claim.signature.as_mut().ok_or("missing signature")?;
+    envelope.payload_sha256 = sha256_hex(&payload);
+    envelope.signature_b64 = BASE64.encode(fake_signature(CLAIM_CONTEXT, &payload, TRUSTED_KEY));
+    write_single_issue(repo.path(), &changed)?;
+
+    let refetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert_eq!(refetched.len(), 1);
+    assert_eq!(client.verify_call_count()?, 2);
+    Ok(())
+}
+
 #[test]
 fn signing_payload_bytes_are_stable_and_digest_matches() -> TestResult {
     let agent = AgentId::new(SIGNER)?;
@@ -881,6 +996,12 @@ const SIGNER: &str = "agent-a";
 const TRUSTED_KEY: &[u8] = b"trusted-key-a";
 const OTHER_KEY: &[u8] = b"trusted-key-b";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MockVerifyTransport {
+    Available,
+    Unavailable,
+}
+
 #[derive(Clone)]
 struct MockSigningClient {
     signer_agent_id: String,
@@ -888,7 +1009,18 @@ struct MockSigningClient {
     fail_sign: bool,
     verify_false: bool,
     verify_always_true: bool,
+    verify_transport: MockVerifyTransport,
+    verify_calls: Arc<Mutex<usize>>,
     max_payload: usize,
+}
+
+impl MockSigningClient {
+    fn verify_call_count(&self) -> TestResult<usize> {
+        self.verify_calls
+            .lock()
+            .map(|calls| *calls)
+            .map_err(|_| io::Error::other("verify call counter lock poisoned").into())
+    }
 }
 
 impl Default for MockSigningClient {
@@ -899,6 +1031,8 @@ impl Default for MockSigningClient {
             fail_sign: false,
             verify_false: false,
             verify_always_true: false,
+            verify_transport: MockVerifyTransport::Available,
+            verify_calls: Arc::new(Mutex::new(0)),
             max_payload: 64 * 1024,
         }
     }
@@ -937,14 +1071,28 @@ impl SigningClient for MockSigningClient {
         payload: &[u8],
         signature: &[u8],
         public_key: &[u8],
-    ) -> x0x_symphony_tracker_git_jsonl::signing::Result<bool> {
+    ) -> x0x_symphony_tracker_git_jsonl::signing::Result<VerifyOutcome> {
+        let mut calls = self.verify_calls.lock().map_err(|_| {
+            SigningError::InvalidResponse("verify call counter lock poisoned".to_owned())
+        })?;
+        *calls = calls.saturating_add(1);
+        drop(calls);
+        if self.verify_transport == MockVerifyTransport::Unavailable {
+            return Ok(VerifyOutcome::TransportError("x0xd unavailable".to_owned()));
+        }
         if self.verify_always_true {
-            return Ok(true);
+            return Ok(VerifyOutcome::Valid);
         }
         if self.verify_false {
-            return Ok(false);
+            return Ok(VerifyOutcome::Invalid(
+                "x0xd verify endpoint returned false".to_owned(),
+            ));
         }
-        Ok(signature == fake_signature(context, payload, public_key))
+        if signature == fake_signature(context, payload, public_key) {
+            Ok(VerifyOutcome::Valid)
+        } else {
+            Ok(VerifyOutcome::Invalid("signature mismatch".to_owned()))
+        }
     }
 
     async fn agent_identity(&self) -> x0x_symphony_tracker_git_jsonl::signing::Result<AgentInfo> {
