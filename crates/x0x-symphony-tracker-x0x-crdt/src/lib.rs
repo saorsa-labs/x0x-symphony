@@ -45,7 +45,7 @@ use x0x_symphony_core::{
     SIGN_ALGORITHM,
 };
 use x0x_symphony_tracker_git_jsonl::signing::{
-    SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver,
+    SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver, VerifyOutcome,
 };
 
 use crate::{
@@ -623,18 +623,20 @@ impl X0xCrdtTracker {
         let signature = BASE64
             .decode(&envelope.signature_b64)
             .map_err(|source| TrackerError::Signing(format!("invalid signature_b64: {source}")))?;
-        let valid = self
+        let outcome = self
             .signing
             .client()?
             .verify(target_context, payload, &signature, &envelope_key)
             .await
             .map_err(signing_error)?;
-        if valid {
-            Ok(())
-        } else {
-            Err(TrackerError::Signing(
-                "x0xd verify endpoint returned false".to_owned(),
-            ))
+        match outcome {
+            VerifyOutcome::Valid => Ok(()),
+            VerifyOutcome::Invalid(reason) => Err(TrackerError::Signing(format!(
+                "x0xd verify rejected signature: {reason}"
+            ))),
+            VerifyOutcome::TransportError(reason) => Err(TrackerError::Signing(format!(
+                "x0xd verify transport error (validity unknown): {reason}"
+            ))),
         }
     }
 }

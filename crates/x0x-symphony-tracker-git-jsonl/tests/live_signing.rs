@@ -60,8 +60,11 @@ async fn live_x0xd_sign_verify_claim_payload_round_trip() -> TestResult {
         .verify(CLAIM_CONTEXT, &payload, &signature, &public_key)
         .await?;
     assert!(
-        verified,
-        "x0xd /agent/verify rejected the payload signed by /agent/sign"
+        matches!(
+            verified,
+            x0x_symphony_tracker_git_jsonl::signing::VerifyOutcome::Valid
+        ),
+        "x0xd /agent/verify rejected the payload signed by /agent/sign: {verified:?}"
     );
     Ok(())
 }
