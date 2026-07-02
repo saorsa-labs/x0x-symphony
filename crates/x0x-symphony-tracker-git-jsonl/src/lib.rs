@@ -60,8 +60,8 @@ use thiserror::Error;
 use tracing::{info, warn};
 use x0x_symphony_core::{
     sha256_hex, shard, AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext,
-    ReleaseReason, Result as CoreResult, Shard, ShardRole, SignatureEnvelope, SymphonyError,
-    Tracker, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
+    ReleaseReason, ReleaseReasonCode, Result as CoreResult, Shard, ShardRole, SignatureEnvelope,
+    SymphonyError, Tracker, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
 };
 
 use crate::signing::{SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver};
@@ -601,6 +601,12 @@ impl JsonlTracker {
                 reason = reason.message.as_str(),
                 "releasing JSONL tracker claim"
             );
+            if reason.code == ReleaseReasonCode::Conflict {
+                record
+                    .issue
+                    .extra
+                    .insert("abandon".to_owned(), conflict_abandon_value(claim, reason)?);
+            }
             record.issue.state = IssueState::new("todo")?;
             record.issue.claim = None;
             record.issue.updated_at = now_utc();
@@ -1406,6 +1412,19 @@ fn ensure_claim_owner(issue: &Issue, claim: &Claim) -> Result<()> {
             ),
         })
     }
+}
+
+fn conflict_abandon_value(claim: &Claim, reason: &ReleaseReason) -> Result<Value> {
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "claim".to_owned(),
+        serde_json::to_value(claim).map_err(|source| TrackerError::Json { source })?,
+    );
+    value.insert(
+        "reason".to_owned(),
+        serde_json::to_value(reason).map_err(|source| TrackerError::Json { source })?,
+    );
+    Ok(Value::Object(value))
 }
 
 fn validate_signed_handoff_bindings(id: &IssueId, claim: &Claim, handoff: &Handoff) -> Result<()> {

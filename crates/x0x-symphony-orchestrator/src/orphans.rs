@@ -12,7 +12,7 @@ use std::{
 use tracing::warn;
 use x0x_symphony_core::{Issue, IssueId, RefusedWorkspace, Tracker, Workspace};
 
-use crate::{reconcile::is_fresh_self, Orchestrator, Result};
+use crate::{reconcile, reconcile::is_fresh_self, Orchestrator, Result};
 
 /// Summary returned by [`Orchestrator::sweep_orphans`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -192,7 +192,7 @@ where
                 claim,
                 &self.config.agent_id,
                 self.clock.as_ref(),
-                self.config.claim_ttl,
+                reconcile::issue_claim_ttl(&issue, self.config.claim_ttl),
             )? {
                 names.insert(issue.id.as_str().to_owned());
                 names.insert(issue.identifier.clone());

@@ -7,7 +7,10 @@
 //! tracker adapters in RFC3339 (see `x0x-symphony-tracker-git-jsonl`); an
 //! unparseable timestamp is a hard error rather than an assumption of freshness.
 
+use std::{cmp::Ordering, time::Duration as StdDuration};
+
 use chrono::{DateTime, Utc};
+use x0x_symphony_core::{AgentId, Claim, Issue, ShardRole};
 
 use crate::{clock::Clock, error::Error, Result};
 
@@ -55,7 +58,7 @@ pub fn classify(
     }
     let heartbeat = parse_heartbeat(&claim.heartbeat_at)?;
     let age = now.signed_duration_since(heartbeat);
-    Ok(if age > ttl {
+    Ok(if age >= ttl {
         ClaimStance::StaleSelf
     } else {
         ClaimStance::FreshSelf
@@ -81,6 +84,75 @@ pub fn is_fresh_self(
     ))
 }
 
+pub(crate) fn issue_claim_ttl(issue: &Issue, default_ttl: chrono::Duration) -> chrono::Duration {
+    issue.shard.as_ref().map_or(default_ttl, |shard| {
+        duration_from_millis_saturating(shard.claim_ttl_ms)
+    })
+}
+
+pub(crate) fn issue_heartbeat_interval(
+    issue: &Issue,
+    default_ttl: chrono::Duration,
+) -> StdDuration {
+    issue.shard.as_ref().map_or_else(
+        || heartbeat_interval_for_ttl(default_ttl),
+        |shard| StdDuration::from_millis((shard.claim_ttl_ms / 4).max(1)),
+    )
+}
+
+pub(crate) fn heartbeat_interval_for_ttl(ttl: chrono::Duration) -> StdDuration {
+    let quarter_ms = ttl.num_milliseconds().max(0) / 4;
+    match u64::try_from(quarter_ms) {
+        Ok(millis) => StdDuration::from_millis(millis.max(1)),
+        Err(_) => StdDuration::from_millis(1),
+    }
+}
+
+pub(crate) fn agent_shard_role(issue: &Issue, agent_id: &AgentId) -> Option<ShardRole> {
+    let shard = issue.shard.as_ref()?;
+    if shard.primary.eq(agent_id) {
+        return Some(ShardRole::Primary);
+    }
+    shard
+        .backups
+        .iter()
+        .position(|backup| backup == agent_id)
+        .map(ShardRole::Backup)
+}
+
+pub(crate) fn is_heartbeat_stale(
+    claim: &Claim,
+    now: DateTime<Utc>,
+    ttl: chrono::Duration,
+) -> Result<bool> {
+    let heartbeat = parse_heartbeat(&claim.heartbeat_at)?;
+    Ok(now.signed_duration_since(heartbeat) >= ttl)
+}
+
+pub(crate) fn winning_conflict_claim<'a, I>(claims: I) -> Option<&'a Claim>
+where
+    I: IntoIterator<Item = &'a Claim>,
+{
+    claims
+        .into_iter()
+        .min_by(|left, right| compare_claim_precedence(left, right))
+}
+
+fn compare_claim_precedence(left: &Claim, right: &Claim) -> Ordering {
+    left.shard_role
+        .rank()
+        .cmp(&right.shard_role.rank())
+        .then_with(|| left.by.cmp(&right.by))
+        .then_with(|| left.at.cmp(&right.at))
+}
+
+fn duration_from_millis_saturating(millis: u64) -> chrono::Duration {
+    match i64::try_from(millis) {
+        Ok(value) => chrono::Duration::milliseconds(value),
+        Err(_) => chrono::Duration::milliseconds(i64::MAX),
+    }
+}
+
 /// Per-issue outcome recorded by [`ReconcileSummary`].
 #[derive(Clone, Debug, Default)]
 pub struct ReconcileSummary {
@@ -88,6 +160,10 @@ pub struct ReconcileSummary {
     pub resumed: usize,
     /// Stale self-owned claims that were released with `expired_heartbeat`.
     pub released: usize,
+    /// Stale primary claims released and re-claimed by this backup.
+    pub taken_over: usize,
+    /// Self-owned losing conflict claims abandoned with `conflict`.
+    pub conflicts_abandoned: usize,
 }
 
 #[cfg(test)]
@@ -131,6 +207,16 @@ mod tests {
         let owner = owner()?;
         let now = ts("2026-07-02T12:00:00Z")?;
         let claim = claim_with_heartbeat(&owner, "2026-07-02T11:00:00Z")?;
+        let stance = classify(&claim, &owner, now, chrono::Duration::minutes(2))?;
+        assert_eq!(stance, ClaimStance::StaleSelf);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_self_at_ttl_boundary() -> Result<(), Box<dyn Error>> {
+        let owner = owner()?;
+        let now = ts("2026-07-02T12:00:00Z")?;
+        let claim = claim_with_heartbeat(&owner, "2026-07-02T11:58:00Z")?;
         let stance = classify(&claim, &owner, now, chrono::Duration::minutes(2))?;
         assert_eq!(stance, ClaimStance::StaleSelf);
         Ok(())

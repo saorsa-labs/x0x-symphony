@@ -26,7 +26,8 @@ use x0x_symphony_core::{
     AgentId, Claim, EventStream, Handoff, Hook, HookEnv, HookOutcome, HookStatus, Issue, IssueId,
     IssueState, LifecycleHooks, PollContext, Prompt, ReleaseReason, ReleaseReasonCode,
     Result as CoreResult, Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext,
-    SessionHandle, SessionId, TurnOutcome, TurnStatus, UsageReport, Workspace, WorkspaceHandle,
+    SessionHandle, SessionId, Shard, TurnOutcome, TurnStatus, UsageReport, Workspace,
+    WorkspaceHandle,
 };
 use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
@@ -66,6 +67,33 @@ fn claimed_issue(id: &str, agent: &AgentId, ts: String) -> Result<Issue, Box<dyn
             x0x_symphony_core::ShardRole::ManualM1,
         )
         .with_heartbeat(ts),
+    );
+    Ok(issue)
+}
+
+fn sharded_issue(
+    id: &str,
+    state_name: &str,
+    primary: &AgentId,
+    backups: Vec<AgentId>,
+    claim_ttl_ms: u64,
+) -> Result<Issue, Box<dyn Error>> {
+    let mut issue = make_issue(id, state_name)?;
+    issue.shard = Some(Shard::new(primary.clone(), backups, claim_ttl_ms, 1));
+    Ok(issue)
+}
+
+fn sharded_claimed_issue(
+    id: &str,
+    claimant: &AgentId,
+    role: x0x_symphony_core::ShardRole,
+    ts: String,
+    shard: Shard,
+) -> Result<Issue, Box<dyn Error>> {
+    let mut issue = make_issue(id, "in_progress")?;
+    issue.shard = Some(shard);
+    issue.claim = Some(
+        Claim::new(Some(issue.id.clone()), claimant.clone(), ts.clone(), role).with_heartbeat(ts),
     );
     Ok(issue)
 }
@@ -283,6 +311,7 @@ struct StubTracker {
     issues: Mutex<Vec<Issue>>,
     releases: Mutex<Vec<(IssueId, ReleaseReasonCode)>>,
     handoffs: Mutex<Vec<Handoff>>,
+    abandons: Mutex<Vec<(IssueId, AgentId)>>,
     /// Number of times `heartbeat` was called (proves the periodic task fires).
     heartbeats: Mutex<u32>,
 }
@@ -310,6 +339,23 @@ fn set_state(issue: &mut Issue, name: &str) -> CoreResult<()> {
     issue.state = IssueState::new(name)
         .map_err(|e| x0x_symphony_core::SymphonyError::Tracker(e.to_string()))?;
     Ok(())
+}
+
+fn shard_role_for(issue: &Issue, agent_id: &AgentId) -> x0x_symphony_core::ShardRole {
+    let Some(shard) = issue.shard.as_ref() else {
+        return x0x_symphony_core::ShardRole::ManualM1;
+    };
+    if shard.primary.eq(agent_id) {
+        return x0x_symphony_core::ShardRole::Primary;
+    }
+    shard
+        .backups
+        .iter()
+        .position(|backup| backup == agent_id)
+        .map_or(
+            x0x_symphony_core::ShardRole::ManualM1,
+            x0x_symphony_core::ShardRole::Backup,
+        )
 }
 
 #[async_trait]
@@ -349,12 +395,8 @@ impl x0x_symphony_core::Tracker for StubTracker {
             ));
         }
         let now = now_iso();
-        let claim = Claim::new(
-            Some(id.clone()),
-            agent_id.clone(),
-            now.clone(),
-            x0x_symphony_core::ShardRole::ManualM1,
-        );
+        let shard_role = shard_role_for(issue, agent_id);
+        let claim = Claim::new(Some(id.clone()), agent_id.clone(), now.clone(), shard_role);
         set_state(&mut *issue, "in_progress")?;
         issue.claim = Some(claim.clone());
         Ok(claim)
@@ -375,11 +417,20 @@ impl x0x_symphony_core::Tracker for StubTracker {
     async fn release(&self, claim: &Claim, reason: ReleaseReason) -> CoreResult<()> {
         let mut issues = lock(&self.issues)?;
         if let Some(id) = &claim.issue_id {
-            if let Some(issue) = issues.iter_mut().find(|i| &i.id == id) {
+            if let Some(issue) = issues.iter_mut().find(|i| {
+                &i.id == id
+                    && i.claim
+                        .as_ref()
+                        .is_some_and(|current| current.by.eq(&claim.by))
+            }) {
                 issue.claim = None;
                 set_state(&mut *issue, "todo")?;
             }
-            lock(&self.releases)?.push((id.clone(), reason.code));
+            let code = reason.code.clone();
+            if code == ReleaseReasonCode::Conflict {
+                lock(&self.abandons)?.push((id.clone(), claim.by.clone()));
+            }
+            lock(&self.releases)?.push((id.clone(), code));
         }
         Ok(())
     }
@@ -1416,6 +1467,132 @@ async fn reconcile_releases_stale_and_keeps_fresh_self_claims() -> Result<(), Bo
 }
 
 #[tokio::test]
+async fn reconcile_backup_takes_over_stale_primary() -> Result<(), Box<dyn Error>> {
+    let backup = agent()?;
+    let primary = AgentId::new("agent-b")?;
+    let now = parse_ts("2026-07-02T12:00:00Z")?;
+    let clock = Arc::new(ManualClock::new(now)) as Arc<dyn Clock>;
+    let ttl_ms = 60_000;
+    let stale_ts = (now - chrono::Duration::milliseconds(61_000))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let shard = Shard::new(primary.clone(), vec![backup.clone()], ttl_ms, 1);
+    let tracker = Arc::new(StubTracker::with(vec![sharded_claimed_issue(
+        "XSY-9104",
+        &primary,
+        x0x_symphony_core::ShardRole::Primary,
+        stale_ts,
+        shard,
+    )?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let tmp = TempDir::new()?;
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().to_path_buf(),
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        clock,
+        config_with(RetryPolicy::default(), 1)?,
+    );
+
+    let summary = orc.reconcile().await?;
+
+    assert_eq!(
+        summary.taken_over, 1,
+        "backup should claim stale primary work"
+    );
+    let releases = lock(&tracker.releases)?.clone();
+    assert!(
+        releases
+            .iter()
+            .any(|(id, code)| id.as_str() == "XSY-9104"
+                && *code == ReleaseReasonCode::ExpiredHeartbeat),
+        "stale primary should be released with expired_heartbeat, got {releases:?}"
+    );
+    let issues = lock(&tracker.issues)?.clone();
+    let issue = issues
+        .iter()
+        .find(|issue| issue.id.as_str() == "XSY-9104")
+        .ok_or("takeover issue present")?;
+    assert_eq!(issue.state, state("in_progress")?);
+    let claim = issue.claim.as_ref().ok_or("backup claim present")?;
+    assert_eq!(claim.by, backup);
+    assert_eq!(claim.shard_role, x0x_symphony_core::ShardRole::Backup(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconcile_conflict_abandons_higher_index_self_claim() -> Result<(), Box<dyn Error>> {
+    let backup = agent()?;
+    let primary = AgentId::new("agent-b")?;
+    let now = parse_ts("2026-07-02T12:00:00Z")?;
+    let fresh_ts =
+        (now - chrono::Duration::seconds(10)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let shard = Shard::new(primary.clone(), vec![backup.clone()], 60_000, 1);
+    let tracker = Arc::new(StubTracker::with(vec![
+        sharded_claimed_issue(
+            "XSY-9105",
+            &primary,
+            x0x_symphony_core::ShardRole::Primary,
+            fresh_ts.clone(),
+            shard.clone(),
+        )?,
+        sharded_claimed_issue(
+            "XSY-9105",
+            &backup,
+            x0x_symphony_core::ShardRole::Backup(0),
+            fresh_ts,
+            shard,
+        )?,
+    ]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let tmp = TempDir::new()?;
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().to_path_buf(),
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        Arc::new(ManualClock::new(now)) as Arc<dyn Clock>,
+        config_with(RetryPolicy::default(), 1)?,
+    );
+
+    let summary = orc.reconcile().await?;
+
+    assert_eq!(summary.conflicts_abandoned, 1);
+    let abandons = lock(&tracker.abandons)?.clone();
+    assert_eq!(abandons, vec![(IssueId::new("XSY-9105")?, backup.clone())]);
+    let releases = lock(&tracker.releases)?.clone();
+    assert!(
+        releases
+            .iter()
+            .any(|(id, code)| id.as_str() == "XSY-9105" && *code == ReleaseReasonCode::Conflict),
+        "higher-index loser should release with conflict, got {releases:?}"
+    );
+    let issues = lock(&tracker.issues)?.clone();
+    let winner = issues
+        .iter()
+        .find(|issue| {
+            issue
+                .claim
+                .as_ref()
+                .is_some_and(|claim| claim.by.eq(&primary))
+        })
+        .ok_or("primary winner remains claimed")?;
+    assert_eq!(winner.state, state("in_progress")?);
+    let loser = issues
+        .iter()
+        .find(|issue| issue.claim.is_none() && issue.id.as_str() == "XSY-9105")
+        .ok_or("backup loser abandoned")?;
+    assert_eq!(loser.state, state("todo")?);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn heartbeat_keeps_claim_fresh_during_long_run() -> Result<(), Box<dyn Error>> {
     let tmp = TempDir::new()?;
     let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9201", "todo")?]));
@@ -1450,8 +1627,12 @@ async fn heartbeat_keeps_claim_fresh_during_long_run() -> Result<(), Box<dyn Err
     let orc_run = Arc::clone(&orc);
     let run_task = tokio::spawn(async move { orc_run.run_once().await });
 
-    // Mid-run: enough elapsed time for several 50 ms heartbeats.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Mid-run: enough elapsed paused Tokio time for several 50 ms heartbeats.
+    tokio::task::yield_now().await;
+    for _ in 0..6 {
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+    }
 
     let heartbeats = *lock(&tracker.heartbeats)?;
     assert!(
@@ -1472,6 +1653,59 @@ async fn heartbeat_keeps_claim_fresh_during_long_run() -> Result<(), Box<dyn Err
         "claim must remain fresh while the heartbeat task runs"
     );
 
+    tokio::time::advance(std::time::Duration::from_millis(300)).await;
+    tokio::task::yield_now().await;
+    let resolution = run_task.await??.ok_or("an issue should run")?;
+    assert_eq!(resolution, Resolution::Completed);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeat_interval_uses_shard_claim_ttl() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let owner = agent()?;
+    let issue = sharded_issue("XSY-9202", "todo", &owner, Vec::new(), 400)?;
+    let tracker = Arc::new(StubTracker::with(vec![issue]));
+    let runner = Arc::new(StubRunner::succeeding_after(
+        std::time::Duration::from_millis(500),
+    ));
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().to_path_buf(),
+        ..StubWorkspace::default()
+    });
+    let config = Config::builder(owner)
+        .active_states(vec![state("todo")?])
+        .terminal_states(vec![state("done")?, state("cancelled")?])
+        .global_concurrency(1)
+        .retry(RetryPolicy::default())
+        .proofs_dir(tmp.path().join("proofs"))
+        // If the heartbeat task used this default TTL, the interval would be 1 s.
+        .claim_ttl(chrono::Duration::seconds(4))
+        .build();
+    let orc = Arc::new(orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config,
+    ));
+
+    let orc_run = Arc::clone(&orc);
+    let run_task = tokio::spawn(async move { orc_run.run_once().await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+
+    let heartbeats = *lock(&tracker.heartbeats)?;
+    assert!(
+        heartbeats >= 2,
+        "shard ttl 400 ms should refresh every 100 ms; saw {heartbeats}"
+    );
+
+    tokio::time::advance(std::time::Duration::from_millis(400)).await;
+    tokio::task::yield_now().await;
     let resolution = run_task.await??.ok_or("an issue should run")?;
     assert_eq!(resolution, Resolution::Completed);
     Ok(())
