@@ -100,6 +100,8 @@ pub struct Config {
     pub hooks: LifecycleHooks,
     /// Root directory where dispatch proof artefacts are written.
     pub proofs_dir: PathBuf,
+    /// Validation commands recorded in successful handoffs.
+    pub validation_commands: Vec<String>,
     /// Claim heartbeat TTL; a claim older than this is stale.
     pub claim_ttl: chrono::Duration,
     /// Maximum time to wait for in-flight runs to release on shutdown.
@@ -123,6 +125,7 @@ impl Config {
             retry: RetryPolicy::default(),
             hooks: LifecycleHooks::default(),
             proofs_dir: PathBuf::from("proofs"),
+            validation_commands: Vec::new(),
             claim_ttl: chrono::Duration::minutes(30),
             shutdown_grace: Duration::from_mins(1),
         }
@@ -164,6 +167,7 @@ pub struct ConfigBuilder {
     retry: RetryPolicy,
     hooks: LifecycleHooks,
     proofs_dir: PathBuf,
+    validation_commands: Vec<String>,
     claim_ttl: chrono::Duration,
     shutdown_grace: Duration,
 }
@@ -217,6 +221,16 @@ impl ConfigBuilder {
         self.proofs_dir = proofs_dir.into();
         self
     }
+    /// Override validation commands recorded in successful handoffs.
+    #[must_use]
+    pub fn validation_commands<I, S>(mut self, commands: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.validation_commands = commands.into_iter().map(Into::into).collect();
+        self
+    }
     /// Override the claim TTL.
     #[must_use]
     pub fn claim_ttl(mut self, ttl: chrono::Duration) -> Self {
@@ -242,6 +256,7 @@ impl ConfigBuilder {
             retry: self.retry,
             hooks: self.hooks,
             proofs_dir: self.proofs_dir,
+            validation_commands: self.validation_commands,
             claim_ttl: self.claim_ttl,
             shutdown_grace: self.shutdown_grace,
         }

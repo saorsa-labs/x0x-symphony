@@ -179,6 +179,27 @@ impl Handoff {
         self
     }
 
+    /// Return a copy with multiple changed files appended.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use x0x_symphony_core::Handoff;
+    ///
+    /// let handoff = Handoff::new("Ready")
+    ///     .with_files_changed(["README.md", "Cargo.toml"]);
+    /// assert_eq!(handoff.files_changed, ["README.md", "Cargo.toml"]);
+    /// ```
+    #[must_use]
+    pub fn with_files_changed<I, S>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.files_changed.extend(files.into_iter().map(Into::into));
+        self
+    }
+
     /// Return a copy with one validation result appended.
     ///
     /// # Examples
@@ -209,6 +230,27 @@ impl Handoff {
     #[must_use]
     pub fn with_follow_up(mut self, note: impl Into<String>) -> Self {
         self.follow_up.push(note.into());
+        self
+    }
+
+    /// Return a copy with multiple follow-up notes appended.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use x0x_symphony_core::Handoff;
+    ///
+    /// let handoff = Handoff::new("Ready")
+    ///     .with_follow_ups(["Review API names", "Update docs"]);
+    /// assert_eq!(handoff.follow_up.len(), 2);
+    /// ```
+    #[must_use]
+    pub fn with_follow_ups<I, S>(mut self, notes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.follow_up.extend(notes.into_iter().map(Into::into));
         self
     }
 

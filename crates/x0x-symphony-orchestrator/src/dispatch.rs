@@ -10,15 +10,16 @@
 //! and registers the claim as in-flight (done by [`Orchestrator::claim_next`]
 //! and the resume path). `run_claim` releases that slot on every exit path.
 
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 
+use tokio::process::Command;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::warn;
 use x0x_symphony_core::{
     Claim, Handoff, HookEnv, HookName, HookOutcome, HookStatus, Issue, IssueId, Prompt,
-    ReleaseReason, ReleaseReasonCode, Runner, SessionContext, Tracker, TurnStatus, Workspace,
-    WorkspaceHandle,
+    ReleaseReason, ReleaseReasonCode, Runner, SessionContext, Tracker, TurnStatus,
+    ValidationResult, ValidationStatus, Workspace, WorkspaceHandle,
 };
 
 use crate::{
@@ -257,6 +258,190 @@ fn parse_exit_code(summary: Option<&str>) -> Option<i32> {
     None
 }
 
+const GIT_DIFF_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn changed_files_from_git_diff(workspace_path: &Path) -> Vec<String> {
+    let output = timeout(
+        GIT_DIFF_TIMEOUT,
+        Command::new("git")
+            .arg("-C")
+            .arg(workspace_path)
+            .arg("diff")
+            .arg("--name-only")
+            .output(),
+    )
+    .await;
+
+    let output = match output {
+        Ok(Ok(output)) => output,
+        Ok(Err(source)) => {
+            warn!(
+                workspace = %workspace_path.display(),
+                error = %source,
+                "git diff --name-only failed; handoff files_changed left empty"
+            );
+            return Vec::new();
+        }
+        Err(_) => {
+            warn!(
+                workspace = %workspace_path.display(),
+                timeout_ms = GIT_DIFF_TIMEOUT.as_millis(),
+                "git diff --name-only timed out; handoff files_changed left empty"
+            );
+            return Vec::new();
+        }
+    };
+
+    if !output.status.success() {
+        warn!(
+            workspace = %workspace_path.display(),
+            exit_code = ?output.status.code(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "git diff --name-only returned non-zero; handoff files_changed left empty"
+        );
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+async fn run_validation_commands(
+    workspace_path: &Path,
+    commands: &[String],
+) -> Vec<ValidationResult> {
+    let mut results = Vec::with_capacity(commands.len());
+    for command in commands
+        .iter()
+        .map(|command| command.trim())
+        .filter(|command| !command.is_empty())
+    {
+        results.push(run_validation_command(workspace_path, command).await);
+    }
+    results
+}
+
+async fn run_validation_command(workspace_path: &Path, command: &str) -> ValidationResult {
+    let mut process = shell_command(command);
+    process.current_dir(workspace_path);
+    process.stdin(Stdio::null());
+    process.stdout(Stdio::null());
+    process.stderr(Stdio::null());
+
+    match process.status().await {
+        Ok(status) => {
+            let validation_status = if status.success() {
+                ValidationStatus::Passed
+            } else {
+                ValidationStatus::Failed
+            };
+            let mut result = ValidationResult::new(command, validation_status);
+            if let Some(code) = status.code() {
+                result = result.with_exit_code(code);
+            }
+            result
+        }
+        Err(source) => {
+            warn!(
+                workspace = %workspace_path.display(),
+                command = %command,
+                error = %source,
+                "validation command failed to start; recording failed validation"
+            );
+            ValidationResult::new(command, ValidationStatus::Failed)
+        }
+    }
+}
+
+fn shell_command(command: &str) -> Command {
+    let mut process = platform_shell();
+    process.arg(command);
+    process
+}
+
+#[cfg(windows)]
+fn platform_shell() -> Command {
+    let mut process = Command::new("cmd");
+    process.arg("/C");
+    process
+}
+
+#[cfg(not(windows))]
+fn platform_shell() -> Command {
+    let mut process = Command::new("sh");
+    process.arg("-c");
+    process
+}
+
+fn configured_validation_commands(configured: &[String], issue: &Issue) -> Vec<String> {
+    if !configured.is_empty() {
+        return configured.to_vec();
+    }
+    let issue_validation = issue_extra_string_list(issue, "validation");
+    if !issue_validation.is_empty() {
+        return issue_validation;
+    }
+    issue_extra_string_list(issue, "acceptance")
+        .into_iter()
+        .filter_map(|entry| acceptance_validation_command(&entry))
+        .collect()
+}
+
+fn acceptance_validation_command(entry: &str) -> Option<String> {
+    for prefix in ["validation:", "validation command:", "command:"] {
+        let Some(command) = entry.strip_prefix(prefix) else {
+            continue;
+        };
+        let trimmed = command.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
+fn issue_extra_string_list(issue: &Issue, key: &str) -> Vec<String> {
+    let Some(value) = issue.extra.get(key) else {
+        return Vec::new();
+    };
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn follow_ups_from_summary(summary: Option<&str>) -> Vec<String> {
+    let Some(summary) = summary else {
+        return Vec::new();
+    };
+    summary
+        .lines()
+        .filter_map(|line| follow_up_line(line.trim()))
+        .collect()
+}
+
+fn follow_up_line(line: &str) -> Option<String> {
+    for prefix in ["follow_up:", "follow-up:", "follow_up="] {
+        let Some(note) = line.strip_prefix(prefix) else {
+            continue;
+        };
+        let trimmed = note.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
 impl<T, R, W> Orchestrator<T, R, W>
 where
     // `T` is shared with the background heartbeat task spawned below; `R`/`W`
@@ -354,12 +539,9 @@ where
 
             match outcome.status {
                 TurnStatus::Succeeded => {
-                    let handoff = Handoff::new(format!(
-                        "runner '{}' succeeded after {attempts} attempt(s)",
-                        self.runner.name()
-                    ))
-                    .with_file(workspace_path.to_string_lossy().into_owned())
-                    .with_proofs_dir(proof.relative_dir().to_owned());
+                    let handoff = self
+                        .build_success_handoff(&issue, &workspace_path, &proof, attempts, &outcome)
+                        .await;
                     guard.cancel_heartbeat();
                     self.tracker.handoff(&claim, handoff).await?;
                     self.cleanup_if_terminal(&claim, &handle, "review", &mut proof)
@@ -395,6 +577,32 @@ where
                 }
             }
         }
+    }
+
+    async fn build_success_handoff(
+        &self,
+        issue: &Issue,
+        workspace_path: &Path,
+        proof: &ProofRun,
+        attempts: u32,
+        outcome: &CompletedTurn,
+    ) -> Handoff {
+        let validation_commands =
+            configured_validation_commands(&self.config.validation_commands, issue);
+        let validation = run_validation_commands(workspace_path, &validation_commands).await;
+        let files_changed = changed_files_from_git_diff(workspace_path).await;
+        let follow_ups = follow_ups_from_summary(outcome.summary.as_deref());
+        let mut handoff = Handoff::new(format!(
+            "runner '{}' succeeded after {attempts} attempt(s)",
+            self.runner.name()
+        ))
+        .with_files_changed(files_changed)
+        .with_follow_ups(follow_ups)
+        .with_proofs_dir(proof.relative_dir().to_owned());
+        for result in validation {
+            handoff = handoff.with_validation(result);
+        }
+        handoff
     }
 
     async fn run_attempt(

@@ -78,6 +78,8 @@ pub struct WorkflowConfig {
     pub workspace: WorkspaceConfig,
     /// Lifecycle hook settings.
     pub hooks: HooksConfig,
+    /// Validation commands to run before writing successful handoffs.
+    pub validation: Vec<String>,
     /// Agent and orchestrator settings.
     pub agent: AgentConfig,
     /// Signing settings for claim and handoff payloads.
@@ -232,6 +234,7 @@ impl WorkflowConfig {
         let polling = parse_polling(root, &mut problems);
         let workspace = parse_workspace(root, &mut problems);
         let hooks = parse_hooks(root, &mut problems);
+        let validation = parse_validation(root, &mut problems);
         let agent = parse_agent(root, &mut problems);
         let signing = parse_signing(root, &mut problems);
         let sharding = parse_sharding(root, &mut problems);
@@ -254,6 +257,7 @@ impl WorkflowConfig {
             polling: polling.ok_or_else(internal_validation_gap)?,
             workspace: workspace.ok_or_else(internal_validation_gap)?,
             hooks: hooks.ok_or_else(internal_validation_gap)?,
+            validation: validation.ok_or_else(internal_validation_gap)?,
             agent: agent.ok_or_else(internal_validation_gap)?,
             signing: signing.ok_or_else(internal_validation_gap)?,
             sharding: sharding.ok_or_else(internal_validation_gap)?,
@@ -316,6 +320,7 @@ impl WorkflowConfig {
             .per_state_concurrency(per_state)
             .retry(retry)
             .hooks(self.hooks.to_lifecycle_hooks())
+            .validation_commands(self.validation.clone())
             .build())
     }
 }
@@ -408,6 +413,10 @@ fn parse_hooks(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<
         after_run: optional_string(hooks, "hooks.after_run", problems),
         before_remove: optional_string(hooks, "hooks.before_remove", problems),
     })
+}
+
+fn parse_validation(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<Vec<String>> {
+    optional_root_string_list(root, "validation", problems)
 }
 
 fn parse_agent(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<AgentConfig> {
@@ -656,6 +665,34 @@ fn optional_string_list(map: &Map<String, Value>, path: &'static str) -> Option<
     } else {
         Some(strings)
     }
+}
+
+fn optional_root_string_list(
+    root: &Map<String, Value>,
+    path: &'static str,
+    problems: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    let Some(value) = root.get(path) else {
+        return Some(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        problems.push(format!("{path} must be a list of strings"));
+        return None;
+    };
+    let mut strings = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(raw) = value.as_str() else {
+            problems.push(format!("{path}[{index}] must be a string"));
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            problems.push(format!("{path}[{index}] must not be empty"));
+        } else {
+            strings.push(trimmed.to_owned());
+        }
+    }
+    Some(strings)
 }
 
 fn optional_agent_list(

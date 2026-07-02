@@ -26,7 +26,8 @@ use x0x_symphony_core::{
     AgentId, Claim, EventStream, Handoff, Hook, HookEnv, HookOutcome, HookStatus, Issue, IssueId,
     IssueState, LifecycleHooks, PollContext, Prompt, ReleaseReason, ReleaseReasonCode,
     Result as CoreResult, Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext,
-    SessionHandle, SessionId, TurnOutcome, TurnStatus, UsageReport, Workspace, WorkspaceHandle,
+    SessionHandle, SessionId, TurnOutcome, TurnStatus, UsageReport, ValidationStatus, Workspace,
+    WorkspaceHandle,
 };
 use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
@@ -273,6 +274,77 @@ impl Runner for EventfulRunner {
 
     async fn stop_session(&self, _sess: SessionHandle) -> CoreResult<UsageReport> {
         Ok(UsageReport::new())
+    }
+}
+
+struct GitChangingRunner;
+
+#[async_trait]
+impl Runner for GitChangingRunner {
+    fn name(&self) -> &'static str {
+        "git-changing"
+    }
+
+    fn capabilities(&self) -> &RunnerCapabilities {
+        static CAPS: std::sync::OnceLock<RunnerCapabilities> = std::sync::OnceLock::new();
+        CAPS.get_or_init(|| RunnerCapabilities::new("git-changing"))
+    }
+
+    async fn start_session(&self, ctx: SessionContext) -> CoreResult<SessionHandle> {
+        init_tracked_git_repo(&ctx.workspace_path)?;
+        std::fs::write(ctx.workspace_path.join("tracked.txt"), b"changed\n")
+            .map_err(|source| x0x_symphony_core::SymphonyError::Runner(source.to_string()))?;
+        Ok(SessionHandle::new(
+            SessionId::new("git-changing-session"),
+            ctx.workspace_path,
+            "now",
+        ))
+    }
+
+    async fn run_turn(
+        &self,
+        _sess: &mut SessionHandle,
+        _prompt: Prompt,
+    ) -> CoreResult<TurnOutcome> {
+        Ok(TurnOutcome::new(TurnStatus::Succeeded, UsageReport::new()))
+    }
+
+    fn stream_events(&self, _sess: &SessionHandle) -> EventStream {
+        Box::pin(stream::empty::<RunnerEvent>())
+    }
+
+    async fn stop_session(&self, _sess: SessionHandle) -> CoreResult<UsageReport> {
+        Ok(UsageReport::new())
+    }
+}
+
+fn init_tracked_git_repo(path: &Path) -> CoreResult<()> {
+    run_git(path, &["init"])?;
+    run_git(path, &["config", "user.email", "runner@example.invalid"])?;
+    run_git(path, &["config", "user.name", "Test Runner"])?;
+    std::fs::write(path.join("tracked.txt"), b"base\n")
+        .map_err(|source| x0x_symphony_core::SymphonyError::Runner(source.to_string()))?;
+    run_git(path, &["add", "tracked.txt"])?;
+    run_git(path, &["commit", "-m", "initial"])
+}
+
+fn run_git(path: &Path, args: &[&str]) -> CoreResult<()> {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|source| x0x_symphony_core::SymphonyError::Runner(source.to_string()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(x0x_symphony_core::SymphonyError::Runner(format!(
+            "git {:?} failed with exit code {:?}",
+            args,
+            status.code()
+        )))
     }
 }
 
@@ -828,6 +900,132 @@ async fn proofs_subtree_and_handoff_link_written_on_success() -> Result<(), Box<
     assert!(manifest["started_at"].as_str().is_some());
     assert!(manifest["ended_at"].as_str().is_some());
     assert_eq!(manifest["hooks"].as_array().ok_or("hooks array")?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn handoff_files_changed_are_read_from_git_diff() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9510", "todo")?]));
+    let runner = Arc::new(GitChangingRunner);
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config_with(fast_retry(1), 1)?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+
+    assert_eq!(resolution, Resolution::Completed);
+    let handoff = lock(&tracker.handoffs)?
+        .first()
+        .cloned()
+        .ok_or("handoff recorded")?;
+    assert_eq!(handoff.files_changed, ["tracked.txt"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn handoff_no_git_repo_uses_empty_files_changed() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9511", "todo")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config_with(fast_retry(1), 1)?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+
+    assert_eq!(resolution, Resolution::Completed);
+    let handoff = lock(&tracker.handoffs)?
+        .first()
+        .cloned()
+        .ok_or("handoff recorded")?;
+    assert!(handoff.files_changed.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn handoff_validation_records_configured_command_statuses() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let tracker = Arc::new(StubTracker::with(vec![make_issue("XSY-9512", "todo")?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let config = Config::builder(agent()?)
+        .active_states(vec![state("todo")?])
+        .terminal_states(vec![state("done")?, state("cancelled")?])
+        .global_concurrency(1)
+        .retry(fast_retry(1))
+        .validation_commands(["exit 0", "exit 7"])
+        .proofs_dir(default_test_proofs_dir())
+        .build();
+    let orc = orc(Arc::clone(&tracker), runner, workspace, sysclock(), config);
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+
+    assert_eq!(resolution, Resolution::Completed);
+    let handoff = lock(&tracker.handoffs)?
+        .first()
+        .cloned()
+        .ok_or("handoff recorded")?;
+    assert_eq!(handoff.validation.len(), 2);
+    assert_eq!(handoff.validation[0].command, "exit 0");
+    assert_eq!(handoff.validation[0].status, ValidationStatus::Passed);
+    assert_eq!(handoff.validation[0].exit_code, Some(0));
+    assert_eq!(handoff.validation[1].command, "exit 7");
+    assert_eq!(handoff.validation[1].status, ValidationStatus::Failed);
+    assert_eq!(handoff.validation[1].exit_code, Some(7));
+    Ok(())
+}
+
+#[tokio::test]
+async fn handoff_validation_can_come_from_issue_metadata() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let mut issue = make_issue("XSY-9513", "todo")?;
+    issue
+        .extra
+        .insert("validation".to_owned(), serde_json::json!(["exit 0"]));
+    let tracker = Arc::new(StubTracker::with(vec![issue]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let orc = orc(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config_with(fast_retry(1), 1)?,
+    );
+
+    let resolution = orc.run_once().await?.ok_or("an issue should run")?;
+
+    assert_eq!(resolution, Resolution::Completed);
+    let handoff = lock(&tracker.handoffs)?
+        .first()
+        .cloned()
+        .ok_or("handoff recorded")?;
+    assert_eq!(handoff.validation.len(), 1);
+    assert_eq!(handoff.validation[0].command, "exit 0");
+    assert_eq!(handoff.validation[0].status, ValidationStatus::Passed);
     Ok(())
 }
 
