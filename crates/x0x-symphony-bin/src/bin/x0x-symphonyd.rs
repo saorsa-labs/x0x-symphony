@@ -60,7 +60,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
 
     let mut tracker_builder = JsonlTracker::builder(tracker_paths.repo_root.clone())
-        .issues_path(tracker_paths.issues_path.clone());
+        .issues_path(tracker_paths.issues_path.clone())
+        .shard_workers(workflow.sharding.workers.clone())
+        .shard_replication_factor(workflow.sharding.replication_factor);
     if let Some(client) = signing_client {
         let signing: Arc<dyn SigningClient> = client.clone();
         let resolver: Arc<dyn TrustedKeyResolver> = client;

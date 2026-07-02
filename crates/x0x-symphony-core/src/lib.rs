@@ -8,6 +8,7 @@ pub mod error;
 pub mod handoff;
 pub mod issue;
 pub mod runner;
+pub mod shard;
 pub mod signing;
 pub mod tracker;
 pub mod workflow;

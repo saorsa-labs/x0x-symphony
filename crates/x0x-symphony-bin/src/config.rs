@@ -9,7 +9,9 @@ use std::{
 
 use serde_json::{Map, Value};
 use thiserror::Error;
-use x0x_symphony_core::{AgentId, IssueState, LifecycleHooks, SymphonyError, WorkflowDefinition};
+use x0x_symphony_core::{
+    shard, AgentId, IssueState, LifecycleHooks, SymphonyError, WorkflowDefinition,
+};
 use x0x_symphony_orchestrator::{Config as OrchestratorConfig, RetryPolicy};
 use x0x_symphony_runner_shell::RunnerSpec;
 use x0x_symphony_tracker_git_jsonl::signing::SigningPolicy;
@@ -80,6 +82,8 @@ pub struct WorkflowConfig {
     pub agent: AgentConfig,
     /// Signing settings for claim and handoff payloads.
     pub signing: SigningConfig,
+    /// Static M2 sharding placeholder settings.
+    pub sharding: ShardingConfig,
     /// Raw runner block used by `RunnerSpec`.
     pub runner: Value,
 }
@@ -162,6 +166,19 @@ pub struct SigningConfig {
     pub x0xd_url: String,
 }
 
+/// Static M2 sharding configuration parsed from the optional `sharding:` block.
+///
+/// This is deliberately a placeholder. M2 reads a static `workers:` list from
+/// `WORKFLOW.md` only so issue creation can freeze shard slates now; M4 replaces
+/// this with live x0x presence-based trusted-worker discovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardingConfig {
+    /// Static trusted-worker roster used for XOR-distance shard assignment.
+    pub workers: Vec<AgentId>,
+    /// Total shard owner count: one primary plus `replication_factor - 1` backups.
+    pub replication_factor: usize,
+}
+
 /// Resolved tracker filesystem paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrackerPaths {
@@ -217,6 +234,7 @@ impl WorkflowConfig {
         let hooks = parse_hooks(root, &mut problems);
         let agent = parse_agent(root, &mut problems);
         let signing = parse_signing(root, &mut problems);
+        let sharding = parse_sharding(root, &mut problems);
         let runner = parse_runner(root, &raw, &mut problems);
 
         if problems.is_empty() {
@@ -238,6 +256,7 @@ impl WorkflowConfig {
             hooks: hooks.ok_or_else(internal_validation_gap)?,
             agent: agent.ok_or_else(internal_validation_gap)?,
             signing: signing.ok_or_else(internal_validation_gap)?,
+            sharding: sharding.ok_or_else(internal_validation_gap)?,
             runner: runner.ok_or_else(internal_validation_gap)?,
         })
     }
@@ -439,6 +458,26 @@ fn parse_signing(root: &Map<String, Value>, problems: &mut Vec<String>) -> Optio
     Some(SigningConfig { policy, x0xd_url })
 }
 
+fn parse_sharding(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<ShardingConfig> {
+    let Some(value) = root.get("sharding") else {
+        return Some(ShardingConfig {
+            workers: Vec::new(),
+            replication_factor: shard::DEFAULT_REPLICATION_FACTOR,
+        });
+    };
+    let Some(sharding) = value.as_object() else {
+        problems.push("sharding must be a mapping".to_owned());
+        return None;
+    };
+    let workers = optional_agent_list(sharding, "sharding.workers", problems)?;
+    let replication_factor = optional_usize(sharding, "sharding.replication_factor", problems, 1)
+        .unwrap_or(shard::DEFAULT_REPLICATION_FACTOR);
+    Some(ShardingConfig {
+        workers,
+        replication_factor,
+    })
+}
+
 fn parse_runner(
     root: &Map<String, Value>,
     raw: &Value,
@@ -616,6 +655,61 @@ fn optional_string_list(map: &Map<String, Value>, path: &'static str) -> Option<
         None
     } else {
         Some(strings)
+    }
+}
+
+fn optional_agent_list(
+    map: &Map<String, Value>,
+    path: &'static str,
+    problems: &mut Vec<String>,
+) -> Option<Vec<AgentId>> {
+    let key = leaf_key(path);
+    let Some(value) = map.get(key) else {
+        return Some(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        problems.push(format!("{path} must be a list of agent id strings"));
+        return None;
+    };
+    let mut agents = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(raw) = value.as_str() else {
+            problems.push(format!("{path}[{index}] must be a string"));
+            continue;
+        };
+        match AgentId::new(raw.to_owned()) {
+            Ok(agent) => agents.push(agent),
+            Err(error) => problems.push(format!("{path}[{index}] {error}")),
+        }
+    }
+    Some(agents)
+}
+
+fn optional_usize(
+    map: &Map<String, Value>,
+    path: &'static str,
+    problems: &mut Vec<String>,
+    min: u64,
+) -> Option<usize> {
+    let key = leaf_key(path);
+    match map.get(key).and_then(Value::as_u64) {
+        Some(value) if value >= min => {
+            if let Ok(converted) = usize::try_from(value) {
+                Some(converted)
+            } else {
+                problems.push(format!("{path} must fit in usize"));
+                None
+            }
+        }
+        Some(_) => {
+            problems.push(format!("{path} must be >= {min}"));
+            None
+        }
+        None if map.contains_key(key) => {
+            problems.push(format!("{path} must be an unsigned integer"));
+            None
+        }
+        None => None,
     }
 }
 

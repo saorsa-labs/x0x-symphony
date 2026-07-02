@@ -41,7 +41,7 @@
 pub mod signing;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -59,9 +59,9 @@ use serde_json::Value;
 use thiserror::Error;
 use tracing::{info, warn};
 use x0x_symphony_core::{
-    sha256_hex, AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext, ReleaseReason,
-    Result as CoreResult, ShardRole, SignatureEnvelope, SymphonyError, Tracker, CLAIM_CONTEXT,
-    HANDOFF_CONTEXT, SIGN_ALGORITHM,
+    sha256_hex, shard, AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext,
+    ReleaseReason, Result as CoreResult, Shard, ShardRole, SignatureEnvelope, SymphonyError,
+    Tracker, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
 };
 
 use crate::signing::{SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver};
@@ -104,6 +104,13 @@ pub enum TrackerError {
         id: IssueId,
         /// Human-readable rejection reason.
         reason: String,
+    },
+
+    /// A mutation attempted to change the frozen shard slate on an existing issue.
+    #[error("issue {id} shard fields are immutable after creation")]
+    ShardMutationRejected {
+        /// Issue whose shard metadata changed after creation.
+        id: IssueId,
     },
 
     /// The claim supplied to a transition is incomplete or stale.
@@ -285,6 +292,8 @@ pub struct JsonlTrackerBuilder {
     lock_initial_backoff: Duration,
     lock_max_backoff: Duration,
     signing: SigningRuntime,
+    shard_workers: Vec<AgentId>,
+    shard_replication_factor: usize,
 }
 
 impl JsonlTrackerBuilder {
@@ -301,6 +310,8 @@ impl JsonlTrackerBuilder {
             lock_initial_backoff: Duration::from_millis(10),
             lock_max_backoff: Duration::from_millis(250),
             signing: SigningRuntime::disabled(),
+            shard_workers: Vec::new(),
+            shard_replication_factor: shard::DEFAULT_REPLICATION_FACTOR,
         }
     }
 
@@ -356,6 +367,28 @@ impl JsonlTrackerBuilder {
         self
     }
 
+    /// Configure the static M2 worker roster used for new issue shard assignment.
+    ///
+    /// This is intentionally a loud placeholder: M4 replaces this static list
+    /// with live x0x presence-based trusted-worker discovery. Existing issue
+    /// shard slates remain immutable regardless of later worker-list churn.
+    #[must_use]
+    pub fn shard_workers(mut self, workers: Vec<AgentId>) -> Self {
+        self.shard_workers = workers;
+        self
+    }
+
+    /// Configure the total number of shard owners for newly created issues.
+    ///
+    /// A value of `3` means one primary plus two backups. The assignment
+    /// function saturates edge cases, so values larger than the static roster
+    /// simply use every configured worker once.
+    #[must_use]
+    pub fn shard_replication_factor(mut self, replication_factor: usize) -> Self {
+        self.shard_replication_factor = replication_factor;
+        self
+    }
+
     /// Build the tracker adapter.
     #[must_use]
     pub fn build(self) -> JsonlTracker {
@@ -367,6 +400,8 @@ impl JsonlTrackerBuilder {
             lock_initial_backoff: self.lock_initial_backoff,
             lock_max_backoff: self.lock_max_backoff,
             signing: self.signing,
+            shard_workers: self.shard_workers,
+            shard_replication_factor: self.shard_replication_factor,
         }
     }
 }
@@ -381,6 +416,8 @@ impl std::fmt::Debug for JsonlTrackerBuilder {
             .field("lock_initial_backoff", &self.lock_initial_backoff)
             .field("lock_max_backoff", &self.lock_max_backoff)
             .field("signing_policy", &self.signing.policy)
+            .field("shard_workers", &self.shard_workers)
+            .field("shard_replication_factor", &self.shard_replication_factor)
             .finish_non_exhaustive()
     }
 }
@@ -395,6 +432,8 @@ pub struct JsonlTracker {
     lock_initial_backoff: Duration,
     lock_max_backoff: Duration,
     signing: SigningRuntime,
+    shard_workers: Vec<AgentId>,
+    shard_replication_factor: usize,
 }
 
 impl std::fmt::Debug for JsonlTracker {
@@ -407,6 +446,8 @@ impl std::fmt::Debug for JsonlTracker {
             .field("lock_initial_backoff", &self.lock_initial_backoff)
             .field("lock_max_backoff", &self.lock_max_backoff)
             .field("signing_policy", &self.signing.policy)
+            .field("shard_workers", &self.shard_workers)
+            .field("shard_replication_factor", &self.shard_replication_factor)
             .finish_non_exhaustive()
     }
 }
@@ -480,6 +521,7 @@ impl JsonlTracker {
             issue.priority = priority;
             issue.labels = labels;
             issue.blocked_by = blocked_by;
+            issue.shard = shard::assign(&id, &self.shard_workers, self.shard_replication_factor);
             records.records.push(IssueRecord {
                 raw_line: String::new(),
                 issue: issue.clone(),
@@ -504,11 +546,12 @@ impl JsonlTracker {
             .find(id)
             .ok_or_else(|| TrackerError::IssueNotFound { id: id.clone() })?;
         ensure_issue_claimable(&record.issue, id)?;
+        let shard_role = shard_role_for_agent(&record.issue, agent_id)?;
         Ok(Claim::new(
             Some(id.clone()),
             agent_id.clone(),
             now_utc(),
-            ShardRole::ManualM1,
+            shard_role,
         ))
     }
 
@@ -806,7 +849,9 @@ impl JsonlTracker {
         let lock_path = self.lock_path(git_dir.as_deref());
         let guard = self.acquire_lock(&lock_path)?;
         let mut records = self.load_records()?;
+        let original_shards = records.shard_snapshot();
         mutate(&mut records)?;
+        records.ensure_shards_unchanged(&original_shards)?;
         if records.has_dirty_records() {
             if git_dir.is_none() {
                 self.ensure_mtime_unchanged(records.modified_at)?;
@@ -1329,6 +1374,22 @@ fn ensure_issue_claimable(issue: &Issue, id: &IssueId) -> Result<()> {
     Ok(())
 }
 
+fn shard_role_for_agent(issue: &Issue, agent_id: &AgentId) -> Result<ShardRole> {
+    let Some(shard) = issue.shard.as_ref() else {
+        return Ok(ShardRole::ManualM1);
+    };
+    if &shard.primary == agent_id {
+        return Ok(ShardRole::Primary);
+    }
+    if let Some(index) = shard.backups.iter().position(|backup| backup == agent_id) {
+        return Ok(ShardRole::Backup(index));
+    }
+    Err(TrackerError::ClaimRejected {
+        id: issue.id.clone(),
+        reason: format!("agent {agent_id} is not in the issue shard slate"),
+    })
+}
+
 fn ensure_claim_owner(issue: &Issue, claim: &Claim) -> Result<()> {
     let Some(current) = issue.claim.as_ref() else {
         return Err(TrackerError::InvalidClaim {
@@ -1437,6 +1498,29 @@ impl LoadedRecords {
         self.records.iter().find(|record| &record.issue.id == id)
     }
 
+    fn shard_snapshot(&self) -> BTreeMap<IssueId, Option<Shard>> {
+        self.records
+            .iter()
+            .map(|record| (record.issue.id.clone(), record.issue.shard.clone()))
+            .collect()
+    }
+
+    fn ensure_shards_unchanged(
+        &self,
+        original_shards: &BTreeMap<IssueId, Option<Shard>>,
+    ) -> Result<()> {
+        for record in &self.records {
+            if let Some(original) = original_shards.get(&record.issue.id) {
+                if original != &record.issue.shard {
+                    return Err(TrackerError::ShardMutationRejected {
+                        id: record.issue.id.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn find_mut(&mut self, id: &IssueId) -> Result<&mut IssueRecord> {
         self.records
             .iter_mut()
@@ -1477,5 +1561,61 @@ struct LockGuard {
 impl Drop for LockGuard {
     fn drop(&mut self) {
         let _ignored = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_mutation_on_existing_record_is_rejected() -> Result<()> {
+        let id = IssueId::new("XSY-0013")?;
+        let mut issue = Issue::new(
+            id.clone(),
+            "XSY-0013",
+            "Shard assignment",
+            IssueState::new("todo")?,
+            "2026-07-02T00:00:00Z",
+        )?;
+        issue.shard = Some(Shard::new(
+            AgentId::new("agent-a")?,
+            vec![AgentId::new("agent-b")?],
+            shard::DEFAULT_CLAIM_TTL_MS,
+            shard::STATIC_WORKER_VIEW_EPOCH,
+        ));
+        let records = LoadedRecords {
+            records: vec![IssueRecord {
+                raw_line: serialize_issue(&issue)?,
+                issue,
+                dirty: false,
+            }],
+            modified_at: None,
+        };
+        let snapshot = records.shard_snapshot();
+        let mut mutated = records.clone();
+        let record = mutated
+            .records
+            .get_mut(0)
+            .ok_or_else(|| TrackerError::InvalidClaim {
+                reason: "test record missing".to_owned(),
+            })?;
+        record.issue.shard = Some(Shard::new(
+            AgentId::new("agent-c")?,
+            Vec::new(),
+            shard::DEFAULT_CLAIM_TTL_MS,
+            shard::STATIC_WORKER_VIEW_EPOCH,
+        ));
+
+        match mutated.ensure_shards_unchanged(&snapshot) {
+            Err(TrackerError::ShardMutationRejected { id: rejected }) => {
+                assert_eq!(rejected, id);
+                Ok(())
+            }
+            Err(error) => Err(error),
+            Ok(()) => Err(TrackerError::InvalidClaim {
+                reason: "shard mutation was accepted".to_owned(),
+            }),
+        }
     }
 }
