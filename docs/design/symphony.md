@@ -404,9 +404,10 @@ trust store. Symphony adds:
   tasks labelled `security-sensitive`. Configurable per project.
 - **Sandbox profiles** (M4): `read-only`, `repo-write`, `no-network`,
   `full-dev`, `ci-only`. The `shell` runner enforces via host sandbox
-  (`firejail` on Linux, `sandbox-exec` on macOS). Profile is declared on
-  the issue; the orchestrator refuses to dispatch a task whose required
-  profile cannot be enforced by the available runner.
+  (Bubblewrap on Linux — firejail was rejected for this track — and
+  `sandbox-exec` on macOS). Profile is declared on the issue; the
+  orchestrator refuses to dispatch a task whose required profile cannot be
+  enforced by the available runner.
 - **Signed claims and handoffs.** ML-DSA-65 signatures over the claim and
   handoff records using the agent's keypair. Verified on read by the
   Tracker adapter; mismatches are dropped.

@@ -9,6 +9,7 @@ use x0x_symphony_core::WorkflowDefinition;
 use crate::{
     error::{Error, Result},
     preset::{self, PresetName},
+    sandbox::SandboxSpec,
 };
 
 const DEFAULT_TURN_TIMEOUT_MS: u64 = 3_600_000;
@@ -42,6 +43,9 @@ pub struct RunnerSpec {
     pub event_high_water_mark: usize,
     /// Explicit bounded-channel overflow behavior.
     pub event_overflow_policy: EventOverflowPolicy,
+    /// Host sandbox configuration; absent means intentionally unsandboxed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxSpec>,
     /// Preset name that produced this spec, when any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<PresetName>,
@@ -67,6 +71,7 @@ impl RunnerSpec {
             event_capacity: DEFAULT_EVENT_CAPACITY,
             event_high_water_mark: DEFAULT_HIGH_WATER_MARK,
             event_overflow_policy: EventOverflowPolicy::DropOldest,
+            sandbox: None,
             preset: None,
         })
     }
@@ -158,6 +163,13 @@ impl RunnerSpec {
         self
     }
 
+    /// Configure a host sandbox for this runner.
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: SandboxSpec) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
     /// Return the configured timeout as a [`Duration`].
     #[must_use]
     pub const fn turn_timeout(&self) -> Duration {
@@ -194,6 +206,9 @@ impl RunnerSpec {
         for key in &self.allow_secret_env {
             crate::env::validate_env_key(key)?;
         }
+        if let Some(sandbox) = &self.sandbox {
+            sandbox.validate()?;
+        }
         crate::env::ensure_secret_env_allowed(self.env.keys(), &self.allow_secret_env)
     }
 }
@@ -214,6 +229,8 @@ struct RunnerWorkflowConfig {
     turn_timeout_ms: Option<u64>,
     event_capacity: Option<usize>,
     event_high_water_mark: Option<usize>,
+    sandbox: Option<SandboxSpec>,
+    sandbox_args: Option<Vec<String>>,
     shell: Option<RunnerOverrides>,
     codex: Option<RunnerOverrides>,
     claude_code: Option<RunnerOverrides>,
@@ -232,6 +249,7 @@ struct RunnerOverrides {
     turn_timeout_ms: Option<u64>,
     event_capacity: Option<usize>,
     event_high_water_mark: Option<usize>,
+    sandbox_args: Option<Vec<String>>,
 }
 
 impl RunnerWorkflowConfig {
@@ -246,6 +264,11 @@ impl RunnerWorkflowConfig {
             block.apply_to(&mut spec)?;
         }
         RunnerOverrides::from_top_level(&self).apply_to(&mut spec)?;
+        if let Some(mut sandbox) = self.sandbox {
+            sandbox.normalize_paths();
+            sandbox.validate()?;
+            spec.sandbox = Some(sandbox);
+        }
         spec.preset = selected_preset;
         spec.validate()?;
         Ok(spec)
@@ -299,6 +322,7 @@ impl RunnerOverrides {
             turn_timeout_ms: config.turn_timeout_ms,
             event_capacity: config.event_capacity,
             event_high_water_mark: config.event_high_water_mark,
+            sandbox_args: config.sandbox_args.clone(),
         }
     }
 
@@ -332,6 +356,14 @@ impl RunnerOverrides {
         if let Some(event_high_water_mark) = self.event_high_water_mark {
             spec.event_high_water_mark = event_high_water_mark;
         }
+        if let Some(sandbox_args) = self.sandbox_args {
+            for arg in &sandbox_args {
+                validate_arg(arg)?;
+            }
+            let mut args = sandbox_args;
+            args.extend(std::mem::take(&mut spec.args));
+            spec.args = args;
+        }
         Ok(())
     }
 }
@@ -349,7 +381,7 @@ fn validate_command(command: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_arg(arg: &str) -> Result<()> {
+pub(crate) fn validate_arg(arg: &str) -> Result<()> {
     if arg.as_bytes().contains(&0) {
         return Err(Error::invalid_config(
             "runner.args",

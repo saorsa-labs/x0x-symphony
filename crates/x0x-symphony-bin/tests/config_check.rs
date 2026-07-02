@@ -18,6 +18,21 @@ async fn repository_workflow_passes_config_check() -> Result<(), Box<dyn Error>>
 }
 
 #[tokio::test]
+async fn workflow_with_runner_sandbox_passes_config_check() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let workflow_path = dir.path().join("WORKFLOW.md");
+    std::fs::write(&workflow_path, workflow_with_sandbox())?;
+    let workflow_arg = workflow_path.to_string_lossy().into_owned();
+
+    let output = run_cli(&["x0x-symphony", "config", "check", "--config", &workflow_arg]).await?;
+
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "config ok\n");
+    assert_eq!(output.stderr, "");
+    Ok(())
+}
+
+#[tokio::test]
 async fn missing_required_blocks_fail_config_check() -> Result<(), Box<dyn Error>> {
     for block in [
         "tracker",
@@ -49,6 +64,24 @@ async fn missing_required_blocks_fail_config_check() -> Result<(), Box<dyn Error
 async fn run_cli(args: &[&str]) -> Result<cli::Output, Box<dyn Error>> {
     let command_line = CommandLine::try_parse_from(args)?;
     cli::run(command_line).await.map_err(Into::into)
+}
+
+fn workflow_with_sandbox() -> String {
+    let mut content = workflow_missing("none");
+    content = content.replace(
+        "runner:\n  kind: shell\n  command: echo\n",
+        concat!(
+            "runner:\n",
+            "  kind: shell\n",
+            "  command: echo\n",
+            "  sandbox:\n",
+            "    profile: repo-write\n",
+            "    backend: none\n",
+            "    on_unavailable: warn\n",
+            "    egress_allow: [\"api.example.test\"]\n",
+        ),
+    );
+    content
 }
 
 fn workflow_missing(block: &str) -> String {

@@ -34,9 +34,11 @@ M1 is a single-host vertical slice:
 
 ### Current boundaries (what still does NOT ship — stated, not hidden)
 
-- **No distributed workers, no sandbox, no MLS.** The runner is an unsandboxed
-  child process; execution is local-backlog-only until M3. The operator vouches
-  for every command in `WORKFLOW.md` (see [`security.md`](./security.md)).
+- **No distributed workers, no MLS.** The runner can be host-sandboxed when
+  `runner.sandbox` is configured; omitting that block intentionally preserves
+  unsandboxed local-development behavior. Execution is local-backlog-only until
+  M3. The operator vouches for every command in `WORKFLOW.md` (see
+  [`security.md`](./security.md)).
 - **SSE is an in-process broadcast.** `/symphony/events` streams heartbeats and
   task-change events originating from this daemon's own API mutations;
   external edits to the JSONL are visible on the next poll/read but are not
@@ -80,7 +82,36 @@ non-zero on any missing/invalid key, printing one clear error per problem:
 | `workspace` | `root` (`~` expanded) |
 | `hooks` | `timeout_ms`; `after_create`, `before_run`, `after_run`, and `before_remove` are optional scripts (absent or empty = disabled) |
 | `agent` | `max_concurrent_agents`, `max_concurrent_agents_by_state`, `max_turns`, `max_retry_backoff_ms` |
-| `runner` | `kind` (`shell`); the `runner:` block is then resolved by `RunnerSpec::from_workflow_config` (so `runner.preset` is accepted) |
+| `runner` | `kind` (`shell`); the `runner:` block is then resolved by `RunnerSpec::from_workflow_config` (so `runner.preset` and optional `runner.sandbox` are accepted) |
+
+Optional runner sandbox schema:
+
+```yaml
+runner:
+  kind: shell
+  preset: claude_code
+  sandbox:
+    profile: repo-write        # read-only | repo-write | no-network | full-dev | ci-only
+    backend: auto              # auto | sandbox-runtime | bubblewrap | landlock | sandbox-exec | none
+    on_unavailable: warn       # warn for local work, fail-closed to refuse local work
+    egress_allow:              # domain metadata / allow-list for network profiles
+      - api.anthropic.com
+      - api.openai.com
+    secrets_deny:              # defaults include SSH, x0x, cloud, GPG, browser profiles
+      - ~/.ssh
+      - ~/.x0x
+    cpu_seconds: 3600          # optional best-effort resource limit
+    memory_bytes: 8589934592   # optional best-effort resource limit
+```
+
+If `runner.sandbox` is absent, the shell runner is unsandboxed. If present,
+`backend: auto` probes at runner construction time: Linux uses `srt` → `bwrap`
+→ `landlock-restrict` → `none`; macOS uses `srt` → `/usr/bin/sandbox-exec` →
+`none`; Windows resolves to `none`. `on_unavailable` applies only to local work.
+Network-sourced work is always fail-closed once that dispatch source exists.
+Preset-specific `sandbox_args` can be prepended to child argv as
+defense-in-depth (for example, a harness-native `--sandbox` flag), but the host
+sandbox remains the enforcement boundary.
 
 Validate without starting the daemon:
 

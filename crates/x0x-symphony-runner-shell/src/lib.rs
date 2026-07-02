@@ -6,9 +6,14 @@ mod env;
 pub mod error;
 pub mod preset;
 pub mod runner;
+pub mod sandbox;
 pub mod spec;
 
 pub use error::{Error, Result};
 pub use preset::PresetName;
 pub use runner::ShellRunner;
+pub use sandbox::{
+    Backend, CommandPlan, HostSandbox, IssueSource, ProbeCheck, ProbeReport, ProbeStatus, Sandbox,
+    SandboxProfile, SandboxSpec, UnavailablePolicy,
+};
 pub use spec::{EventOverflowPolicy, RunnerSpec};

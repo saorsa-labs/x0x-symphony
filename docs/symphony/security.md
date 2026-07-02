@@ -1,15 +1,12 @@
-# x0x-symphony — Interim security posture (pre-sandbox)
+# x0x-symphony — Security posture and sandbox profiles
 
 This document states x0x-symphony's security posture for the M1–M3
-window — the period before sandbox profiles land at M4. Until then, a
-runner is an unsandboxed child process; this file records the four rules
-that make that acceptable and the boundaries that hold. It is the
-verbatim source required by the
-[2026-07 M1 execution plan](../plan/2026-07-m1-execution-plan.md) §4.3.
-XSY-0027 extends this same file with sandbox-profile mapping when M4
-arrives; until then, the architecture document
-[`../design/symphony.md`](../design/symphony.md) §11 remains the
-authoritative security model.
+window and the M2 sandbox-profile layer added by XSY-0027. The original
+interim rules remain the baseline: local operator-controlled work can run
+without a configured sandbox, but network-sourced dispatch is default-off
+through M3 and becomes fail-closed once that source exists. The
+architecture document [`../design/symphony.md`](../design/symphony.md)
+§11 remains the authoritative security model.
 
 ---
 
@@ -30,8 +27,9 @@ access**. There is no sandbox. Containment rests on two controls:
    unless explicitly allow-listed. This control lands with the runner
    (XSY-0004) and workspace hooks (XSY-0005 / plan §4.1).
 
-These are the primary and secondary boundaries. There is no tertiary
-boundary (sandbox) until M4.
+These are the primary and secondary boundaries. XSY-0027 adds a tertiary
+host-sandbox boundary when `[runner.sandbox]` is configured; omitting the
+block intentionally preserves the local-development unsandboxed behavior.
 
 ---
 
@@ -78,9 +76,11 @@ Per-rule controlling issues:
 
 This posture is **not**:
 
-- **A sandbox.** There is no process isolation, syscall filtering, or
-  filesystem namespace confinement until XSY-0027 at M4. The runner has
-  the full privileges of the `x0x-symphonyd` process.
+- **A sandbox when `[runner.sandbox]` is absent.** Local development may
+  still opt out by omitting the block. When a sandbox block is present,
+  the shell runner transforms the structured command plan before process
+  spawn and preserves the existing env-clear, stdio, timeout, and process
+  group layers.
 - **Signature verification.** Claims and handoffs are *not* signed or
   verified during M1–M2. ML-DSA-65 signing arrives with XSY-0020 at M3.
 - **Trust-gated dispatch.** There is no trust-level evaluation before
@@ -95,6 +95,54 @@ signature + trust level (XSY-0039) from the moment that path exists.
 
 ---
 
+## Sandbox profiles (M2)
+
+The shell runner accepts an optional `[runner.sandbox]` / `runner.sandbox:`
+block. If omitted, behavior is unchanged and local work runs unsandboxed.
+If present, the runner resolves a backend at construction time, mutates a
+`CommandPlan` before building `tokio::process::Command`, then applies the
+existing env-clear, stdio-pipe, timeout, and process-group layers.
+
+Profiles:
+
+| Profile | Filesystem | Network | Secrets |
+|---------|------------|---------|---------|
+| `read-only` | Workspace mounted read-only; rest of host read-only where the backend supports it | Denied | Denied (`~/.ssh`, `~/.x0x`, `~/.aws`, `~/.config/gcloud`, `~/.gnupg`, browser profiles, plus configured denies) |
+| `repo-write` | Workspace writable; rest read-only/masked | Configured LLM/API egress allow-list | Denied by default |
+| `no-network` | Workspace writable; rest read-only/masked | Denied | Denied by default |
+| `full-dev` | Workspace writable; broad host read/write where supported | Unrestricted | Accessible; use only for trusted, pinned agents |
+| `ci-only` | Workspace writable; rest read-only/masked | CI/registry allow-list (GitHub, crates.io, configured registry) | Only CI-scoped secrets the operator explicitly passes |
+
+Backend selection:
+
+| Platform | `backend = auto` order | Notes |
+|----------|------------------------|-------|
+| Linux | `srt` → `bwrap` → `landlock-restrict` → `none` | Firejail was deliberately replaced with Bubblewrap. Bubblewrap provides filesystem, PID, and network namespace isolation, but domain-level egress allow-lists require an outer policy engine such as `srt`; when Bubblewrap is the effective backend, egress allow-list entries are advisory metadata rather than DNS firewall rules. |
+| macOS | `srt` → `/usr/bin/sandbox-exec` → `none` | `sandbox-exec` enforces filesystem and coarse network operations from generated SBPL. Domain allow-lists are not DNS-specific. |
+| Windows | `none` | Tier 1 has no Windows host sandbox; non-local dispatch must fail closed. |
+
+`on_unavailable` controls only local work: `warn` logs and runs the
+unwrapped command, while `fail-closed` refuses to spawn. Network-sourced
+work is always fail-closed regardless of this setting; a resolved
+`backend = none` is not enforceable for `IssueSource::NetworkSourced`.
+This preserves the M2/M3 rule that network dispatch remains default-off
+and, once introduced, cannot use an unavailable sandbox as an escape hatch.
+
+Resource limits are Tier-1 best effort. Linux wraps sandboxed commands in
+`systemd-run --user --scope` when CPU or memory limits are configured and
+`systemd-run` is available. macOS uses shell `ulimit` / rlimit inheritance;
+that is a per-process mechanism rather than a cgroup-scoped boundary, so
+forked children are not bounded as strongly as on Linux. Proper native
+resource enforcement is tracked for M4 Tier 2.
+
+Every sandbox exposes a `probe()` self-test that returns a structured
+`ProbeReport` for write-outside-workspace, secret-read, host-PID, and
+non-allowlisted-network checks. Checks can be `not-applicable` when a
+backend, platform primitive, or probe dependency is absent, but the report
+always records each check explicitly.
+
+---
+
 ## Future hardening
 
 The following issues extend or supersede this posture, in milestone order:
@@ -104,9 +152,9 @@ The following issues extend or supersede this posture, in milestone order:
 | [XSY-0020](../../issues/issues.jsonl) | M3 | ML-DSA-65 signing + verification of claim and handoff payloads |
 | [XSY-0022](../../issues/issues.jsonl) | M3 | Trust-gated dispatch: rejects non-trusted agents on sensitive tasks |
 | [XSY-0039](../../issues/issues.jsonl) | M3 | Dispatch gate: orchestrator refuses network-sourced issues without verified signature + trust |
-| [XSY-0027](../../issues/issues.jsonl) | M4 | Sandbox profiles (firejail / sandbox-exec) — extends *this file* with profile mapping |
+| [XSY-0027](../../issues/issues.jsonl) | M4 | Sandbox profiles (Bubblewrap / sandbox-exec) — extends *this file* with profile mapping |
 | [XSY-0028](../../issues/issues.jsonl) | M4 | Sensitive-task gates: Pinned identity + human approval step |
 
-When XSY-0027 lands, this document transitions from an interim posture to a
-sandbox-enforced one. The four rules above remain as the baseline contract;
-the sandbox profiles layer additional defense-in-depth on top.
+The four rules above remain as the baseline contract; configured sandbox
+profiles layer additional defense-in-depth on top. Tier 2 replaces the
+external-tool wrappers with native no-Node backends.

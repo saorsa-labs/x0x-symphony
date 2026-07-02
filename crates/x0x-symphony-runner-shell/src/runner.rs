@@ -32,7 +32,7 @@ use x0x_symphony_core::{
 use crate::{
     env,
     error::{Error, Result},
-    EventOverflowPolicy, RunnerSpec,
+    CommandPlan, EventOverflowPolicy, HostSandbox, RunnerSpec, Sandbox,
 };
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -43,6 +43,7 @@ const READ_CHUNK_BYTES: usize = 8 * 1024;
 /// It never invokes a shell implicitly and never renders issue fields into argv.
 pub struct ShellRunner {
     spec: Arc<RunnerSpec>,
+    sandbox: Option<Arc<dyn Sandbox>>,
     capabilities: RunnerCapabilities,
     sessions: Arc<Mutex<BTreeMap<SessionId, SessionState>>>,
     next_session: AtomicU64,
@@ -60,8 +61,15 @@ impl ShellRunner {
         if let Some(preset) = spec.preset {
             capabilities = capabilities.with_label(preset.as_str());
         }
+        let sandbox = spec
+            .sandbox
+            .clone()
+            .map(HostSandbox::new)
+            .transpose()?
+            .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>);
         Ok(Self {
             spec: Arc::new(spec),
+            sandbox,
             capabilities,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             next_session: AtomicU64::new(1),
@@ -108,7 +116,7 @@ impl ShellRunner {
         child_env: BTreeMap<String, String>,
     ) -> Result<TurnOutcome> {
         let started = Instant::now();
-        let mut command = self.command_for_session(sess, child_env);
+        let mut command = self.command_for_session(sess, child_env).await?;
         let mut child = command.spawn().map_err(|source| Error::Spawn {
             command: self.spec.command.clone(),
             source,
@@ -159,22 +167,31 @@ impl ShellRunner {
         Ok(outcome)
     }
 
-    fn command_for_session(
+    async fn command_for_session(
         &self,
         sess: &SessionHandle,
         child_env: BTreeMap<String, String>,
-    ) -> Command {
-        let mut command = Command::new(&self.spec.command);
+    ) -> Result<Command> {
+        let mut plan = CommandPlan::new(
+            self.spec.command.clone(),
+            self.spec.args.clone(),
+            sess.workspace_path.clone(),
+            child_env,
+        );
+        if let Some(sandbox) = &self.sandbox {
+            sandbox.transform(&mut plan).await?;
+        }
+        let mut command = Command::new(&plan.program);
         command
-            .args(&self.spec.args)
-            .current_dir(&sess.workspace_path)
+            .args(&plan.args)
+            .current_dir(&plan.cwd)
             .env_clear()
-            .envs(child_env)
+            .envs(plan.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure_process_group(&mut command);
-        command
+        Ok(command)
     }
 }
 
