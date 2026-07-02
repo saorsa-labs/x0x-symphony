@@ -1,10 +1,12 @@
 use std::{error::Error, fs, path::Path};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 use x0x_symphony_core::{Hook, HookEnv, HookName, HookStatus, Issue, IssueId, IssueState};
 use x0x_symphony_workspace::{
     containment::{sanitize_issue_identifier, ContainmentError},
-    CleanupDecision, Config, Manager,
+    CleanupDecision, Config, Error as WorkspaceError, Manager,
 };
 
 fn issue(identifier: &str) -> Result<Issue, x0x_symphony_core::SymphonyError> {
@@ -141,6 +143,19 @@ fn workspace_path_is_deterministic_from_sanitized_issue_id() -> Result<(), Box<d
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn created_workspace_directory_is_owner_private() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let workspace = manager(&temp)?;
+    let handle = workspace.create_for_issue(&issue("XSY-0006")?)?;
+
+    let mode = fs::metadata(&handle.path)?.permissions().mode() & 0o777;
+
+    assert_eq!(mode, 0o700);
+    Ok(())
+}
+
 #[tokio::test]
 async fn hook_timeout_produces_structured_outcome() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
@@ -218,6 +233,70 @@ async fn hook_sensitive_env_allowed_when_explicitly_allowlisted() -> Result<(), 
 
     assert_eq!(outcome.status, HookStatus::Succeeded);
     assert_eq!(outcome.stdout.as_deref(), Some("secret"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn hook_env_value_rejects_newline_with_structured_error() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let workspace = manager(&temp)?;
+    let handle = workspace.create_for_issue(&issue("XSY-1005")?)?;
+    let hook = Hook::new(HookName::BeforeRun, "true", 1_000);
+    let env = HookEnv::new().with_var("SAFE_VALUE", "first\nsecond");
+
+    match workspace.run_hook_in(&handle, &hook, &env).await {
+        Err(WorkspaceError::InvalidHookEnv { name, reason }) => {
+            assert_eq!(name, "SAFE_VALUE");
+            assert_eq!(reason, "value must not contain newline");
+            Ok(())
+        }
+        other => Err(format!("expected InvalidHookEnv for newline, got {other:?}").into()),
+    }
+}
+
+#[tokio::test]
+async fn hook_env_key_length_boundary_is_enforced() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let workspace = manager(&temp)?;
+    let handle = workspace.create_for_issue(&issue("XSY-1006")?)?;
+    let hook = Hook::new(HookName::BeforeRun, "true", 1_000);
+    let valid_name = "A".repeat(255);
+    let valid_env = HookEnv::new().with_var(valid_name, "ok");
+
+    let outcome = workspace.run_hook_in(&handle, &hook, &valid_env).await?;
+    assert_eq!(outcome.status, HookStatus::Succeeded);
+
+    let invalid_name = "A".repeat(256);
+    let invalid_env = HookEnv::new().with_var(invalid_name, "too-long");
+    match workspace.run_hook_in(&handle, &hook, &invalid_env).await {
+        Err(WorkspaceError::InvalidHookEnv { name, reason }) => {
+            assert_eq!(name.len(), 256);
+            assert_eq!(reason, "name must be at most 255 bytes");
+            Ok(())
+        }
+        other => Err(format!("expected InvalidHookEnv for long key, got {other:?}").into()),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hook_env_preserves_case_sensitive_path_aliases() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let workspace = manager(&temp)?;
+    let handle = workspace.create_for_issue(&issue("XSY-1007")?)?;
+    let hook = Hook::new(
+        HookName::BeforeRun,
+        "printf '%s|%s' \"$PATH\" \"$Path\"",
+        1_000,
+    );
+    let env = HookEnv::new()
+        .with_var("PATH", "upper")
+        .with_var("Path", "mixed");
+
+    let outcome = workspace.run_hook_in(&handle, &hook, &env).await?;
+
+    assert_eq!(outcome.status, HookStatus::Succeeded);
+    assert_eq!(outcome.stdout.as_deref(), Some("upper|mixed"));
     Ok(())
 }
 
