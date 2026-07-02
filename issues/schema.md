@@ -42,11 +42,13 @@ Schema evolution after v1 is **additive-only**:
 - Existing v1 fields are never renamed, removed, or re-typed.
 - Unknown top-level fields are preserved verbatim across read/write cycles.
 
-Signatures (XSY-0020) cover the EXACT stored payload bytes — the serialized
-claim/handoff as written — never a re-derived canonical projection. Therefore
-additive schema growth (new optional fields) can never invalidate an existing
-signature. `BTreeMap`-ordered unknown-field preservation supports deterministic
-stored bytes for this rule.
+Signatures (XSY-0020) cover the serialized claim/handoff payload as stored,
+excluding only the signature envelope itself. Claim `heartbeat_at` is also
+excluded intentionally: it is a mutable liveness signal, not an ownership
+attestation, so heartbeat refreshes do not invalidate the claim signature.
+Additive schema growth (new optional fields) can never invalidate an existing
+signature when those fields are absent. `BTreeMap`-ordered unknown-field
+preservation supports deterministic stored bytes for this rule.
 
 ## Optional fields
 
@@ -87,11 +89,19 @@ Present once a worker holds the issue. Updated on heartbeat.
 ```jsonc
 {
   "claim": {
+    "issue_id":      "XSY-0001",
     "by":            "<agent_id_hex>",
     "at":            "2026-04-28T12:00:00Z",
     "heartbeat_at":  "2026-04-28T12:14:00Z",
     "shard_role":    "primary",
-    "signature":     "<ml-dsa-65 sig hex>"
+    "signature": {
+      "algorithm":       "x0x.agent-sign.v2.ml-dsa-65",
+      "context":         "x0x-symphony-claim-v1",
+      "public_key_b64":  "<ml-dsa-65-public-key>",
+      "signature_b64":   "<detached-ml-dsa-65-signature>",
+      "payload_sha256":  "<hex-sha256-of-signed-payload>",
+      "signer_agent_id": "<agent_id_hex>"
+    }
   }
 }
 ```
@@ -109,7 +119,17 @@ Same shape on x0x and x0x-symphony.
       {"command": "just fmt-check", "status": "passed"}
     ],
     "follow_up":  ["Anything humans or later agents should know"],
-    "proofs_dir": "proofs/XSY-0001/2026-04-28T12-15-00Z"
+    "proofs_dir": "proofs/XSY-0001/2026-04-28T12-15-00Z",
+    "issue_id":   "XSY-0001",
+    "signer_agent_id": "<agent_id_hex>",
+    "signature": {
+      "algorithm":       "x0x.agent-sign.v2.ml-dsa-65",
+      "context":         "x0x-symphony-handoff-v1",
+      "public_key_b64":  "<ml-dsa-65-public-key>",
+      "signature_b64":   "<detached-ml-dsa-65-signature>",
+      "payload_sha256":  "<hex-sha256-of-signed-payload>",
+      "signer_agent_id": "<agent_id_hex>"
+    }
   }
 }
 ```
@@ -117,6 +137,11 @@ Same shape on x0x and x0x-symphony.
 `proofs_dir` is a relative path inside the workspace where large
 validation artefacts (full stdout, stderr, runner traces, fmt diffs)
 are stored. Small status only lives inside `validation`.
+
+When `handoff.signature` is present, `handoff.issue_id` and
+`handoff.signer_agent_id` are required and are part of the signed payload. They
+bind the handoff to one issue and one x0x signer so a valid handoff cannot be
+replayed onto another issue.
 
 ## State values
 

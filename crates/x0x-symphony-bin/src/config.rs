@@ -12,6 +12,7 @@ use thiserror::Error;
 use x0x_symphony_core::{AgentId, IssueState, LifecycleHooks, SymphonyError, WorkflowDefinition};
 use x0x_symphony_orchestrator::{Config as OrchestratorConfig, RetryPolicy};
 use x0x_symphony_runner_shell::RunnerSpec;
+use x0x_symphony_tracker_git_jsonl::signing::SigningPolicy;
 
 /// Result alias for workflow configuration operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -77,6 +78,8 @@ pub struct WorkflowConfig {
     pub hooks: HooksConfig,
     /// Agent and orchestrator settings.
     pub agent: AgentConfig,
+    /// Signing settings for claim and handoff payloads.
+    pub signing: SigningConfig,
     /// Raw runner block used by `RunnerSpec`.
     pub runner: Value,
 }
@@ -150,6 +153,15 @@ pub struct AgentConfig {
     pub max_retry_backoff_ms: u64,
 }
 
+/// Signing configuration parsed from the optional `signing:` block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SigningConfig {
+    /// Signing policy for local JSONL claim/handoff records.
+    pub policy: SigningPolicy,
+    /// x0xd base URL used for `/agent/sign` and `/agent/verify`.
+    pub x0xd_url: String,
+}
+
 /// Resolved tracker filesystem paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrackerPaths {
@@ -204,6 +216,7 @@ impl WorkflowConfig {
         let workspace = parse_workspace(root, &mut problems);
         let hooks = parse_hooks(root, &mut problems);
         let agent = parse_agent(root, &mut problems);
+        let signing = parse_signing(root, &mut problems);
         let runner = parse_runner(root, &raw, &mut problems);
 
         if problems.is_empty() {
@@ -224,6 +237,7 @@ impl WorkflowConfig {
             workspace: workspace.ok_or_else(internal_validation_gap)?,
             hooks: hooks.ok_or_else(internal_validation_gap)?,
             agent: agent.ok_or_else(internal_validation_gap)?,
+            signing: signing.ok_or_else(internal_validation_gap)?,
             runner: runner.ok_or_else(internal_validation_gap)?,
         })
     }
@@ -244,7 +258,10 @@ impl WorkflowConfig {
     ///
     /// Returns [`Error::Invalid`] when a relative tracker path has no parent.
     pub fn tracker_paths(&self, workflow_path: &Path) -> Result<TrackerPaths> {
-        let base = workflow_path.parent().unwrap_or_else(|| Path::new("."));
+        let base = match workflow_path.parent() {
+            Some(parent) => parent,
+            None => Path::new("."),
+        };
         let issues_path = absolutize_against(base, &self.tracker.path);
         let repo_root = repo_root_from_issues_path(&issues_path)?;
         Ok(TrackerPaths {
@@ -320,16 +337,18 @@ fn parse_tracker(root: &Map<String, Value>, problems: &mut Vec<String>) -> Optio
         }
     }
     let path = required_string(tracker, "tracker.path", problems).map(PathBuf::from);
-    let active_states = optional_string_list(tracker, "tracker.active_states")
-        .unwrap_or_else(|| vec!["todo".to_owned()]);
-    let terminal_states =
-        optional_string_list(tracker, "tracker.terminal_states").unwrap_or_else(|| {
-            vec![
-                "done".to_owned(),
-                "cancelled".to_owned(),
-                "duplicate".to_owned(),
-            ]
-        });
+    let active_states = match optional_string_list(tracker, "tracker.active_states") {
+        Some(states) => states,
+        None => vec!["todo".to_owned()],
+    };
+    let terminal_states = match optional_string_list(tracker, "tracker.terminal_states") {
+        Some(states) => states,
+        None => vec![
+            "done".to_owned(),
+            "cancelled".to_owned(),
+            "duplicate".to_owned(),
+        ],
+    };
     Some(TrackerConfig {
         kind: kind?,
         path: path?,
@@ -385,6 +404,39 @@ fn parse_agent(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<
         max_turns,
         max_retry_backoff_ms,
     })
+}
+
+fn parse_signing(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<SigningConfig> {
+    let Some(value) = root.get("signing") else {
+        return Some(SigningConfig {
+            policy: SigningPolicy::Disabled,
+            x0xd_url: "http://127.0.0.1:12700".to_owned(),
+        });
+    };
+    let Some(signing) = value.as_object() else {
+        problems.push("signing must be a mapping".to_owned());
+        return None;
+    };
+    let policy = match optional_string(signing, "signing.policy", problems) {
+        Some(raw) => {
+            if let Some(policy) = SigningPolicy::from_config_value(&raw) {
+                policy
+            } else {
+                problems.push("signing.policy must be `disabled` or `required`".to_owned());
+                return None;
+            }
+        }
+        None => SigningPolicy::Disabled,
+    };
+    let x0xd_url = match optional_string(signing, "signing.x0xd_url", problems) {
+        Some(url) if !url.trim().is_empty() => url,
+        Some(_) => {
+            problems.push("signing.x0xd_url must not be empty".to_owned());
+            return None;
+        }
+        None => "http://127.0.0.1:12700".to_owned(),
+    };
+    Some(SigningConfig { policy, x0xd_url })
 }
 
 fn parse_runner(

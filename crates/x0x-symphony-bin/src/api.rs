@@ -479,16 +479,16 @@ impl IntoResponse for Error {
     }
 }
 
-fn bearer_header_matches(request: &Request<axum::body::Body>, expected: &str) -> bool {
+fn bearer_header_matches(request: &Request<axum::body::Body>, target: &str) -> bool {
     request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected)
+        .is_some_and(|token| token == target)
 }
 
-fn query_token_matches(request: &Request<axum::body::Body>, expected: &str) -> bool {
+fn query_token_matches(request: &Request<axum::body::Body>, target: &str) -> bool {
     if request.uri().path() != "/symphony/events" {
         return false;
     }
@@ -496,7 +496,7 @@ fn query_token_matches(request: &Request<axum::body::Body>, expected: &str) -> b
         query
             .split('&')
             .filter_map(|pair| pair.strip_prefix("token="))
-            .any(|token| token == expected)
+            .any(|token| token == target)
     })
 }
 

@@ -61,7 +61,13 @@ impl Budget {
     pub fn headroom(&self, state: &IssueState) -> Headroom {
         let global = self.global_cap.saturating_sub(self.global_used);
         let per_state = match self.per_state_caps.get(state) {
-            Some(cap) => cap.saturating_sub(self.per_state_used.get(state).copied().unwrap_or(0)),
+            Some(cap) => {
+                let mut used = 0;
+                if let Some(value) = self.per_state_used.get(state).copied() {
+                    used = value;
+                }
+                cap.saturating_sub(used)
+            }
             None => usize::MAX,
         };
         Headroom { global, per_state }

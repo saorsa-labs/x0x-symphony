@@ -8,7 +8,10 @@ use x0x_symphony_bin::{api, auth, config};
 use x0x_symphony_core::AgentId;
 use x0x_symphony_orchestrator::{Orchestrator, SystemClock};
 use x0x_symphony_runner_shell::{RunnerSpec, ShellRunner};
-use x0x_symphony_tracker_git_jsonl::JsonlTracker;
+use x0x_symphony_tracker_git_jsonl::{
+    signing::{SigningClient, SigningPolicy, TrustedKeyResolver, X0xdClient},
+    JsonlTracker,
+};
 use x0x_symphony_workspace::{Config as WorkspaceConfig, Manager};
 
 #[derive(Debug, Parser)]
@@ -38,13 +41,32 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let workflow = config::WorkflowConfig::load(&args.config)?;
     let tracker_paths = workflow.tracker_paths(&args.config)?;
     let api_token = auth::load_or_generate_api_token(&data_dir).await?;
-    let agent_id = AgentId::new(args.agent_id.clone())?;
+    let signing_client = if workflow.signing.policy == SigningPolicy::Required {
+        Some(Arc::new(
+            X0xdClient::new(&workflow.signing.x0xd_url)
+                .context("failed to configure x0xd signing client")?,
+        ))
+    } else {
+        None
+    };
+    let agent_id = if let Some(client) = signing_client.as_ref() {
+        let identity = client
+            .agent_identity()
+            .await
+            .context("failed to read x0xd agent identity for required signing")?;
+        AgentId::new(identity.agent_id)?
+    } else {
+        AgentId::new(args.agent_id.clone())?
+    };
 
-    let tracker = Arc::new(
-        JsonlTracker::builder(tracker_paths.repo_root.clone())
-            .issues_path(tracker_paths.issues_path.clone())
-            .build(),
-    );
+    let mut tracker_builder = JsonlTracker::builder(tracker_paths.repo_root.clone())
+        .issues_path(tracker_paths.issues_path.clone());
+    if let Some(client) = signing_client {
+        let signing: Arc<dyn SigningClient> = client.clone();
+        let resolver: Arc<dyn TrustedKeyResolver> = client;
+        tracker_builder = tracker_builder.required_signing(signing, resolver);
+    }
+    let tracker = Arc::new(tracker_builder.build());
     let runner_spec = RunnerSpec::from_workflow_config(&workflow.definition.config)
         .context("runner configuration did not resolve")?;
     let runner = Arc::new(ShellRunner::new(runner_spec).context("failed to build shell runner")?);

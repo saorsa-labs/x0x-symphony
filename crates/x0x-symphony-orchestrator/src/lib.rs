@@ -127,7 +127,11 @@ impl Config {
     #[must_use]
     pub fn heartbeat_interval(&self) -> Duration {
         let quarter_ms = self.claim_ttl.num_milliseconds().max(0) / 4;
-        Duration::from_millis(u64::try_from(quarter_ms).unwrap_or(0).max(1))
+        let mut millis = 0;
+        if let Ok(value) = u64::try_from(quarter_ms) {
+            millis = value;
+        }
+        Duration::from_millis(millis.max(1))
     }
 
     fn poll_context(&self) -> PollContext {

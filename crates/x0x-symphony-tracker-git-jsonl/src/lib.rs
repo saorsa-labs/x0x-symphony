@@ -38,6 +38,8 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod signing;
+
 use std::{
     collections::BTreeSet,
     ffi::OsString,
@@ -45,19 +47,24 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     thread,
     time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 use thiserror::Error;
 use tracing::{info, warn};
 use x0x_symphony_core::{
-    AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext, ReleaseReason,
-    Result as CoreResult, ShardRole, SymphonyError, Tracker,
+    sha256_hex, AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext, ReleaseReason,
+    Result as CoreResult, ShardRole, SignatureEnvelope, SymphonyError, Tracker, CLAIM_CONTEXT,
+    HANDOFF_CONTEXT, SIGN_ALGORITHM,
 };
+
+use crate::signing::{SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver};
 
 /// Result alias used by the git JSONL tracker adapter.
 pub type Result<T> = std::result::Result<T, TrackerError>;
@@ -109,7 +116,7 @@ pub enum TrackerError {
     /// A file changed while the non-git mtime fallback was protecting a transition.
     #[error("concurrent modification detected for {path}")]
     ConcurrentModification {
-        /// File whose mtime changed unexpectedly.
+        /// File whose mtime changed during a guarded transition.
         path: PathBuf,
     },
 
@@ -141,6 +148,10 @@ pub enum TrackerError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// Signing or verification failed.
+    #[error("signing error: {0}")]
+    Signing(String),
 
     /// Core domain validation failed while constructing an adapter value.
     #[error(transparent)]
@@ -215,8 +226,57 @@ impl IssueDraft {
     }
 }
 
+#[derive(Clone)]
+struct SigningRuntime {
+    policy: SigningPolicy,
+    client: Option<Arc<dyn SigningClient>>,
+    resolver: Option<Arc<dyn TrustedKeyResolver>>,
+}
+
+impl SigningRuntime {
+    const fn disabled() -> Self {
+        Self {
+            policy: SigningPolicy::Disabled,
+            client: None,
+            resolver: None,
+        }
+    }
+
+    fn required(client: Arc<dyn SigningClient>, resolver: Arc<dyn TrustedKeyResolver>) -> Self {
+        Self {
+            policy: SigningPolicy::Required,
+            client: Some(client),
+            resolver: Some(resolver),
+        }
+    }
+
+    fn new(
+        policy: SigningPolicy,
+        client: Option<Arc<dyn SigningClient>>,
+        resolver: Option<Arc<dyn TrustedKeyResolver>>,
+    ) -> Self {
+        Self {
+            policy,
+            client,
+            resolver,
+        }
+    }
+
+    fn client(&self) -> Result<&dyn SigningClient> {
+        self.client
+            .as_deref()
+            .ok_or_else(|| TrackerError::Signing("signing client is not configured".to_owned()))
+    }
+
+    fn resolver(&self) -> Result<&dyn TrustedKeyResolver> {
+        self.resolver.as_deref().ok_or_else(|| {
+            TrackerError::Signing("trusted key resolver is not configured".to_owned())
+        })
+    }
+}
+
 /// Builder for [`JsonlTracker`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JsonlTrackerBuilder {
     repo_root: PathBuf,
     issues_path: PathBuf,
@@ -224,6 +284,7 @@ pub struct JsonlTrackerBuilder {
     lock_attempts: u32,
     lock_initial_backoff: Duration,
     lock_max_backoff: Duration,
+    signing: SigningRuntime,
 }
 
 impl JsonlTrackerBuilder {
@@ -239,6 +300,7 @@ impl JsonlTrackerBuilder {
             lock_attempts: 50,
             lock_initial_backoff: Duration::from_millis(10),
             lock_max_backoff: Duration::from_millis(250),
+            signing: SigningRuntime::disabled(),
         }
     }
 
@@ -271,6 +333,29 @@ impl JsonlTrackerBuilder {
         self
     }
 
+    /// Enable required signing with injected client and trusted-key resolver.
+    #[must_use]
+    pub fn required_signing(
+        mut self,
+        client: Arc<dyn SigningClient>,
+        resolver: Arc<dyn TrustedKeyResolver>,
+    ) -> Self {
+        self.signing = SigningRuntime::required(client, resolver);
+        self
+    }
+
+    /// Set an explicit signing policy and optional signing dependencies.
+    #[must_use]
+    pub fn signing(
+        mut self,
+        policy: SigningPolicy,
+        client: Option<Arc<dyn SigningClient>>,
+        resolver: Option<Arc<dyn TrustedKeyResolver>>,
+    ) -> Self {
+        self.signing = SigningRuntime::new(policy, client, resolver);
+        self
+    }
+
     /// Build the tracker adapter.
     #[must_use]
     pub fn build(self) -> JsonlTracker {
@@ -281,12 +366,27 @@ impl JsonlTrackerBuilder {
             lock_attempts: self.lock_attempts,
             lock_initial_backoff: self.lock_initial_backoff,
             lock_max_backoff: self.lock_max_backoff,
+            signing: self.signing,
         }
     }
 }
 
+impl std::fmt::Debug for JsonlTrackerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonlTrackerBuilder")
+            .field("repo_root", &self.repo_root)
+            .field("issues_path", &self.issues_path)
+            .field("git_binary", &self.git_binary)
+            .field("lock_attempts", &self.lock_attempts)
+            .field("lock_initial_backoff", &self.lock_initial_backoff)
+            .field("lock_max_backoff", &self.lock_max_backoff)
+            .field("signing_policy", &self.signing.policy)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Tracker adapter backed by `issues/issues.jsonl` and git commits.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JsonlTracker {
     repo_root: PathBuf,
     issues_path: PathBuf,
@@ -294,6 +394,21 @@ pub struct JsonlTracker {
     lock_attempts: u32,
     lock_initial_backoff: Duration,
     lock_max_backoff: Duration,
+    signing: SigningRuntime,
+}
+
+impl std::fmt::Debug for JsonlTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonlTracker")
+            .field("repo_root", &self.repo_root)
+            .field("issues_path", &self.issues_path)
+            .field("git_binary", &self.git_binary)
+            .field("lock_attempts", &self.lock_attempts)
+            .field("lock_initial_backoff", &self.lock_initial_backoff)
+            .field("lock_max_backoff", &self.lock_max_backoff)
+            .field("signing_policy", &self.signing.policy)
+            .finish_non_exhaustive()
+    }
 }
 
 impl JsonlTracker {
@@ -379,32 +494,33 @@ impl JsonlTracker {
     }
 
     fn claim_issue(&self, id: &IssueId, agent_id: &AgentId) -> Result<Claim> {
+        let claim = self.prepare_claim(id, agent_id)?;
+        self.commit_claim(id, claim)
+    }
+
+    fn prepare_claim(&self, id: &IssueId, agent_id: &AgentId) -> Result<Claim> {
+        let records = self.load_records()?;
+        let record = records
+            .find(id)
+            .ok_or_else(|| TrackerError::IssueNotFound { id: id.clone() })?;
+        ensure_issue_claimable(&record.issue, id)?;
+        Ok(Claim::new(
+            Some(id.clone()),
+            agent_id.clone(),
+            now_utc(),
+            ShardRole::ManualM1,
+        ))
+    }
+
+    fn commit_claim(&self, id: &IssueId, claim: Claim) -> Result<Claim> {
         let mut claimed = None;
         let message = format!("x0x-symphony: claim {id}");
         self.with_records_mutation(&message, |records| {
             let record = records.find_mut(id)?;
-            if record.issue.claim.is_some() {
-                return Err(TrackerError::ClaimRejected {
-                    id: id.clone(),
-                    reason: "issue already has an active claim".to_owned(),
-                });
-            }
-            if record.issue.state.as_str() != "todo" {
-                return Err(TrackerError::ClaimRejected {
-                    id: id.clone(),
-                    reason: format!("state is {}", record.issue.state.as_str()),
-                });
-            }
-            let now = now_utc();
-            let claim = Claim::new(
-                Some(id.clone()),
-                agent_id.clone(),
-                now.clone(),
-                ShardRole::ManualM1,
-            );
+            ensure_issue_claimable(&record.issue, id)?;
             record.issue.state = IssueState::new("in_progress")?;
             record.issue.claim = Some(claim.clone());
-            record.issue.updated_at = now;
+            record.issue.updated_at = now_utc();
             record.dirty = true;
             claimed = Some(claim);
             Ok(())
@@ -452,10 +568,29 @@ impl JsonlTracker {
 
     fn handoff_claim(&self, claim: &Claim, handoff: Handoff) -> Result<()> {
         let id = claim_issue_id(claim)?;
+        self.commit_handoff(&id, claim, handoff)
+    }
+
+    fn prepare_handoff(&self, claim: &Claim, handoff: Handoff) -> Result<Handoff> {
+        let id = claim_issue_id(claim)?;
+        let records = self.load_records()?;
+        let record = records
+            .find(&id)
+            .ok_or_else(|| TrackerError::IssueNotFound { id: id.clone() })?;
+        ensure_claim_owner(&record.issue, claim)?;
+        let mut prepared = handoff
+            .with_issue_id(id)
+            .with_signer_agent_id(claim.by.to_string());
+        prepared.signature = None;
+        Ok(prepared)
+    }
+
+    fn commit_handoff(&self, id: &IssueId, claim: &Claim, handoff: Handoff) -> Result<()> {
         let message = format!("x0x-symphony: handoff {id}");
         self.with_records_mutation(&message, |records| {
-            let record = records.find_mut(&id)?;
+            let record = records.find_mut(id)?;
             ensure_claim_owner(&record.issue, claim)?;
+            validate_signed_handoff_bindings(id, claim, &handoff)?;
             record.issue.state = IssueState::new("review")?;
             record.issue.claim = None;
             record.issue.handoff = Some(handoff);
@@ -491,6 +626,176 @@ impl JsonlTracker {
             record.dirty = true;
             Ok(())
         })
+    }
+
+    async fn sign_claim(&self, mut claim: Claim) -> Result<Claim> {
+        let payload = claim.signing_payload_bytes().map_err(TrackerError::from)?;
+        let response = self
+            .signing
+            .client()?
+            .sign(CLAIM_CONTEXT, &payload)
+            .await
+            .map_err(signing_error)?;
+        let envelope = envelope_from_sign_response(response, CLAIM_CONTEXT, &payload, &claim.by)?;
+        claim.signature = Some(envelope);
+        Ok(claim)
+    }
+
+    async fn sign_handoff(&self, mut handoff: Handoff, signer: &AgentId) -> Result<Handoff> {
+        let payload = handoff
+            .signing_payload_bytes()
+            .map_err(TrackerError::from)?;
+        let response = self
+            .signing
+            .client()?
+            .sign(HANDOFF_CONTEXT, &payload)
+            .await
+            .map_err(signing_error)?;
+        let envelope = envelope_from_sign_response(response, HANDOFF_CONTEXT, &payload, signer)?;
+        handoff.signature = Some(envelope);
+        Ok(handoff)
+    }
+
+    async fn filter_verified_issues(&self, issues: Vec<Issue>) -> Vec<Issue> {
+        if self.signing.policy == SigningPolicy::Disabled {
+            return issues;
+        }
+        let mut verified = Vec::with_capacity(issues.len());
+        for issue in issues {
+            if self.verify_issue(&issue).await {
+                verified.push(issue);
+            }
+        }
+        verified
+    }
+
+    async fn verify_issue(&self, issue: &Issue) -> bool {
+        if let Err(error) = self.verify_issue_result(issue).await {
+            warn!(issue_id = %issue.id, error = %error, "dropping issue with invalid signature");
+            false
+        } else {
+            true
+        }
+    }
+
+    async fn verify_issue_result(&self, issue: &Issue) -> Result<()> {
+        if let Some(claim) = &issue.claim {
+            self.verify_claim(issue, claim).await?;
+        }
+        if let Some(handoff) = &issue.handoff {
+            self.verify_handoff(issue, handoff).await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_claim(&self, issue: &Issue, claim: &Claim) -> Result<()> {
+        if claim.issue_id.as_ref() != Some(&issue.id) {
+            return Err(TrackerError::Signing(format!(
+                "claim issue_id does not match parent issue {}",
+                issue.id
+            )));
+        }
+        let envelope = claim.signature.as_ref().ok_or_else(|| {
+            TrackerError::Signing(format!("claim for issue {} is unsigned", issue.id))
+        })?;
+        if envelope.signer_agent_id != claim.by.to_string() {
+            return Err(TrackerError::Signing(format!(
+                "claim owner {} does not match signer {}",
+                claim.by, envelope.signer_agent_id
+            )));
+        }
+        let payload = claim.signing_payload_bytes().map_err(TrackerError::from)?;
+        self.verify_envelope(envelope, CLAIM_CONTEXT, &payload)
+            .await
+    }
+
+    async fn verify_handoff(&self, issue: &Issue, handoff: &Handoff) -> Result<()> {
+        let envelope = handoff.signature.as_ref().ok_or_else(|| {
+            TrackerError::Signing(format!("handoff for issue {} is unsigned", issue.id))
+        })?;
+        if handoff.issue_id.as_ref() != Some(&issue.id) {
+            return Err(TrackerError::Signing(format!(
+                "handoff issue_id does not match parent issue {}",
+                issue.id
+            )));
+        }
+        let signer_agent_id = handoff.signer_agent_id.as_ref().ok_or_else(|| {
+            TrackerError::Signing(format!(
+                "handoff for issue {} is missing signer_agent_id",
+                issue.id
+            ))
+        })?;
+        if signer_agent_id != &envelope.signer_agent_id {
+            return Err(TrackerError::Signing(format!(
+                "handoff signer binding {signer_agent_id} does not match envelope signer {}",
+                envelope.signer_agent_id
+            )));
+        }
+        let payload = handoff
+            .signing_payload_bytes()
+            .map_err(TrackerError::from)?;
+        self.verify_envelope(envelope, HANDOFF_CONTEXT, &payload)
+            .await
+    }
+
+    async fn verify_envelope(
+        &self,
+        envelope: &SignatureEnvelope,
+        target_context: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        if envelope.algorithm != SIGN_ALGORITHM {
+            return Err(TrackerError::Signing(format!(
+                "unsupported signing algorithm {}",
+                envelope.algorithm
+            )));
+        }
+        if envelope.context != target_context {
+            return Err(TrackerError::Signing(format!(
+                "signature context {} does not match {target_context}",
+                envelope.context
+            )));
+        }
+        let actual_digest = sha256_hex(payload);
+        if envelope.payload_sha256 != actual_digest {
+            return Err(TrackerError::Signing(format!(
+                "payload digest {} does not match {actual_digest}",
+                envelope.payload_sha256
+            )));
+        }
+        let envelope_key = BASE64
+            .decode(&envelope.public_key_b64)
+            .map_err(|source| TrackerError::Signing(format!("invalid public_key_b64: {source}")))?;
+        let trusted_key = self
+            .signing
+            .resolver()?
+            .resolve(&envelope.signer_agent_id)
+            .await
+            .map_err(signing_error)?;
+        if envelope_key != trusted_key {
+            return Err(TrackerError::Signing(format!(
+                "envelope public key does not belong to signer {}",
+                envelope.signer_agent_id
+            )));
+        }
+        let signature = BASE64
+            .decode(&envelope.signature_b64)
+            .map_err(|source| TrackerError::Signing(format!("invalid signature_b64: {source}")))?;
+        // Send raw claim/handoff payload bytes. x0xd reconstructs the external
+        // DST internally for both /agent/sign and /agent/verify.
+        let valid = self
+            .signing
+            .client()?
+            .verify(target_context, payload, &signature, &envelope_key)
+            .await
+            .map_err(signing_error)?;
+        if valid {
+            Ok(())
+        } else {
+            Err(TrackerError::Signing(
+                "x0xd verify endpoint returned false".to_owned(),
+            ))
+        }
     }
 
     fn with_records_mutation<F>(&self, commit_message: &str, mutate: F) -> Result<()>
@@ -624,8 +929,8 @@ impl JsonlTracker {
         }
     }
 
-    fn ensure_mtime_unchanged(&self, expected: Option<SystemTime>) -> Result<()> {
-        if self.current_mtime()? == expected {
+    fn ensure_mtime_unchanged(&self, original_mtime: Option<SystemTime>) -> Result<()> {
+        if self.current_mtime()? == original_mtime {
             Ok(())
         } else {
             Err(TrackerError::ConcurrentModification {
@@ -819,10 +1124,10 @@ impl Tracker for JsonlTracker {
             .filter(|record| blockers_are_terminal(&record.issue, &records, &terminal_states))
             .map(|record| record.issue.clone())
             .collect::<Vec<_>>();
+        candidates = self.filter_verified_issues(candidates).await;
         candidates.sort_by(|left, right| {
-            left.priority
-                .unwrap_or(u8::MAX)
-                .cmp(&right.priority.unwrap_or(u8::MAX))
+            priority_sort_key(left)
+                .cmp(&priority_sort_key(right))
                 .then_with(|| left.id.cmp(&right.id))
         });
         Ok(candidates)
@@ -836,11 +1141,18 @@ impl Tracker for JsonlTracker {
                 issues.push(record.issue.clone());
             }
         }
-        Ok(issues)
+        Ok(self.filter_verified_issues(issues).await)
     }
 
     async fn claim(&self, id: &IssueId, agent_id: &AgentId) -> CoreResult<Claim> {
-        self.claim_issue(id, agent_id).map_err(SymphonyError::from)
+        if self.signing.policy == SigningPolicy::Disabled {
+            return self.claim_issue(id, agent_id).map_err(SymphonyError::from);
+        }
+        let claim = self
+            .prepare_claim(id, agent_id)
+            .map_err(SymphonyError::from)?;
+        let signed = self.sign_claim(claim).await.map_err(SymphonyError::from)?;
+        self.commit_claim(id, signed).map_err(SymphonyError::from)
     }
 
     async fn heartbeat(&self, claim: &Claim) -> CoreResult<()> {
@@ -853,7 +1165,20 @@ impl Tracker for JsonlTracker {
     }
 
     async fn handoff(&self, claim: &Claim, handoff: Handoff) -> CoreResult<()> {
-        self.handoff_claim(claim, handoff)
+        if self.signing.policy == SigningPolicy::Disabled {
+            return self
+                .handoff_claim(claim, handoff)
+                .map_err(SymphonyError::from);
+        }
+        let id = claim_issue_id(claim).map_err(SymphonyError::from)?;
+        let prepared = self
+            .prepare_handoff(claim, handoff)
+            .map_err(SymphonyError::from)?;
+        let signed = self
+            .sign_handoff(prepared, &claim.by)
+            .await
+            .map_err(SymphonyError::from)?;
+        self.commit_handoff(&id, claim, signed)
             .map_err(SymphonyError::from)
     }
 
@@ -872,8 +1197,9 @@ impl Tracker for JsonlTracker {
                         .is_some_and(|claim| &claim.by == agent)
                 })
             })
-            .map(|record| record.issue.clone());
-        Ok(claimed.collect())
+            .map(|record| record.issue.clone())
+            .collect::<Vec<_>>();
+        Ok(self.filter_verified_issues(claimed).await)
     }
 
     async fn block(&self, claim: &Claim, reason: ReleaseReason) -> CoreResult<()> {
@@ -959,6 +1285,13 @@ fn issue_state_is_active(issue: &Issue, ctx: &PollContext) -> bool {
     ctx.active_states.iter().any(|state| state == &issue.state)
 }
 
+const fn priority_sort_key(issue: &Issue) -> u8 {
+    match issue.priority {
+        Some(priority) => priority,
+        None => u8::MAX,
+    }
+}
+
 fn blockers_are_terminal(
     issue: &Issue,
     records: &LoadedRecords,
@@ -980,6 +1313,22 @@ fn claim_issue_id(claim: &Claim) -> Result<IssueId> {
         })
 }
 
+fn ensure_issue_claimable(issue: &Issue, id: &IssueId) -> Result<()> {
+    if issue.claim.is_some() {
+        return Err(TrackerError::ClaimRejected {
+            id: id.clone(),
+            reason: "issue already has an active claim".to_owned(),
+        });
+    }
+    if issue.state.as_str() != "todo" {
+        return Err(TrackerError::ClaimRejected {
+            id: id.clone(),
+            reason: format!("state is {}", issue.state.as_str()),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_claim_owner(issue: &Issue, claim: &Claim) -> Result<()> {
     let Some(current) = issue.claim.as_ref() else {
         return Err(TrackerError::InvalidClaim {
@@ -996,6 +1345,64 @@ fn ensure_claim_owner(issue: &Issue, claim: &Claim) -> Result<()> {
             ),
         })
     }
+}
+
+fn validate_signed_handoff_bindings(id: &IssueId, claim: &Claim, handoff: &Handoff) -> Result<()> {
+    if handoff.signature.is_none() {
+        return Ok(());
+    }
+    if handoff.issue_id.as_ref() != Some(id) {
+        return Err(TrackerError::InvalidClaim {
+            reason: format!("signed handoff is not bound to issue {id}"),
+        });
+    }
+    if handoff.signer_agent_id.as_deref() != Some(claim.by.as_str()) {
+        return Err(TrackerError::InvalidClaim {
+            reason: format!(
+                "signed handoff signer does not match claim owner {}",
+                claim.by
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn envelope_from_sign_response(
+    response: SignResponse,
+    target_context: &str,
+    payload: &[u8],
+    target_signer: &AgentId,
+) -> Result<SignatureEnvelope> {
+    if response.algorithm != SIGN_ALGORITHM {
+        return Err(TrackerError::Signing(format!(
+            "sign response algorithm {} did not match {SIGN_ALGORITHM}",
+            response.algorithm
+        )));
+    }
+    if response.context != target_context {
+        return Err(TrackerError::Signing(format!(
+            "sign response context {} did not match {target_context}",
+            response.context
+        )));
+    }
+    if response.agent_id != target_signer.to_string() {
+        return Err(TrackerError::Signing(format!(
+            "sign response agent {} did not match claim owner {}",
+            response.agent_id, target_signer
+        )));
+    }
+    Ok(SignatureEnvelope::new(
+        response.algorithm,
+        response.context,
+        response.public_key_b64,
+        response.signature_b64,
+        sha256_hex(payload),
+        response.agent_id,
+    ))
+}
+
+fn signing_error(error: impl std::fmt::Display) -> TrackerError {
+    TrackerError::Signing(error.to_string())
 }
 
 fn now_utc() -> String {
@@ -1042,12 +1449,15 @@ impl LoadedRecords {
     }
 
     fn next_issue_id(&self) -> Result<IssueId> {
-        let max_suffix = self
+        let mut max_suffix = 0;
+        if let Some(value) = self
             .records
             .iter()
             .filter_map(|record| parse_xsy_suffix(record.issue.id.as_str()))
             .max()
-            .unwrap_or(0);
+        {
+            max_suffix = value;
+        }
         let next = max_suffix.saturating_add(1);
         IssueId::new(format!("XSY-{next:04}")).map_err(TrackerError::from)
     }

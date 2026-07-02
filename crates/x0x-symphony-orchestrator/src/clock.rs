@@ -52,7 +52,10 @@ impl ManualClock {
     /// Advance the clock by `duration`.
     pub fn advance(&self, duration: chrono::Duration) {
         if let Ok(mut current) = self.current.lock() {
-            *current = (*current).checked_add_signed(duration).unwrap_or(*current);
+            *current = match (*current).checked_add_signed(duration) {
+                Some(advanced) => advanced,
+                None => *current,
+            };
         }
     }
 

@@ -153,7 +153,7 @@ impl Output {
 ///
 /// # Errors
 ///
-/// Returns [`enum@Error`] for daemon client errors and unexpected config show errors.
+/// Returns [`enum@Error`] for daemon client errors and surprising config show errors.
 pub async fn run(command_line: CommandLine) -> Result<Output> {
     match &command_line.command {
         Commands::Config { command } => run_config(command),

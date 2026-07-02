@@ -115,9 +115,10 @@ impl Options {
         let token = if let Some(token) = self.token {
             token
         } else {
-            let token_file = self
-                .token_file
-                .unwrap_or_else(|| auth::api_token_path(&data_dir));
+            let token_file = match self.token_file {
+                Some(path) => path,
+                None => auth::api_token_path(&data_dir),
+            };
             auth::read_api_token(&token_file).await?
         };
         SymphonyClient::new(&server, token)

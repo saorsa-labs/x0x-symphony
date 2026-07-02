@@ -5,19 +5,27 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
+    sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
 
+use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use proptest::{prelude::*, test_runner::TestCaseError};
 use serde_json::{Map, Value};
 use tempfile::TempDir;
 use x0x_symphony_core::{
-    AgentId, Claim, Handoff, Issue, IssueId, IssueRef, IssueState, PollContext, ReleaseReason,
-    ReleaseReasonCode, Shard, ShardRole, Tracker, ValidationResult, ValidationStatus,
+    sha256_hex, AgentId, Claim, Handoff, Issue, IssueId, IssueRef, IssueState, PollContext,
+    ReleaseReason, ReleaseReasonCode, Shard, ShardRole, SignatureEnvelope, Tracker,
+    ValidationResult, ValidationStatus, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_tracker_git_jsonl::{
-    parse_issue_line, serialize_issue, IssueDraft, JsonlTracker, TrackerError,
+    parse_issue_line, serialize_issue,
+    signing::{
+        AgentInfo, SignResponse, SigningClient, SigningError, SigningPolicy, TrustedKeyResolver,
+    },
+    IssueDraft, JsonlTracker, TrackerError,
 };
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -281,6 +289,690 @@ fn canned_v1_fixture_is_byte_stable() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn required_policy_signs_and_verifies_claims() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Signed claim")?)?;
+    let agent = AgentId::new(SIGNER)?;
+
+    let claim = tracker.claim(&issue.id, &agent).await?;
+    let envelope = claim.signature.as_ref().ok_or("missing claim signature")?;
+    assert_eq!(envelope.algorithm, SIGN_ALGORITHM);
+    assert_eq!(envelope.context, CLAIM_CONTEXT);
+    assert_eq!(envelope.signer_agent_id, SIGNER);
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert_eq!(fetched.len(), 1);
+    assert!(fetched[0]
+        .claim
+        .as_ref()
+        .and_then(|c| c.signature.as_ref())
+        .is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_policy_signs_and_verifies_handoffs_with_bindings() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Signed handoff")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let claim = tracker.claim(&issue.id, &agent).await?;
+
+    tracker
+        .handoff(&claim, Handoff::new("ready").with_file("src/lib.rs"))
+        .await?;
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert_eq!(fetched.len(), 1);
+    let handoff = fetched[0].handoff.as_ref().ok_or("missing handoff")?;
+    assert_eq!(handoff.issue_id.as_ref(), Some(&issue.id));
+    assert_eq!(handoff.signer_agent_id.as_deref(), Some(SIGNER));
+    assert_eq!(
+        handoff.signature.as_ref().map(|sig| sig.context.as_str()),
+        Some(HANDOFF_CONTEXT)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_policy_allows_unsigned_claims() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = JsonlTracker::new(repo.path());
+    let issue = tracker.create_issue(IssueDraft::new("Unsigned local dev")?)?;
+    let agent = AgentId::new("local-dev")?;
+    let claim = tracker.claim(&issue.id, &agent).await?;
+    assert!(claim.signature.is_none());
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert_eq!(fetched.len(), 1);
+    assert!(fetched[0].claim.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_policy_drops_unsigned_claims() -> TestResult {
+    let repo = init_plain()?;
+    let unsigned = JsonlTracker::new(repo.path());
+    let issue = unsigned.create_issue(IssueDraft::new("Unsigned claim")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = unsigned.claim(&issue.id, &agent).await?;
+
+    let required = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let fetched = required
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn heartbeat_refresh_preserves_claim_signature() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Heartbeat")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let claim = tracker.claim(&issue.id, &agent).await?;
+    let before_signature = claim.signature.clone();
+    let before_payload = claim.signing_payload_bytes()?;
+
+    tracker.heartbeat(&claim).await?;
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    let refreshed = fetched
+        .first()
+        .and_then(|issue| issue.claim.as_ref())
+        .ok_or("missing refreshed claim")?;
+    assert_eq!(refreshed.signature, before_signature);
+    assert_ne!(refreshed.heartbeat_at, claim.heartbeat_at);
+    assert_eq!(refreshed.signing_payload_bytes()?, before_payload);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_context_cross_replay_from_claim_to_handoff() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Cross replay")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let claim = tracker.claim(&issue.id, &agent).await?;
+    let claim_signature = claim.signature.clone().ok_or("missing claim signature")?;
+
+    let mut tampered = tracker.load_issues()?.remove(0);
+    tampered.claim = None;
+    tampered.state = IssueState::new("review")?;
+    let mut handoff = Handoff::new("bad replay")
+        .with_issue_id(issue.id.clone())
+        .with_signer_agent_id(SIGNER);
+    handoff.signature = Some(claim_signature);
+    tampered.handoff = Some(handoff);
+    write_single_issue(repo.path(), &tampered)?;
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_payload_substitution() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue_a = tracker.create_issue(IssueDraft::new("Payload A")?)?;
+    let issue_b = tracker.create_issue(IssueDraft::new("Payload B")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let claim_a = tracker.claim(&issue_a.id, &agent).await?;
+    let mut claim_b = Claim::new(
+        Some(issue_b.id.clone()),
+        agent,
+        "2026-07-02T01:00:00Z",
+        ShardRole::ManualM1,
+    );
+    claim_b.signature = claim_a.signature;
+
+    let mut issues = tracker.load_issues()?;
+    let target = issues
+        .iter_mut()
+        .find(|issue| issue.id == issue_b.id)
+        .ok_or("issue B missing")?;
+    target.state = IssueState::new("in_progress")?;
+    target.claim = Some(claim_b);
+    write_issues(repo.path(), &issues)?;
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue_b.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_envelope_public_key_swap_even_when_verify_would_pass() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Key swap")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = tracker.claim(&issue.id, &agent).await?;
+
+    let mut tampered = tracker.load_issues()?.remove(0);
+    let claim = tampered.claim.as_mut().ok_or("missing claim")?;
+    let envelope = claim.signature.as_mut().ok_or("missing signature")?;
+    envelope.public_key_b64 = BASE64.encode(OTHER_KEY);
+    write_single_issue(repo.path(), &tampered)?;
+
+    let verifier = MockSigningClient {
+        verify_always_true: true,
+        ..MockSigningClient::default()
+    };
+    let verifying_tracker = signed_tracker(repo.path(), verifier, trusted_resolver());
+    let fetched = verifying_tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_truncated_and_extended_payload_digests() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Digest attack")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = tracker.claim(&issue.id, &agent).await?;
+
+    let mut truncated = tracker.load_issues()?.remove(0);
+    let claim = truncated.claim.as_mut().ok_or("missing claim")?;
+    let payload = claim.signing_payload_bytes()?;
+    let envelope = claim.signature.as_mut().ok_or("missing signature")?;
+    envelope.payload_sha256 = sha256_hex(&payload[..payload.len().saturating_sub(1)]);
+    write_single_issue(repo.path(), &truncated)?;
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+
+    let mut extended = truncated;
+    let claim = extended.claim.as_mut().ok_or("missing claim")?;
+    let mut extended_payload = claim.signing_payload_bytes()?;
+    extended_payload.extend_from_slice(b"extra");
+    let envelope = claim.signature.as_mut().ok_or("missing signature")?;
+    envelope.payload_sha256 = sha256_hex(&extended_payload);
+    write_single_issue(repo.path(), &extended)?;
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_algorithm_downgrade_and_null() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Algorithm")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = tracker.claim(&issue.id, &agent).await?;
+
+    let mut downgraded = tracker.load_issues()?.remove(0);
+    downgraded
+        .claim
+        .as_mut()
+        .and_then(|claim| claim.signature.as_mut())
+        .ok_or("missing signature")?
+        .algorithm = "x0x.agent-sign.v1.ml-dsa-65".to_owned();
+    write_single_issue(repo.path(), &downgraded)?;
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+
+    let mut value = serde_json::to_value(&downgraded)?;
+    value["claim"]["signature"]["algorithm"] = Value::Null;
+    fs::write(
+        repo.path().join("issues").join("issues.jsonl"),
+        format!("{}\n", serde_json::to_string(&value)?),
+    )?;
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_handoff_replay_across_issue_ids() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue_a = tracker.create_issue(IssueDraft::new("Handoff A")?)?;
+    let issue_b = tracker.create_issue(IssueDraft::new("Handoff B")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let claim_a = tracker.claim(&issue_a.id, &agent).await?;
+    tracker.handoff(&claim_a, Handoff::new("ready A")).await?;
+    let handoff_a = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue_a.id))
+        .await?
+        .remove(0)
+        .handoff
+        .ok_or("missing handoff A")?;
+
+    let mut issues = tracker.load_issues()?;
+    let target = issues
+        .iter_mut()
+        .find(|issue| issue.id == issue_b.id)
+        .ok_or("issue B missing")?;
+    target.state = IssueState::new("review")?;
+    target.handoff = Some(handoff_a);
+    write_issues(repo.path(), &issues)?;
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue_b.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_signer_claim_owner_mismatch() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Owner mismatch")?)?;
+    let other = AgentId::new("agent-b")?;
+    let mut claim = Claim::new(
+        Some(issue.id.clone()),
+        other,
+        "2026-07-02T01:00:00Z",
+        ShardRole::ManualM1,
+    );
+    let payload = claim.signing_payload_bytes()?;
+    claim.signature = Some(SignatureEnvelope::new(
+        SIGN_ALGORITHM,
+        CLAIM_CONTEXT,
+        BASE64.encode(TRUSTED_KEY),
+        BASE64.encode(b"synthetic"),
+        sha256_hex(&payload),
+        SIGNER,
+    ));
+
+    let mut tampered = tracker.load_issues()?.remove(0);
+    tampered.state = IssueState::new("in_progress")?;
+    tampered.claim = Some(claim);
+    write_single_issue(repo.path(), &tampered)?;
+
+    let verifier = MockSigningClient {
+        verify_always_true: true,
+        ..MockSigningClient::default()
+    };
+    let verifying_tracker = signed_tracker(repo.path(), verifier, trusted_resolver());
+    let fetched = verifying_tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_invalid_base64_in_envelope() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Invalid b64")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = tracker.claim(&issue.id, &agent).await?;
+
+    let mut tampered = tracker.load_issues()?.remove(0);
+    tampered
+        .claim
+        .as_mut()
+        .and_then(|claim| claim.signature.as_mut())
+        .ok_or("missing signature")?
+        .public_key_b64 = "not%%%base64".to_owned();
+    write_single_issue(repo.path(), &tampered)?;
+
+    let fetched = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_payload_fails_required_signing_without_partial_write() -> TestResult {
+    let repo = init_plain()?;
+    let tracker = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = tracker.create_issue(IssueDraft::new("Oversized")?)?;
+    let large_agent = AgentId::new(format!("agent-{}", "x".repeat(70_000)))?;
+
+    let error = tracker
+        .claim(&issue.id, &large_agent)
+        .await
+        .err()
+        .ok_or("oversized claim unexpectedly succeeded")?;
+    assert!(error.to_string().contains("maximum signable size"));
+    let loaded = tracker.load_issues()?;
+    assert_eq!(loaded[0].state, IssueState::new("todo")?);
+    assert!(loaded[0].claim.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn x0xd_unavailable_fails_required_but_disabled_still_writes() -> TestResult {
+    let required_repo = init_plain()?;
+    let failing = MockSigningClient {
+        fail_sign: true,
+        ..MockSigningClient::default()
+    };
+    let required = signed_tracker(required_repo.path(), failing, trusted_resolver());
+    let required_issue = required.create_issue(IssueDraft::new("Required failure")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    assert!(required.claim(&required_issue.id, &agent).await.is_err());
+    assert!(required.load_issues()?[0].claim.is_none());
+
+    let disabled_repo = init_plain()?;
+    let disabled = JsonlTracker::new(disabled_repo.path());
+    let disabled_issue = disabled.create_issue(IssueDraft::new("Disabled succeeds")?)?;
+    let claim = disabled.claim(&disabled_issue.id, &agent).await?;
+    assert!(claim.signature.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn verify_endpoint_false_drops_record() -> TestResult {
+    let repo = init_plain()?;
+    let signer = signed_tracker(
+        repo.path(),
+        MockSigningClient::default(),
+        trusted_resolver(),
+    );
+    let issue = signer.create_issue(IssueDraft::new("Verify false")?)?;
+    let agent = AgentId::new(SIGNER)?;
+    let _claim = signer.claim(&issue.id, &agent).await?;
+
+    let verifier = MockSigningClient {
+        verify_false: true,
+        ..MockSigningClient::default()
+    };
+    let verifying_tracker = signed_tracker(repo.path(), verifier, trusted_resolver());
+    let fetched = verifying_tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
+    assert!(fetched.is_empty());
+    Ok(())
+}
+
+#[test]
+fn signing_payload_bytes_are_stable_and_digest_matches() -> TestResult {
+    let agent = AgentId::new(SIGNER)?;
+    let claim = Claim::new(
+        Some(IssueId::new("XSY-9000")?),
+        agent,
+        "2026-07-02T01:00:00Z",
+        ShardRole::ManualM1,
+    );
+    assert_eq!(
+        claim.signing_payload_bytes()?,
+        claim.signing_payload_bytes()?
+    );
+    assert_eq!(
+        claim.signing_payload_sha256()?,
+        sha256_hex(&claim.signing_payload_bytes()?)
+    );
+
+    let mut signed = claim.clone();
+    signed.signature = Some(SignatureEnvelope::new(
+        SIGN_ALGORITHM,
+        CLAIM_CONTEXT,
+        BASE64.encode(TRUSTED_KEY),
+        BASE64.encode(b"synthetic"),
+        claim.signing_payload_sha256()?,
+        SIGNER,
+    ));
+    assert_eq!(
+        signed.signing_payload_bytes()?,
+        claim.signing_payload_bytes()?
+    );
+    assert_eq!(
+        claim
+            .clone()
+            .with_heartbeat("2026-07-02T02:00:00Z")
+            .signing_payload_bytes()?,
+        claim.signing_payload_bytes()?
+    );
+
+    let handoff = Handoff::new("ready");
+    let with_absent_optional_fields = Handoff {
+        summary: "ready".to_owned(),
+        files_changed: Vec::new(),
+        validation: Vec::new(),
+        follow_up: Vec::new(),
+        proofs_dir: None,
+        issue_id: None,
+        signer_agent_id: None,
+        signature: None,
+    };
+    assert_eq!(
+        handoff.signing_payload_bytes()?,
+        with_absent_optional_fields.signing_payload_bytes()?
+    );
+    Ok(())
+}
+
+const SIGNER: &str = "agent-a";
+const TRUSTED_KEY: &[u8] = b"trusted-key-a";
+const OTHER_KEY: &[u8] = b"trusted-key-b";
+
+#[derive(Clone)]
+struct MockSigningClient {
+    signer_agent_id: String,
+    public_key: Vec<u8>,
+    fail_sign: bool,
+    verify_false: bool,
+    verify_always_true: bool,
+    max_payload: usize,
+}
+
+impl Default for MockSigningClient {
+    fn default() -> Self {
+        Self {
+            signer_agent_id: SIGNER.to_owned(),
+            public_key: TRUSTED_KEY.to_vec(),
+            fail_sign: false,
+            verify_false: false,
+            verify_always_true: false,
+            max_payload: 64 * 1024,
+        }
+    }
+}
+
+#[async_trait]
+impl SigningClient for MockSigningClient {
+    async fn sign(
+        &self,
+        context: &str,
+        payload: &[u8],
+    ) -> x0x_symphony_tracker_git_jsonl::signing::Result<SignResponse> {
+        if self.fail_sign {
+            return Err(SigningError::InvalidResponse(
+                "signing unavailable".to_owned(),
+            ));
+        }
+        if payload.len() > self.max_payload {
+            return Err(SigningError::PayloadTooLarge {
+                max: self.max_payload,
+                actual: payload.len(),
+            });
+        }
+        Ok(SignResponse {
+            agent_id: self.signer_agent_id.clone(),
+            public_key_b64: BASE64.encode(&self.public_key),
+            signature_b64: BASE64.encode(fake_signature(context, payload, &self.public_key)),
+            algorithm: SIGN_ALGORITHM.to_owned(),
+            context: context.to_owned(),
+        })
+    }
+
+    async fn verify(
+        &self,
+        context: &str,
+        payload: &[u8],
+        signature: &[u8],
+        public_key: &[u8],
+    ) -> x0x_symphony_tracker_git_jsonl::signing::Result<bool> {
+        if self.verify_always_true {
+            return Ok(true);
+        }
+        if self.verify_false {
+            return Ok(false);
+        }
+        Ok(signature == fake_signature(context, payload, public_key))
+    }
+
+    async fn agent_identity(&self) -> x0x_symphony_tracker_git_jsonl::signing::Result<AgentInfo> {
+        Ok(AgentInfo {
+            agent_id: self.signer_agent_id.clone(),
+        })
+    }
+}
+
+struct MockResolver {
+    agent_id: String,
+    public_key: Vec<u8>,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl TrustedKeyResolver for MockResolver {
+    async fn resolve(
+        &self,
+        agent_id: &str,
+    ) -> x0x_symphony_tracker_git_jsonl::signing::Result<Vec<u8>> {
+        let mut calls = self
+            .calls
+            .lock()
+            .map_err(|_| SigningError::UntrustedKey("resolver lock poisoned".to_owned()))?;
+        *calls = calls.saturating_add(1);
+        if agent_id == self.agent_id {
+            Ok(self.public_key.clone())
+        } else {
+            Err(SigningError::UntrustedKey(format!(
+                "agent {agent_id} is not trusted"
+            )))
+        }
+    }
+}
+
+fn trusted_resolver() -> Arc<dyn TrustedKeyResolver> {
+    Arc::new(MockResolver {
+        agent_id: SIGNER.to_owned(),
+        public_key: TRUSTED_KEY.to_vec(),
+        calls: Mutex::new(0),
+    })
+}
+
+fn signed_tracker(
+    repo: &Path,
+    client: MockSigningClient,
+    resolver: Arc<dyn TrustedKeyResolver>,
+) -> JsonlTracker {
+    JsonlTracker::builder(repo)
+        .signing(
+            SigningPolicy::Required,
+            Some(Arc::new(client)),
+            Some(resolver),
+        )
+        .build()
+}
+
+fn fake_signature(context: &str, payload: &[u8], public_key: &[u8]) -> Vec<u8> {
+    format!(
+        "{context}:{}:{}",
+        sha256_hex(payload),
+        BASE64.encode(public_key)
+    )
+    .into_bytes()
+}
+
+fn init_plain() -> TestResult<TempDir> {
+    let repo = TempDir::new()?;
+    fs::create_dir_all(repo.path().join("issues"))?;
+    fs::write(repo.path().join("issues").join("issues.jsonl"), "")?;
+    Ok(repo)
+}
+
+fn write_single_issue(repo: &Path, issue: &Issue) -> TestResult {
+    write_issues(repo, std::slice::from_ref(issue))
+}
+
+fn write_issues(repo: &Path, issues: &[Issue]) -> TestResult {
+    let mut content = String::new();
+    for issue in issues {
+        content.push_str(&serialize_issue(issue)?);
+        content.push('\n');
+    }
+    fs::write(repo.join("issues").join("issues.jsonl"), content)?;
+    Ok(())
+}
+
 fn init_repo() -> TestResult<TempDir> {
     let repo = TempDir::new()?;
     fs::create_dir_all(repo.path().join("issues"))?;
@@ -518,7 +1210,7 @@ fn claim_strategy() -> impl Strategy<Value = Claim> {
         timestamp_strategy(),
         timestamp_strategy(),
         shard_role_strategy(),
-        prop::option::of(non_empty_text_strategy()),
+        prop::option::of(signature_envelope_strategy()),
     )
         .prop_map(
             |(issue_id, by, at, heartbeat_at, shard_role, signature)| Claim {
@@ -539,14 +1231,57 @@ fn handoff_strategy() -> impl Strategy<Value = Handoff> {
         prop::collection::vec(validation_result_strategy(), 0..3),
         prop::collection::vec(text_strategy(), 0..3),
         prop::option::of(path_strategy()),
+        prop::option::of(issue_id_strategy()),
+        prop::option::of(non_empty_text_strategy()),
+        prop::option::of(signature_envelope_strategy()),
     )
         .prop_map(
-            |(summary, files_changed, validation, follow_up, proofs_dir)| Handoff {
+            |(
                 summary,
                 files_changed,
                 validation,
                 follow_up,
                 proofs_dir,
+                issue_id,
+                signer_agent_id,
+                signature,
+            )| Handoff {
+                summary,
+                files_changed,
+                validation,
+                follow_up,
+                proofs_dir,
+                issue_id,
+                signer_agent_id,
+                signature,
+            },
+        )
+}
+
+fn signature_envelope_strategy() -> impl Strategy<Value = SignatureEnvelope> {
+    (
+        prop::sample::select(vec![SIGN_ALGORITHM.to_owned()]),
+        prop::sample::select(vec![CLAIM_CONTEXT.to_owned(), HANDOFF_CONTEXT.to_owned()]),
+        non_empty_text_strategy(),
+        non_empty_text_strategy(),
+        "[0-9a-f]{64}",
+        non_empty_text_strategy(),
+    )
+        .prop_map(
+            |(
+                algorithm,
+                context,
+                public_key_b64,
+                signature_b64,
+                payload_sha256,
+                signer_agent_id,
+            )| SignatureEnvelope {
+                algorithm,
+                context,
+                public_key_b64,
+                signature_b64,
+                payload_sha256,
+                signer_agent_id,
             },
         )
 }
