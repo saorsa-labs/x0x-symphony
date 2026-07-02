@@ -9,7 +9,7 @@ populates it.
 | `operator.md` | M1 | Pending (XSY-0008) |
 | `runner-authoring.md` | M1 | Pending (XSY-0008) |
 | `x0x-tracker.md` | M3 | Pending |
-| `security.md` | M4 | Pending |
+| [`security.md`](security.md) | M1 (interim) | Present — interim posture (XSY-0038); extended at M4 by XSY-0027 |
 | `distributed-workers.md` | M4 | Pending |
 
 Until M1 lands, the architecture document
