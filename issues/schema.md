@@ -138,6 +138,19 @@ Same shape on x0x and x0x-symphony.
 validation artefacts (full stdout, stderr, runner traces, fmt diffs)
 are stored. Small status only lives inside `validation`.
 
+Proof artefact retention is configured outside issue records in
+`WORKFLOW.md` frontmatter. The optional maintenance block is:
+
+```yaml
+retention:
+  proofs_days: 30          # default; must be >= 1
+  reap_interval_secs: 3600 # default; must be >= 60
+```
+
+The daemon reaper deletes timestamped proof run directories older than
+`proofs_days`, but skips every directory whose issue is currently
+`in_progress`.
+
 When `handoff.signature` is present, `handoff.issue_id` and
 `handoff.signer_agent_id` are required and are part of the signed payload. They
 bind the handoff to one issue and one x0x signer so a valid handoff cannot be

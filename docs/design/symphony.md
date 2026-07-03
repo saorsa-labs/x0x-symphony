@@ -349,6 +349,8 @@ Required keys:
   `hooks.timeout_ms`
 - `agent.max_concurrent_agents`, `agent.max_concurrent_agents_by_state`,
   `agent.max_turns`, `agent.max_retry_backoff_ms`
+- `retention.proofs_days` (default 30, ≥ 1) and
+  `retention.reap_interval_secs` (default 3600, ≥ 60) for proof artefact cleanup.
 - `runner.kind` — `shell` (default), `codex`, `claude_code`. Plus
   runner-specific config blocks: `runner.shell.{...}`, `runner.codex.{...}`,
   `runner.claude_code.{...}`.

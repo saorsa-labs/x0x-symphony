@@ -24,6 +24,7 @@ pub mod dispatch;
 pub mod error;
 pub mod orphans;
 mod proofs;
+pub mod reaper;
 pub mod reconcile;
 pub mod retry;
 pub mod trust_gate;
@@ -54,12 +55,13 @@ pub enum DispatchEvent {
 
 pub use error::{Error, Result};
 pub use orphans::{OrphanSweepSummary, QuarantinedOrphan, RefusedOrphan};
+pub use reaper::{reap_old_proofs, ReapReport};
 pub use reconcile::{classify, is_fresh_self, parse_heartbeat, ClaimStance, ReconcileSummary};
 pub use retry::RetryPolicy;
 pub use trust_gate::{NetworkDispatchPolicy, TrustClient, TrustLevel, X0xdTrustClient};
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -108,6 +110,27 @@ pub struct Orchestrator<T, R, W> {
     shutdown_flag: AtomicBool,
 }
 
+const DEFAULT_PROOF_RETENTION_DAYS: u32 = 30;
+const DEFAULT_PROOF_REAP_INTERVAL: Duration = Duration::from_hours(1);
+
+/// Proof artefact retention settings used by the daemon reaper.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionPolicy {
+    /// Delete proof run directories older than this many days.
+    pub proofs_days: u32,
+    /// Interval between background proof reaper scans.
+    pub reap_interval: Duration,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            proofs_days: DEFAULT_PROOF_RETENTION_DAYS,
+            reap_interval: DEFAULT_PROOF_REAP_INTERVAL,
+        }
+    }
+}
+
 /// Immutable orchestrator configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -129,6 +152,8 @@ pub struct Config {
     pub hooks: LifecycleHooks,
     /// Root directory where dispatch proof artefacts are written.
     pub proofs_dir: PathBuf,
+    /// Proof artefact retention settings.
+    pub retention: RetentionPolicy,
     /// Validation commands recorded in successful handoffs.
     pub validation_commands: Vec<String>,
     /// Claim heartbeat TTL; a claim older than this is stale.
@@ -162,6 +187,7 @@ impl Config {
             retry: RetryPolicy::default(),
             hooks: LifecycleHooks::default(),
             proofs_dir: PathBuf::from("proofs"),
+            retention: RetentionPolicy::default(),
             validation_commands: Vec::new(),
             claim_ttl: chrono::Duration::minutes(30),
             required_trust: TrustLevel::Trusted,
@@ -203,6 +229,7 @@ pub struct ConfigBuilder {
     retry: RetryPolicy,
     hooks: LifecycleHooks,
     proofs_dir: PathBuf,
+    retention: RetentionPolicy,
     validation_commands: Vec<String>,
     claim_ttl: chrono::Duration,
     required_trust: TrustLevel,
@@ -259,6 +286,12 @@ impl ConfigBuilder {
     #[must_use]
     pub fn proofs_dir(mut self, proofs_dir: impl Into<PathBuf>) -> Self {
         self.proofs_dir = proofs_dir.into();
+        self
+    }
+    /// Override proof artefact retention settings.
+    #[must_use]
+    pub fn retention(mut self, retention: RetentionPolicy) -> Self {
+        self.retention = retention;
         self
     }
     /// Override validation commands recorded in successful handoffs.
@@ -320,6 +353,7 @@ impl ConfigBuilder {
             retry: self.retry,
             hooks: self.hooks,
             proofs_dir: self.proofs_dir,
+            retention: self.retention,
             validation_commands: self.validation_commands,
             claim_ttl: self.claim_ttl,
             required_trust: self.required_trust,
@@ -458,6 +492,21 @@ impl<T, R, W> Orchestrator<T, R, W> {
             return 0;
         };
         u32::try_from(state.in_flight.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Return the issue ids currently registered as in-flight by this daemon.
+    #[must_use]
+    pub fn in_flight_issue_ids(&self) -> BTreeSet<IssueId> {
+        let Ok(state) = self.state.lock() else {
+            return BTreeSet::new();
+        };
+        state.in_flight.keys().cloned().collect()
+    }
+
+    /// Return the configured proof retention policy.
+    #[must_use]
+    pub fn retention_policy(&self) -> RetentionPolicy {
+        self.config.retention
     }
 
     /// `true` once shutdown has been requested.

@@ -138,6 +138,67 @@ fn network_dispatch_defaults_off() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn retention_defaults_to_thirty_days_and_hourly_reaper() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_missing("none");
+
+    let config = WorkflowConfig::from_markdown(&workflow)?;
+    let orchestrator = config.to_orchestrator_config(AgentId::new("agent-a")?)?;
+
+    assert_eq!(config.retention.proofs_days, 30);
+    assert_eq!(config.retention.reap_interval_secs, 3_600);
+    assert_eq!(orchestrator.retention.proofs_days, 30);
+    assert_eq!(
+        orchestrator.retention.reap_interval,
+        Duration::from_hours(1)
+    );
+    Ok(())
+}
+
+#[test]
+fn retention_overrides_parse() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_with_retention("  proofs_days: 7\n  reap_interval_secs: 120\n");
+
+    let config = WorkflowConfig::from_markdown(&workflow)?;
+    let orchestrator = config.to_orchestrator_config(AgentId::new("agent-a")?)?;
+
+    assert_eq!(config.retention.proofs_days, 7);
+    assert_eq!(config.retention.reap_interval_secs, 120);
+    assert_eq!(orchestrator.retention.proofs_days, 7);
+    assert_eq!(orchestrator.retention.reap_interval, Duration::from_mins(2));
+    Ok(())
+}
+
+#[test]
+fn retention_proofs_days_rejects_zero() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_with_retention("  proofs_days: 0\n");
+
+    let problems = invalid_workflow_problems(&workflow)?;
+
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem == "retention.proofs_days must be >= 1"),
+        "problems were: {problems:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn retention_reap_interval_rejects_under_sixty_seconds() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_with_retention("  reap_interval_secs: 59\n");
+
+    let problems = invalid_workflow_problems(&workflow)?;
+
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem == "retention.reap_interval_secs must be >= 60"),
+        "problems were: {problems:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn workers_config_defaults_to_publish_enabled_with_sixty_second_ttl() -> Result<(), Box<dyn Error>>
 {
     let workflow = workflow_missing("none");
@@ -451,6 +512,13 @@ fn invalid_workflow_problems(workflow: &str) -> Result<Vec<String>, Box<dyn Erro
 
 fn workflow_with_security(security_body: &str) -> String {
     workflow_missing("none").replace("agent:\n", &format!("security:\n{security_body}\nagent:\n"))
+}
+
+fn workflow_with_retention(retention_body: &str) -> String {
+    workflow_missing("none").replace(
+        "agent:\n",
+        &format!("retention:\n{retention_body}\nagent:\n"),
+    )
 }
 
 fn workflow_with_legacy_codex_block() -> String {

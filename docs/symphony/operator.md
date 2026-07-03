@@ -88,6 +88,7 @@ non-zero on any missing/invalid key, printing one clear error per problem:
 | `workspace` | `root` (`~` expanded) |
 | `hooks` | `timeout_ms`; `after_create`, `before_run`, `after_run`, and `before_remove` are optional scripts (absent or empty = disabled) |
 | `agent` | `max_concurrent_agents`, `max_concurrent_agents_by_state`, `max_turns`, `max_retry_backoff_ms` |
+| `retention` | Optional proof reaper settings: `proofs_days` (default 30, ≥ 1) and `reap_interval_secs` (default 3600, ≥ 60) |
 | `runner` | `kind` (`shell`); the `runner:` block is then resolved by `RunnerSpec::from_workflow_config` (so `runner.preset` and optional `runner.sandbox` are accepted) |
 
 Minimal M3 tracker/signing configuration:
@@ -215,8 +216,11 @@ repository. The directory contains `stdout.log`, `stderr.log`, any
 | `ended_at` | string | RFC3339 UTC dispatch end timestamp. |
 | `hooks` | array of strings | Hook outcomes as `<hook>:<status>`, for example `before_run:succeeded`. |
 
-Proof directory cleanup is not implemented in M2; the retention reaper is an
-M5 follow-up.
+The daemon reaps timestamped proof run directories older than
+`retention.proofs_days` (default 30 days) every
+`retention.reap_interval_secs` (default 3600 seconds). Cleanup is
+maintenance-only and race-safe: any issue currently `in_progress` or registered
+as in-flight by the local daemon is skipped for that scan.
 
 ## Observability
 

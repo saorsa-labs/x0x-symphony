@@ -41,6 +41,13 @@ tracker:
 polling:
   interval_ms: 30000
 
+retention:
+  # Maintenance default: proof artefact cleanup is ON by default.
+  # Runs older than proofs_days are deleted unless their issue is in_progress.
+  proofs_days: 30
+  # Reaper scans at most hourly by default; minimum accepted value is 60.
+  reap_interval_secs: 3600
+
 workspace:
   # Each issue workspace contains:
   #   <root>/<issue>/x0x-symphony

@@ -13,12 +13,14 @@ use x0x_symphony_core::{
     shard, AgentId, IssueState, LifecycleHooks, SymphonyError, WorkflowDefinition,
 };
 use x0x_symphony_orchestrator::{
-    Config as OrchestratorConfig, NetworkDispatchPolicy, RetryPolicy, TrustLevel,
+    Config as OrchestratorConfig, NetworkDispatchPolicy, RetentionPolicy, RetryPolicy, TrustLevel,
 };
 use x0x_symphony_runner_shell::RunnerSpec;
 use x0x_symphony_signing::SigningPolicy;
 
 const LEGACY_CODEX_BLOCK_REMOVAL: &str = "`codex:` top-level block was removed in XSY-0031 and is no longer supported; use `runner: {kind: shell, preset: codex}` instead. See docs/symphony/operator.md#migrating-from-the-legacy-codex-block.";
+const DEFAULT_PROOFS_DAYS: u32 = 30;
+const DEFAULT_REAP_INTERVAL_SECS: u64 = 3_600;
 
 /// Result alias for workflow configuration operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -88,6 +90,8 @@ pub struct WorkflowConfig {
     pub agent: AgentConfig,
     /// Security policy for dispatch gates.
     pub security: SecurityConfig,
+    /// Proof artefact retention settings.
+    pub retention: RetentionConfig,
     /// Signing settings for claim and handoff payloads.
     pub signing: SigningConfig,
     /// Shard assignment settings.
@@ -184,6 +188,15 @@ pub struct SecurityConfig {
     pub approval_webhook_url: Option<String>,
 }
 
+/// Proof artefact retention configuration parsed from the optional `retention:` block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionConfig {
+    /// Delete proof run directories older than this many days.
+    pub proofs_days: u32,
+    /// Seconds between background proof reaper scans.
+    pub reap_interval_secs: u64,
+}
+
 /// Signing configuration parsed from the optional `signing:` block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SigningConfig {
@@ -270,6 +283,7 @@ impl WorkflowConfig {
         let validation = parse_validation(root, &mut problems);
         let agent = parse_agent(root, &mut problems);
         let security = parse_security(root, &mut problems);
+        let retention = parse_retention(root, &mut problems);
         let signing = parse_signing(root, &mut problems);
         let sharding = parse_sharding(root, &mut problems);
         let workers = parse_workers(root, &mut problems);
@@ -295,6 +309,7 @@ impl WorkflowConfig {
             validation: validation.ok_or_else(internal_validation_gap)?,
             agent: agent.ok_or_else(internal_validation_gap)?,
             security: security.ok_or_else(internal_validation_gap)?,
+            retention: retention.ok_or_else(internal_validation_gap)?,
             signing: signing.ok_or_else(internal_validation_gap)?,
             sharding: sharding.ok_or_else(internal_validation_gap)?,
             workers: workers.ok_or_else(internal_validation_gap)?,
@@ -343,6 +358,10 @@ impl WorkflowConfig {
             .validation_commands(self.validation.clone())
             .required_trust(self.security.required_trust)
             .network_dispatch(self.security.network_dispatch)
+            .retention(RetentionPolicy {
+                proofs_days: self.retention.proofs_days,
+                reap_interval: Duration::from_secs(self.retention.reap_interval_secs),
+            })
             .approval_ttl(self.security.approval_ttl)
             .approval_webhook_url(self.security.approval_webhook_url.clone())
             .build())
@@ -617,6 +636,30 @@ fn parse_duration_literal(raw: &str) -> std::result::Result<Duration, String> {
 
 const fn default_approval_ttl() -> Duration {
     Duration::from_hours(24)
+}
+
+fn parse_retention(
+    root: &Map<String, Value>,
+    problems: &mut Vec<String>,
+) -> Option<RetentionConfig> {
+    let Some(value) = root.get("retention") else {
+        return Some(RetentionConfig {
+            proofs_days: DEFAULT_PROOFS_DAYS,
+            reap_interval_secs: DEFAULT_REAP_INTERVAL_SECS,
+        });
+    };
+    let Some(retention) = value.as_object() else {
+        problems.push("retention must be a mapping".to_owned());
+        return None;
+    };
+    let proofs_days = optional_u32(retention, "retention.proofs_days", problems, 1)
+        .unwrap_or(DEFAULT_PROOFS_DAYS);
+    let reap_interval_secs = optional_u64(retention, "retention.reap_interval_secs", problems, 60)
+        .unwrap_or(DEFAULT_REAP_INTERVAL_SECS);
+    Some(RetentionConfig {
+        proofs_days,
+        reap_interval_secs,
+    })
 }
 
 fn parse_signing(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<SigningConfig> {
@@ -1019,6 +1062,21 @@ fn optional_u64(
             None
         }
         None => None,
+    }
+}
+
+fn optional_u32(
+    map: &Map<String, Value>,
+    path: &'static str,
+    problems: &mut Vec<String>,
+    min: u64,
+) -> Option<u32> {
+    let value = optional_u64(map, path, problems, min)?;
+    if let Ok(converted) = u32::try_from(value) {
+        Some(converted)
+    } else {
+        problems.push(format!("{path} must fit in u32"));
+        None
     }
 }
 
