@@ -2146,6 +2146,7 @@ name = "x0x-symphony-orchestrator"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "futures-util",
  "reqwest",
@@ -2156,6 +2157,7 @@ dependencies = [
  "tokio",
  "tracing",
  "x0x-symphony-core",
+ "x0x-symphony-signing",
  "x0x-symphony-workspace",
 ]
 

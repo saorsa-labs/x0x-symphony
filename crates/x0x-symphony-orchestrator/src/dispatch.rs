@@ -12,17 +12,20 @@
 
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tracing::warn;
 use x0x_symphony_core::{
     approval_decision, content_hash, sha256_hex, AgentId, ApprovalConsumed, ApprovalDecision,
-    Claim, Handoff, HookEnv, HookName, HookOutcome, HookStatus, Issue, IssueId, IssueSource,
-    Prompt, ReleaseReason, ReleaseReasonCode, Runner, SessionContext, SignatureEnvelope,
-    SignatureProvenance, Tracker, TurnStatus, ValidationResult, ValidationStatus, Workspace,
-    WorkspaceHandle, APPROVAL_CONSUMED_CONTEXT, SIGN_ALGORITHM,
+    ApprovalEvent, ApprovalState, ApprovalValidity, Claim, Handoff, HookEnv, HookName, HookOutcome,
+    HookStatus, Issue, IssueId, IssueSource, Prompt, ReleaseReason, ReleaseReasonCode, Runner,
+    SessionContext, SignatureEnvelope, SignatureProvenance, Tracker, TurnStatus, ValidationResult,
+    ValidationStatus, Workspace, WorkspaceHandle, APPROVAL_CONSUMED_CONTEXT, APPROVAL_CONTEXT,
+    SIGN_ALGORITHM,
 };
+use x0x_symphony_signing::{SigningClient, SigningError, TrustedKeyResolver, VerifyOutcome};
 
 use crate::{NetworkDispatchPolicy, TrustLevel};
 
@@ -158,6 +161,23 @@ enum DispatchGateOutcome {
     Blocked,
     /// The gate released the claim while waiting for signed approval.
     PendingApproval,
+}
+
+/// Cryptographic approval-signature verification result used by the gate.
+enum CryptoVerify {
+    /// The approval signature verified under the trusted approver key.
+    Valid,
+    /// The event is forged, malformed, or from an unknown approver.
+    Invalid,
+    /// Verification could not complete; dispatch must fail closed.
+    TransportError,
+}
+
+fn signing_error_is_transport(error: &SigningError) -> bool {
+    matches!(
+        error,
+        SigningError::Request { .. } | SigningError::Decode { .. } | SigningError::Http { .. }
+    )
 }
 
 /// Carries a runner session through `select!` so shutdown can preempt it.
@@ -733,13 +753,58 @@ where
             .clock
             .now()
             .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let effective_events = if let (Some(signing_client), Some(key_resolver)) =
+            (&self.signing_client, &self.key_resolver)
+        {
+            let mut kept = Vec::new();
+            for event in &state.events {
+                if event.is_valid(
+                    issue,
+                    signer,
+                    &now,
+                    self.config.approval_ttl,
+                    &state.consumed,
+                ) != ApprovalValidity::Valid
+                {
+                    continue;
+                }
+                match self
+                    .verify_approval_signature(
+                        signing_client.as_ref(),
+                        key_resolver.as_ref(),
+                        event,
+                    )
+                    .await
+                {
+                    CryptoVerify::Valid => kept.push(event.clone()),
+                    CryptoVerify::Invalid => {}
+                    CryptoVerify::TransportError => {
+                        self.block_for_dispatch_refusal(
+                            guard,
+                            claim,
+                            ReleaseReasonCode::VerifyTransportError,
+                            "approval signature verification transport failed".to_owned(),
+                        )
+                        .await?;
+                        return Ok(DispatchGateOutcome::PendingApproval);
+                    }
+                }
+            }
+            kept
+        } else {
+            state.events.clone()
+        };
+        let effective_state = ApprovalState {
+            events: effective_events,
+            consumed: state.consumed.clone(),
+        };
         match approval_decision(
-            &state.events,
+            &effective_state.events,
             issue,
             signer,
             &now,
             self.config.approval_ttl,
-            &state.consumed,
+            &effective_state.consumed,
         ) {
             ApprovalDecision::Approved => {
                 let consumed = self.approval_consumed_event(issue, signer, &now)?;
@@ -770,6 +835,42 @@ where
                 .await?;
                 Ok(DispatchGateOutcome::PendingApproval)
             }
+        }
+    }
+
+    async fn verify_approval_signature(
+        &self,
+        signing_client: &dyn SigningClient,
+        key_resolver: &dyn TrustedKeyResolver,
+        event: &ApprovalEvent,
+    ) -> CryptoVerify {
+        let public_key = match key_resolver.resolve(event.approver_agent_id.as_str()).await {
+            Ok(public_key) => public_key,
+            Err(source) if signing_error_is_transport(&source) => {
+                return CryptoVerify::TransportError;
+            }
+            Err(_source) => return CryptoVerify::Invalid,
+        };
+        let payload = match event.signing_payload_bytes() {
+            Ok(payload) => payload,
+            Err(_source) => return CryptoVerify::Invalid,
+        };
+        let Some(signature) = &event.signature else {
+            return CryptoVerify::Invalid;
+        };
+        let signature_bytes = match BASE64.decode(&signature.signature_b64) {
+            Ok(signature_bytes) => signature_bytes,
+            Err(_source) => return CryptoVerify::Invalid,
+        };
+        match signing_client
+            .verify(APPROVAL_CONTEXT, &payload, &signature_bytes, &public_key)
+            .await
+        {
+            Ok(VerifyOutcome::Valid) => CryptoVerify::Valid,
+            Ok(VerifyOutcome::Invalid(_reason)) => CryptoVerify::Invalid,
+            Ok(VerifyOutcome::TransportError(_reason)) => CryptoVerify::TransportError,
+            Err(source) if signing_error_is_transport(&source) => CryptoVerify::TransportError,
+            Err(_source) => CryptoVerify::Invalid,
         }
     }
 

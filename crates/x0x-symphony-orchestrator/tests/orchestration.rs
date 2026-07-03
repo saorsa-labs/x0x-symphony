@@ -19,6 +19,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Utc};
 use futures_util::stream;
 use tempfile::TempDir;
@@ -34,6 +35,9 @@ use x0x_symphony_core::{
 use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
     NetworkDispatchPolicy, Orchestrator, SystemClock, TrustClient, TrustLevel,
+};
+use x0x_symphony_signing::{
+    AgentInfo, SignResponse, SigningClient, SigningError, TrustedKeyResolver, VerifyOutcome,
 };
 use x0x_symphony_workspace::{Config as WorkspaceConfig, Manager};
 
@@ -583,6 +587,102 @@ impl TrustClient for MockTrustClient {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MockVerifyCall {
+    context: String,
+    payload: Vec<u8>,
+    signature: Vec<u8>,
+    public_key: Vec<u8>,
+}
+
+#[derive(Default)]
+struct MockApprovalCrypto {
+    keys: Mutex<BTreeMap<String, Vec<u8>>>,
+    outcomes: Mutex<BTreeMap<Vec<u8>, VerifyOutcome>>,
+    verify_calls: Mutex<Vec<MockVerifyCall>>,
+}
+
+impl MockApprovalCrypto {
+    fn with_key(agent_id: &str, public_key: &[u8]) -> Self {
+        let mut keys = BTreeMap::new();
+        keys.insert(agent_id.to_owned(), public_key.to_vec());
+        Self {
+            keys: Mutex::new(keys),
+            ..Self::default()
+        }
+    }
+
+    fn set_outcome_for_event(
+        &self,
+        event: &ApprovalEvent,
+        outcome: VerifyOutcome,
+    ) -> Result<(), Box<dyn Error>> {
+        let signature = event
+            .signature
+            .as_ref()
+            .ok_or("approval signature should be present")?;
+        let signature_bytes = BASE64.decode(&signature.signature_b64)?;
+        guard(&self.outcomes).insert(signature_bytes, outcome);
+        Ok(())
+    }
+
+    fn verify_calls(&self) -> Vec<MockVerifyCall> {
+        guard(&self.verify_calls).clone()
+    }
+}
+
+#[async_trait]
+impl SigningClient for MockApprovalCrypto {
+    async fn sign(
+        &self,
+        context: &str,
+        payload: &[u8],
+    ) -> x0x_symphony_signing::Result<SignResponse> {
+        Ok(SignResponse {
+            agent_id: "mock-approver".to_owned(),
+            public_key_b64: BASE64.encode(b"mock-public-key"),
+            signature_b64: BASE64.encode(payload),
+            algorithm: SIGN_ALGORITHM.to_owned(),
+            context: context.to_owned(),
+        })
+    }
+
+    async fn verify(
+        &self,
+        context: &str,
+        payload: &[u8],
+        signature: &[u8],
+        public_key: &[u8],
+    ) -> x0x_symphony_signing::Result<VerifyOutcome> {
+        guard(&self.verify_calls).push(MockVerifyCall {
+            context: context.to_owned(),
+            payload: payload.to_vec(),
+            signature: signature.to_vec(),
+            public_key: public_key.to_vec(),
+        });
+        Ok(guard(&self.outcomes)
+            .get(signature)
+            .cloned()
+            .unwrap_or_else(|| VerifyOutcome::Invalid("unconfigured mock signature".to_owned())))
+    }
+
+    async fn agent_identity(&self) -> x0x_symphony_signing::Result<AgentInfo> {
+        Ok(AgentInfo {
+            agent_id: "mock-approver".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl TrustedKeyResolver for MockApprovalCrypto {
+    async fn resolve(&self, agent_id: &str) -> x0x_symphony_signing::Result<Vec<u8>> {
+        guard(&self.keys)
+            .get(agent_id)
+            .cloned()
+            .ok_or_else(|| SigningError::UntrustedKey(format!("unknown approver {agent_id}")))
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> CoreResult<std::sync::MutexGuard<'_, T>> {
     m.lock()
         .map_err(|e| x0x_symphony_core::SymphonyError::Tracker(format!("poisoned: {e}")))
@@ -975,6 +1075,49 @@ async fn run_spy_dispatch_with_approval_state(
     run_spy_dispatch_with_tracker(tracker, config, trust).await
 }
 
+async fn run_spy_dispatch_with_crypto(
+    issue: Issue,
+    config: Config,
+    trust: Arc<MockTrustClient>,
+    approval_state: ApprovalState,
+    signing_client: Arc<dyn SigningClient>,
+    key_resolver: Arc<dyn TrustedKeyResolver>,
+) -> Result<
+    (
+        Option<Resolution>,
+        Arc<ExecutionSpy>,
+        Arc<StubTracker>,
+        Arc<MockTrustClient>,
+    ),
+    Box<dyn Error>,
+> {
+    let tracker = Arc::new(StubTracker::with(vec![issue]));
+    *lock(&tracker.approvals)? = approval_state;
+    let tmp = TempDir::new()?;
+    let spy = Arc::new(ExecutionSpy::default());
+    let runner = Arc::new(SpyRunner {
+        spy: Arc::clone(&spy),
+    });
+    let workspace = Arc::new(SpyWorkspace {
+        root: tmp.path().join("workspaces"),
+        spy: Arc::clone(&spy),
+    });
+    let trust_client: Arc<dyn TrustClient> = trust.clone();
+    let orc = Orchestrator::new_with_signing(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config,
+        trust_client,
+        Some(signing_client),
+        Some(key_resolver),
+    );
+
+    let resolution = orc.run_once().await?;
+    Ok((resolution, spy, tracker, trust))
+}
+
 async fn run_spy_dispatch_with_tracker(
     tracker: Arc<StubTracker>,
     config: Config,
@@ -1073,6 +1216,23 @@ fn signed_approval_event(
         payload_sha256,
         event.approver_agent_id.to_string(),
     ));
+    Ok(event)
+}
+
+fn crypto_approval_event(
+    issue: &Issue,
+    signer: &str,
+    verdict: ApprovalVerdict,
+    approved_at: &str,
+    signature_bytes: &[u8],
+) -> Result<ApprovalEvent, Box<dyn Error>> {
+    let mut event = signed_approval_event(issue, signer, verdict, approved_at)?;
+    let signature = event
+        .signature
+        .as_mut()
+        .ok_or("approval signature should be present")?;
+    signature.public_key_b64 = BASE64.encode(b"mock-public-key");
+    signature.signature_b64 = BASE64.encode(signature_bytes);
     Ok(event)
 }
 
@@ -1351,6 +1511,219 @@ async fn approve_with_valid_approval_dispatches() -> Result<(), Box<dyn Error>> 
     assert_eq!(trust.calls(), vec!["trusted-signer".to_owned()]);
     assert_eq!(guard(&tracker.handoffs).len(), 1);
     assert_consumed_count(&tracker, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn crypto_verified_approval_executes() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-CRYPTO-APPROVE", &["feature"], "trusted-signer")?;
+    let approval = crypto_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+        b"valid-approval-signature",
+    )?;
+    let crypto = Arc::new(MockApprovalCrypto::with_key(
+        "approver",
+        b"approver-public-key",
+    ));
+    crypto.set_outcome_for_event(&approval, VerifyOutcome::Valid)?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+    let signing_client: Arc<dyn SigningClient> = crypto.clone();
+    let key_resolver: Arc<dyn TrustedKeyResolver> = crypto.clone();
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch_with_crypto(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval.clone()],
+            consumed: Vec::new(),
+        },
+        signing_client,
+        key_resolver,
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::Completed));
+    assert_eq!(spy.counts(), (1, 0, 1, 1));
+    assert_eq!(trust.calls(), vec!["trusted-signer".to_owned()]);
+    assert_eq!(guard(&tracker.handoffs).len(), 1);
+    assert_consumed_count(&tracker, 1);
+    let calls = crypto.verify_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].context, APPROVAL_CONTEXT);
+    assert_eq!(calls[0].payload, approval.signing_payload_bytes()?);
+    assert_eq!(calls[0].signature, b"valid-approval-signature".to_vec());
+    assert_eq!(calls[0].public_key, b"approver-public-key".to_vec());
+    Ok(())
+}
+
+#[tokio::test]
+async fn forged_envelope_does_not_execute() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-CRYPTO-FORGED", &["feature"], "trusted-signer")?;
+    let approval = crypto_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+        b"forged-approval-signature",
+    )?;
+    let crypto = Arc::new(MockApprovalCrypto::with_key(
+        "approver",
+        b"approver-public-key",
+    ));
+    crypto.set_outcome_for_event(
+        &approval,
+        VerifyOutcome::Invalid("signature mismatch".to_owned()),
+    )?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+    let signing_client: Arc<dyn SigningClient> = crypto.clone();
+    let key_resolver: Arc<dyn TrustedKeyResolver> = crypto.clone();
+
+    let (resolution, spy, tracker, _trust) = run_spy_dispatch_with_crypto(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval],
+            consumed: Vec::new(),
+        },
+        signing_client,
+        key_resolver,
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_consumed_count(&tracker, 0);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-CRYPTO-FORGED",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    assert_eq!(crypto.verify_calls().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn verify_transport_error_fails_closed() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-CRYPTO-TRANSPORT", &["feature"], "trusted-signer")?;
+    let approval = crypto_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+        b"transport-error-signature",
+    )?;
+    let crypto = Arc::new(MockApprovalCrypto::with_key(
+        "approver",
+        b"approver-public-key",
+    ));
+    crypto.set_outcome_for_event(
+        &approval,
+        VerifyOutcome::TransportError("x0xd unavailable".to_owned()),
+    )?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+    let signing_client: Arc<dyn SigningClient> = crypto.clone();
+    let key_resolver: Arc<dyn TrustedKeyResolver> = crypto.clone();
+
+    let (resolution, spy, tracker, _trust) = run_spy_dispatch_with_crypto(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval],
+            consumed: Vec::new(),
+        },
+        signing_client,
+        key_resolver,
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_consumed_count(&tracker, 0);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-CRYPTO-TRANSPORT",
+        &ReleaseReasonCode::VerifyTransportError,
+    )?;
+    assert_eq!(crypto.verify_calls().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_approver_treated_as_invalid() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-CRYPTO-UNKNOWN", &["feature"], "trusted-signer")?;
+    let approval = crypto_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+        b"unknown-approver-signature",
+    )?;
+    let crypto = Arc::new(MockApprovalCrypto::default());
+    crypto.set_outcome_for_event(&approval, VerifyOutcome::Valid)?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+    let signing_client: Arc<dyn SigningClient> = crypto.clone();
+    let key_resolver: Arc<dyn TrustedKeyResolver> = crypto.clone();
+
+    let (resolution, spy, tracker, _trust) = run_spy_dispatch_with_crypto(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval],
+            consumed: Vec::new(),
+        },
+        signing_client,
+        key_resolver,
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_consumed_count(&tracker, 0);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-CRYPTO-UNKNOWN",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    assert!(crypto.verify_calls().is_empty());
     Ok(())
 }
 

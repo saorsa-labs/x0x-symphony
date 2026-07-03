@@ -52,6 +52,7 @@ use x0x_symphony_core::{
     AgentId, Claim, Issue, IssueId, IssueState, LifecycleHooks, PollContext, ReleaseReason,
     ReleaseReasonCode, Runner, ShardRole, Tracker, Workspace,
 };
+use x0x_symphony_signing::{SigningClient, TrustedKeyResolver};
 
 use crate::trust_gate::UnknownTrustClient;
 
@@ -77,6 +78,8 @@ pub struct Orchestrator<T, R, W> {
     workspace: Arc<W>,
     clock: Arc<dyn Clock>,
     trust_client: Arc<dyn TrustClient>,
+    signing_client: Option<Arc<dyn SigningClient>>,
+    key_resolver: Option<Arc<dyn TrustedKeyResolver>>,
     config: Config,
     state: Mutex<State>,
     shutdown_notify: Notify,
@@ -336,6 +339,39 @@ impl<T, R, W> Orchestrator<T, R, W> {
         config: Config,
         trust_client: Arc<dyn TrustClient>,
     ) -> Self {
+        Self::new_with_signing(
+            tracker,
+            runner,
+            workspace,
+            clock,
+            config,
+            trust_client,
+            None,
+            None,
+        )
+    }
+
+    /// Construct an orchestrator with explicit trust and optional signing clients.
+    ///
+    /// When both signing clients are present, the approval gate
+    /// cryptographically verifies approval and denial signatures before treating
+    /// them as executable operator consent. Passing `None` for either client
+    /// preserves the legacy envelope-consistency-only behavior used by existing
+    /// local tests and unsigned development fixtures.
+    // XSY-0055 intentionally mirrors the existing constructor parameters and
+    // adds two optional security clients without breaking call sites.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new_with_signing(
+        tracker: Arc<T>,
+        runner: Arc<R>,
+        workspace: Arc<W>,
+        clock: Arc<dyn Clock>,
+        config: Config,
+        trust_client: Arc<dyn TrustClient>,
+        signing_client: Option<Arc<dyn SigningClient>>,
+        key_resolver: Option<Arc<dyn TrustedKeyResolver>>,
+    ) -> Self {
         let budget = BudgetImpl::new(
             config.global_concurrency,
             config.per_state_concurrency.clone(),
@@ -346,6 +382,8 @@ impl<T, R, W> Orchestrator<T, R, W> {
             workspace,
             clock,
             trust_client,
+            signing_client,
+            key_resolver,
             config,
             state: Mutex::new(State {
                 budget,
