@@ -20,6 +20,7 @@ path = "src/bin/x0x-symphony.rs"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -43,7 +44,6 @@ x0x-symphony-tracker-x0x-crdt = { path = "../x0x-symphony-tracker-x0x-crdt" }
 x0x-symphony-workspace = { path = "../x0x-symphony-workspace" }
 
 [dev-dependencies]
-async-trait = "0.1"
 tempfile = "3"
 
 [lints]

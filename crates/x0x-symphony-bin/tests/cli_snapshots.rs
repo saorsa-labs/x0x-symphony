@@ -254,36 +254,36 @@ async fn proofs_list_snapshot() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn issue_new_reports_jsonl_removal() -> Result<(), Box<dyn Error>> {
-    let dir = tempfile::tempdir()?;
-    let workflow_path = dir.path().join("WORKFLOW.md");
-    std::fs::write(
-        &workflow_path,
-        workflow_with_sharding("/tmp/xsy-workspaces"),
-    )?;
-    let config_arg = workflow_path.to_string_lossy().into_owned();
-
-    let command_line = CommandLine::try_parse_from([
+async fn issue_new_dispatches_to_daemon_create_issue() -> Result<(), Box<dyn Error>> {
+    let daemon = spawn_stub_daemon().await?;
+    let stdout = run_cli(&[
         "x0x-symphony",
+        "--server",
+        &daemon.server,
+        "--token",
+        "stub-token",
         "issue",
         "new",
-        "--config",
-        &config_arg,
         "--title",
         "Shard me",
+        "--description",
+        "body",
         "--priority",
         "2",
         "--label",
         "x0x-symphony",
-    ])?;
-    let output = cli::run(command_line).await?;
+    ])
+    .await?;
 
-    assert_eq!(output.exit_code, 1);
-    assert_eq!(output.stdout, "");
-    assert_eq!(
-        output.stderr,
-        "x0x-symphony issue new used the removed M1-M2 JSONL tracker; create tasks in x0xd TaskList for M3 (daemon/API task creation is M4 work)\n"
-    );
+    assert_eq!(stdout, "created TASK-NEW\n");
+    Ok(())
+}
+
+#[test]
+fn issue_new_help_renders() -> Result<(), Box<dyn Error>> {
+    let help = render_help(&["issue", "new"])?;
+    assert!(help.contains("Create an issue through the daemon tracker"));
+    assert!(help.contains("--title <TITLE>"));
     Ok(())
 }
 
@@ -340,6 +340,7 @@ async fn spawn_stub_daemon() -> Result<StubDaemon, Box<dyn Error>> {
         .route("/symphony/routes", get(stub_routes))
         .route("/symphony/approvals/pending", get(stub_pending_approvals))
         .route("/symphony/approvals/{id}", post(stub_submit_approval))
+        .route("/symphony/issues", post(stub_create_issue))
         .route("/symphony/proofs", get(stub_proofs));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -467,21 +468,26 @@ async fn stub_submit_approval(
     )
 }
 
-async fn stub_proofs() -> Json<serde_json::Value> {
-    Json(json!({"proofs": ["XSY-0001/run.txt", "XSY-0002/report.txt"]}))
+async fn stub_create_issue(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    Json(json!({
+        "schema_version": 1,
+        "id": "TASK-NEW",
+        "identifier": "TASK-NEW",
+        "title": body.get("title").and_then(serde_json::Value::as_str).unwrap_or("Untitled"),
+        "description": body.get("description").and_then(serde_json::Value::as_str).unwrap_or(""),
+        "priority": body.get("priority").and_then(serde_json::Value::as_i64),
+        "state": "todo",
+        "branch_name": null,
+        "url": null,
+        "labels": body.get("labels").and_then(serde_json::Value::as_array).cloned().unwrap_or_default(),
+        "blocked_by": [],
+        "created_at": "2026-07-03T00:00:00Z",
+        "updated_at": "2026-07-03T00:00:00Z"
+    }))
 }
 
-fn workflow_with_sharding(root: &str) -> String {
-    valid_workflow(root).replace(
-        "polling:\n  interval_ms: 1\n",
-        concat!(
-            "sharding:\n",
-            "  workers: [\"agent-a\", \"agent-b\", \"agent-c\"]\n",
-            "  replication_factor: 3\n",
-            "polling:\n",
-            "  interval_ms: 1\n",
-        ),
-    )
+async fn stub_proofs() -> Json<serde_json::Value> {
+    Json(json!({"proofs": ["XSY-0001/run.txt", "XSY-0002/report.txt"]}))
 }
 
 fn valid_workflow(root: &str) -> String {

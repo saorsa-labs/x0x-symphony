@@ -233,6 +233,22 @@ impl FromStr for IssueState {
     }
 }
 
+/// Draft used when a tracker owns creation of a new issue.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IssueDraft {
+    /// Short issue title.
+    pub title: String,
+    /// Optional Markdown-capable issue description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional dispatch priority where lower values run earlier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    /// Lowercase issue labels requested by the creator.
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
 /// Provenance class for dispatch safety decisions.
 ///
 /// Local issues are operator-controlled backlog items. Network-sourced issues

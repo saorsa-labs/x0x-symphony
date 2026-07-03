@@ -1,4 +1,10 @@
-use std::{error::Error, path::PathBuf, time::Duration};
+use std::{
+    error::Error,
+    io,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use clap::Parser;
 use x0x_symphony_bin::{
@@ -7,6 +13,49 @@ use x0x_symphony_bin::{
 };
 use x0x_symphony_core::AgentId;
 use x0x_symphony_orchestrator::{NetworkDispatchPolicy, TrustLevel};
+
+#[derive(Clone, Default)]
+struct SharedWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+struct SharedWriterGuard {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedWriterGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut bytes = self
+            .bytes
+            .lock()
+            .map_err(|_error| io::Error::other("trace buffer lock poisoned"))?;
+        bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for SharedWriter {
+    type Writer = SharedWriterGuard;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        SharedWriterGuard {
+            bytes: Arc::clone(&self.bytes),
+        }
+    }
+}
+
+fn logs_from_writer(writer: &SharedWriter) -> Result<String, Box<dyn Error>> {
+    let bytes = writer
+        .bytes
+        .lock()
+        .map_err(|_error| io::Error::other("trace buffer lock poisoned"))?
+        .clone();
+    String::from_utf8(bytes).map_err(Into::into)
+}
 
 #[tokio::test]
 async fn repository_workflow_passes_config_check() -> Result<(), Box<dyn Error>> {
@@ -141,6 +190,33 @@ fn workers_ttl_must_be_positive() -> Result<(), Box<dyn Error>> {
             .any(|problem| problem == "workers.ttl_seconds must be >= 1"),
         "problems were: {problems:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn sharding_workers_emit_deprecation_warn() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_missing("none").replace(
+        "polling:\n  interval_ms: 1\n",
+        concat!(
+            "sharding:\n",
+            "  workers: [\"agent-a\", \"agent-b\"]\n",
+            "  replication_factor: 2\n",
+            "polling:\n",
+            "  interval_ms: 1\n",
+        ),
+    );
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(writer.clone())
+        .without_time()
+        .finish();
+
+    let config =
+        tracing::subscriber::with_default(subscriber, || WorkflowConfig::from_markdown(&workflow))?;
+
+    assert_eq!(config.sharding.workers.len(), 2);
+    assert!(logs_from_writer(&writer)?.contains("sharding.workers is deprecated"));
     Ok(())
 }
 

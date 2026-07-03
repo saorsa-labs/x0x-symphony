@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use reqwest::StatusCode;
 use thiserror::Error;
+use x0x_symphony_core::IssueDraft;
 
 use crate::{client, config::WorkflowConfig};
 
@@ -133,9 +134,9 @@ pub enum ProofsCommand {
 /// Issue-related subcommands.
 #[derive(Clone, Debug, Subcommand)]
 pub enum IssueCommand {
-    /// Report that local JSONL issue creation was removed in M3.
+    /// Create an issue through the daemon tracker.
     New {
-        /// Workflow file path used to resolve tracker and sharding settings.
+        /// Deprecated; daemon workflow controls tracker and sharding settings.
         #[arg(long, default_value = "WORKFLOW.md")]
         config: PathBuf,
         /// Issue title.
@@ -222,7 +223,6 @@ impl Output {
 pub async fn run(command_line: CommandLine) -> Result<Output> {
     match &command_line.command {
         Commands::Config { command } => run_config(command),
-        Commands::Issue { command } => Ok(run_issue(command)),
         command => run_daemon_command(&command_line, command).await,
     }
 }
@@ -296,7 +296,8 @@ async fn run_daemon_command(command_line: &CommandLine, command: &Commands) -> R
             let routes = client.routes().await?;
             Ok(Output::success(format_routes(&routes.routes)))
         }
-        Commands::Config { .. } | Commands::Issue { .. } => Ok(Output::failure(
+        Commands::Issue { command } => run_issue(&client, command).await,
+        Commands::Config { .. } => Ok(Output::failure(
             "internal error: local command reached daemon dispatch\n",
         )),
     }
@@ -311,11 +312,24 @@ fn approval_error_output(error: client::Error) -> Result<Output> {
     }
 }
 
-fn run_issue(command: &IssueCommand) -> Output {
+async fn run_issue(client: &client::SymphonyClient, command: &IssueCommand) -> Result<Output> {
     match command {
-        IssueCommand::New { .. } => Output::failure(
-            "x0x-symphony issue new used the removed M1-M2 JSONL tracker; create tasks in x0xd TaskList for M3 (daemon/API task creation is M4 work)\n",
-        ),
+        IssueCommand::New {
+            config: _,
+            title,
+            description,
+            priority,
+            labels,
+        } => {
+            let draft = IssueDraft {
+                title: title.clone(),
+                description: (!description.trim().is_empty()).then_some(description.clone()),
+                priority: priority.map(i32::from),
+                labels: labels.clone(),
+            };
+            let issue = client.create_issue(&draft).await?;
+            Ok(Output::success(format!("created {}\n", issue.identifier)))
+        }
     }
 }
 
