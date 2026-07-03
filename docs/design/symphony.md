@@ -400,8 +400,11 @@ in M3 — no parallel UI.
 Inherits x0x's three-layer identity (Machine → Agent → User) and its
 trust store. Symphony adds:
 
-- **Dispatch trust gate.** Only agents at `Trusted` or `Pinned` may claim
-  tasks labelled `security-sensitive`. Configurable per project.
+- **Network dispatch gate.** Network-sourced issues are default-off and,
+  when `security.network_dispatch_enabled` is explicitly enabled, may only
+  dispatch after verified ML-DSA-65 signature provenance and the configured
+  x0xd trust threshold both hold. The older `security-sensitive` trust gate
+  remains a narrower policy layered under this universal M3 gate.
 - **Sandbox profiles** (M4): `read-only`, `repo-write`, `no-network`,
   `full-dev`, `ci-only`. The `shell` runner enforces via host sandbox
   (Bubblewrap on Linux — firejail was rejected for this track — and

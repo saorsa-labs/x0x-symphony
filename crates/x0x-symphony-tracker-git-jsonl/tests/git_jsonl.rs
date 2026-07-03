@@ -1351,6 +1351,7 @@ fn arbitrary_issue_strategy() -> BoxedStrategy<Issue> {
                 shard,
                 claim,
                 handoff,
+                signature_provenance: None,
                 created_at,
                 updated_at,
                 extra,

@@ -95,8 +95,10 @@ This posture is **not**:
 **Network-sourced work is impossible before M3.** The `git_jsonl` tracker
 (XSY-0003) has no network code path; it reads only the local
 operator-controlled repo. At M3 the `x0x_crdt` adapter (XSY-0019)
-introduces network-sourced issues, but dispatch is hard-gated on verified
-signature + trust level (XSY-0039) from the moment that path exists.
+introduces network-sourced issues, but dispatch is default-off via
+`security.network_dispatch_enabled: false` and, when explicitly enabled,
+hard-gated on verified signature provenance + trust level (XSY-0039) from
+the moment that path exists.
 
 ---
 

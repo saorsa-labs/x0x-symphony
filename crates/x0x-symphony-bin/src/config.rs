@@ -164,8 +164,10 @@ pub struct AgentConfig {
 /// Security configuration parsed from the optional `security:` block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SecurityConfig {
-    /// Minimum trust level for security-sensitive network-sourced issues.
+    /// Minimum trust level for network-sourced issue dispatch.
     pub required_trust: TrustLevel,
+    /// Whether network-sourced issues may dispatch after signature + trust checks.
+    pub network_dispatch_enabled: bool,
 }
 
 /// Signing configuration parsed from the optional `signing:` block.
@@ -333,6 +335,7 @@ impl WorkflowConfig {
             .hooks(self.hooks.to_lifecycle_hooks())
             .validation_commands(self.validation.clone())
             .required_trust(self.security.required_trust)
+            .network_dispatch_enabled(self.security.network_dispatch_enabled)
             .build())
     }
 }
@@ -450,6 +453,7 @@ fn parse_security(root: &Map<String, Value>, problems: &mut Vec<String>) -> Opti
     let Some(value) = root.get("security") else {
         return Some(SecurityConfig {
             required_trust: TrustLevel::Trusted,
+            network_dispatch_enabled: false,
         });
     };
     let Some(security) = value.as_object() else {
@@ -466,7 +470,12 @@ fn parse_security(root: &Map<String, Value>, problems: &mut Vec<String>) -> Opti
         },
         None => TrustLevel::Trusted,
     };
-    Some(SecurityConfig { required_trust })
+    let network_dispatch_enabled =
+        optional_bool(security, "security.network_dispatch_enabled", problems).unwrap_or(false);
+    Some(SecurityConfig {
+        required_trust,
+        network_dispatch_enabled,
+    })
 }
 
 fn parse_signing(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<SigningConfig> {
@@ -589,6 +598,22 @@ fn optional_string(
         Some(Value::String(value)) => Some(value.clone()),
         Some(_) => {
             problems.push(format!("{path} must be a string"));
+            None
+        }
+        None => None,
+    }
+}
+
+fn optional_bool(
+    map: &Map<String, Value>,
+    path: &'static str,
+    problems: &mut Vec<String>,
+) -> Option<bool> {
+    let key = leaf_key(path);
+    match map.get(key) {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => {
+            problems.push(format!("{path} must be a boolean"));
             None
         }
         None => None,

@@ -38,15 +38,32 @@ async fn workflow_with_runner_sandbox_passes_config_check() -> Result<(), Box<dy
 }
 
 #[test]
-fn security_required_trust_maps_to_orchestrator_config() -> Result<(), Box<dyn Error>> {
+fn security_config_maps_to_orchestrator_config() -> Result<(), Box<dyn Error>> {
     let mut workflow = workflow_missing("none");
-    workflow = workflow.replace("agent:\n", "security:\n  required_trust: known\n\nagent:\n");
+    workflow = workflow.replace(
+        "agent:\n",
+        "security:\n  required_trust: known\n  network_dispatch_enabled: true\n\nagent:\n",
+    );
 
     let config = WorkflowConfig::from_markdown(&workflow)?;
     let orchestrator = config.to_orchestrator_config(AgentId::new("agent-a")?)?;
 
     assert_eq!(config.security.required_trust, TrustLevel::Known);
+    assert!(config.security.network_dispatch_enabled);
     assert_eq!(orchestrator.required_trust, TrustLevel::Known);
+    assert!(orchestrator.network_dispatch_enabled);
+    Ok(())
+}
+
+#[test]
+fn network_dispatch_defaults_off() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_missing("none");
+
+    let config = WorkflowConfig::from_markdown(&workflow)?;
+    let orchestrator = config.to_orchestrator_config(AgentId::new("agent-a")?)?;
+
+    assert!(!config.security.network_dispatch_enabled);
+    assert!(!orchestrator.network_dispatch_enabled);
     Ok(())
 }
 
