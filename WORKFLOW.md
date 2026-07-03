@@ -77,6 +77,11 @@ agent:
   max_turns: 8
   max_retry_backoff_ms: 300000
 
+security:
+  # Network-sourced issues labelled `security-sensitive` require this x0xd
+  # /contacts trust level or higher. `blocked` signers are always refused.
+  required_trust: trusted
+
 # Default runner: shell. Operators may configure a preset (codex,
 # claude_code, kimi, glm, minimax, pi) via runner.preset.
 runner:

@@ -16,6 +16,7 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use x0x_symphony_core::IssueSource;
 
 use crate::{
     error::{Error, Result},
@@ -210,15 +211,6 @@ pub enum UnavailablePolicy {
     /// Log a warning and run the unwrapped command.
     #[default]
     Warn,
-}
-
-/// Source class used for fail-closed sandbox dispatch decisions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IssueSource {
-    /// Local operator-controlled backlog item.
-    Local,
-    /// Network-sourced item received through the future x0x CRDT adapter.
-    NetworkSourced,
 }
 
 /// Workflow sandbox configuration resolved from `runner.sandbox`.

@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use thiserror::Error;
 use x0x_symphony_core::SymphonyError;
 
+use crate::trust_gate::TrustLevelParseError;
+
 /// Result alias for orchestrator operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -36,6 +38,51 @@ pub enum Error {
         id: String,
         /// Why the issue was rejected.
         reason: String,
+    },
+
+    /// The reqwest client for trust lookups could not be constructed.
+    #[error("failed to construct x0xd trust HTTP client: {source}")]
+    TrustClientBuild {
+        /// Underlying reqwest error.
+        #[source]
+        source: reqwest::Error,
+    },
+
+    /// A trust lookup request failed before a response was received.
+    #[error("trust request to {url} failed: {source}")]
+    TrustRequest {
+        /// Request URL.
+        url: String,
+        /// Underlying reqwest error.
+        #[source]
+        source: reqwest::Error,
+    },
+
+    /// A trust lookup response could not be decoded.
+    #[error("failed to decode trust response from {url}: {source}")]
+    TrustDecode {
+        /// Request URL.
+        url: String,
+        /// Underlying reqwest error.
+        #[source]
+        source: reqwest::Error,
+    },
+
+    /// x0xd returned a non-success status for a trust lookup.
+    #[error("x0xd trust lookup returned HTTP {status}: {body}")]
+    TrustHttp {
+        /// HTTP status code.
+        status: reqwest::StatusCode,
+        /// Response body text.
+        body: String,
+    },
+
+    /// x0xd returned a trust level outside the contacts API contract.
+    #[error("invalid trust level in x0xd contacts response: {source}")]
+    TrustLevel {
+        /// Trust level parse error.
+        #[source]
+        source: TrustLevelParseError,
     },
 
     /// A proof artefact filesystem operation failed.

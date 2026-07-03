@@ -233,6 +233,65 @@ impl FromStr for IssueState {
     }
 }
 
+/// Provenance class for dispatch safety decisions.
+///
+/// Local issues are operator-controlled backlog items. Network-sourced issues
+/// arrived through an x0x-backed adapter and may require additional trust and
+/// signature gates before execution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueSource {
+    /// Local operator-controlled backlog item.
+    #[default]
+    Local,
+    /// Network-sourced item received through the x0x CRDT adapter.
+    NetworkSourced,
+}
+
+impl IssueSource {
+    /// Stable marker used in adapter-preserved issue metadata.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::NetworkSourced => "network_sourced",
+        }
+    }
+
+    /// Resolve an issue's source marker from adapter-preserved metadata.
+    ///
+    /// Missing or unknown markers default to [`IssueSource::Local`] to preserve
+    /// the M1 local-JSONL behavior. Adapters that ingest network records should
+    /// set `issue_source` (or legacy `source`) to `network_sourced`.
+    #[must_use]
+    pub fn from_issue(issue: &Issue) -> Self {
+        ["issue_source", "source"]
+            .iter()
+            .filter_map(|key| issue.extra.get(*key))
+            .find_map(Self::from_json_value)
+            .unwrap_or(Self::Local)
+    }
+
+    fn from_json_value(value: &Value) -> Option<Self> {
+        value.as_str().and_then(Self::from_marker)
+    }
+
+    fn from_marker(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "local" => Some(Self::Local),
+            "network" | "network_sourced" | "x0x" | "x0x_crdt" => Some(Self::NetworkSourced),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for IssueSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Minimal blocker reference embedded inside another issue.
 ///
 /// # Examples

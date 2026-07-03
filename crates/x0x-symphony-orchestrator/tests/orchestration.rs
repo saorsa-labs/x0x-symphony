@@ -12,7 +12,7 @@
 #![cfg(test)]
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -31,7 +31,7 @@ use x0x_symphony_core::{
 };
 use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
-    Orchestrator, SystemClock,
+    Orchestrator, SystemClock, TrustClient, TrustLevel,
 };
 use x0x_symphony_tracker_git_jsonl::{serialize_issue, JsonlTracker};
 use x0x_symphony_workspace::{Config as WorkspaceConfig, Manager};
@@ -44,6 +44,26 @@ fn make_issue(id: &str, state: &str) -> Result<Issue, Box<dyn Error>> {
         IssueState::new(state)?,
         "2026-07-02T00:00:00Z",
     )?)
+}
+
+fn network_issue(id: &str, labels: &[&str], signer: &str) -> Result<Issue, Box<dyn Error>> {
+    let mut issue = make_issue(id, "todo")?;
+    issue.labels = labels.iter().map(|label| (*label).to_owned()).collect();
+    issue.extra.insert(
+        "issue_source".to_owned(),
+        serde_json::Value::String("network_sourced".to_owned()),
+    );
+    issue.extra.insert(
+        "signer_agent_id".to_owned(),
+        serde_json::Value::String(signer.to_owned()),
+    );
+    Ok(issue)
+}
+
+fn local_issue_with_labels(id: &str, labels: &[&str]) -> Result<Issue, Box<dyn Error>> {
+    let mut issue = make_issue(id, "todo")?;
+    issue.labels = labels.iter().map(|label| (*label).to_owned()).collect();
+    Ok(issue)
 }
 
 fn agent() -> Result<AgentId, Box<dyn Error>> {
@@ -397,6 +417,46 @@ impl StubTracker {
     }
 }
 
+#[derive(Default)]
+struct MockTrustClient {
+    levels: BTreeMap<String, TrustLevel>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl MockTrustClient {
+    fn with_levels<I, S>(levels: I) -> Self
+    where
+        I: IntoIterator<Item = (S, TrustLevel)>,
+        S: Into<String>,
+    {
+        Self {
+            levels: levels
+                .into_iter()
+                .map(|(agent, level)| (agent.into(), level))
+                .collect(),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<String> {
+        guard(&self.calls).clone()
+    }
+}
+
+#[async_trait]
+impl TrustClient for MockTrustClient {
+    async fn trust_level(&self, agent_id: &str) -> x0x_symphony_orchestrator::Result<TrustLevel> {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.push(agent_id.to_owned());
+        }
+        Ok(self
+            .levels
+            .get(agent_id)
+            .copied()
+            .unwrap_or(TrustLevel::Unknown))
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> CoreResult<std::sync::MutexGuard<'_, T>> {
     m.lock()
         .map_err(|e| x0x_symphony_core::SymphonyError::Tracker(format!("poisoned: {e}")))
@@ -585,6 +645,17 @@ fn config_with_hooks_and_proofs(
         .build())
 }
 
+fn trust_config(required_trust: TrustLevel, proofs_dir: PathBuf) -> Result<Config, Box<dyn Error>> {
+    Ok(Config::builder(agent()?)
+        .active_states(vec![state("todo")?])
+        .terminal_states(vec![state("done")?, state("cancelled")?])
+        .global_concurrency(1)
+        .retry(fast_retry(1))
+        .required_trust(required_trust)
+        .proofs_dir(proofs_dir)
+        .build())
+}
+
 fn default_test_proofs_dir() -> PathBuf {
     std::env::temp_dir().join(format!(
         "x0x-symphony-orchestrator-tests-{}",
@@ -661,6 +732,22 @@ where
     Orchestrator::new(tracker, runner, workspace, clock, config)
 }
 
+fn orc_with_trust<T, R, W>(
+    tracker: Arc<T>,
+    runner: Arc<R>,
+    workspace: Arc<W>,
+    clock: Arc<dyn Clock>,
+    config: Config,
+    trust_client: Arc<dyn TrustClient>,
+) -> Orchestrator<T, R, W>
+where
+    T: x0x_symphony_core::Tracker,
+    R: Runner,
+    W: Workspace,
+{
+    Orchestrator::new_with_trust_client(tracker, runner, workspace, clock, config, trust_client)
+}
+
 fn sysclock() -> Arc<dyn Clock> {
     Arc::new(SystemClock) as Arc<dyn Clock>
 }
@@ -691,6 +778,291 @@ fn orphan_config() -> Result<Config, Box<dyn Error>> {
 }
 
 // ---------- tests ----------
+
+#[tokio::test]
+async fn trust_gate_rejects_non_trusted_on_security_sensitive() -> Result<(), Box<dyn Error>> {
+    for (level, suffix) in [
+        (TrustLevel::Unknown, "unknown"),
+        (TrustLevel::Known, "known"),
+    ] {
+        let tmp = TempDir::new()?;
+        let signer = format!("signer-{suffix}");
+        let issue_id = format!("XSY-TG-{suffix}");
+        let tracker = Arc::new(StubTracker::with(vec![network_issue(
+            &issue_id,
+            &["security-sensitive"],
+            &signer,
+        )?]));
+        let runner = Arc::new(StubRunner::succeeding());
+        let workspace = Arc::new(StubWorkspace {
+            root: tmp.path().join("workspaces"),
+            ..StubWorkspace::default()
+        });
+        let trust = Arc::new(MockTrustClient::with_levels([(signer.clone(), level)]));
+        let trust_client: Arc<dyn TrustClient> = trust.clone();
+        let orc = orc_with_trust(
+            Arc::clone(&tracker),
+            runner,
+            Arc::clone(&workspace),
+            sysclock(),
+            trust_config(TrustLevel::Trusted, tmp.path().join("proofs"))?,
+            trust_client,
+        );
+
+        let resolution = orc.run_once().await?;
+
+        assert_eq!(resolution, Some(Resolution::Blocked));
+        assert_eq!(trust.calls(), vec![signer.clone()]);
+        assert!(guard(&workspace.created).is_empty());
+        assert!(guard(&tracker.handoffs).is_empty());
+        assert!(guard(&tracker.releases)
+            .iter()
+            .any(|(id, code)| id.as_str() == issue_id
+                && code == &ReleaseReasonCode::InsufficientTrust));
+        let issues = guard(&tracker.issues);
+        let issue = issues
+            .iter()
+            .find(|issue| issue.id.as_str() == issue_id)
+            .ok_or("blocked issue should remain in tracker")?;
+        assert_eq!(issue.state, state("blocked")?);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn trust_gate_allows_trusted_on_security_sensitive() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let tracker = Arc::new(StubTracker::with(vec![network_issue(
+        "XSY-TG-TRUSTED",
+        &["security-sensitive"],
+        "trusted-signer",
+    )?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+    let trust_client: Arc<dyn TrustClient> = trust.clone();
+    let orc = orc_with_trust(
+        Arc::clone(&tracker),
+        runner,
+        Arc::clone(&workspace),
+        sysclock(),
+        trust_config(TrustLevel::Trusted, tmp.path().join("proofs"))?,
+        trust_client,
+    );
+
+    let resolution = orc.run_once().await?;
+
+    assert_eq!(resolution, Some(Resolution::Completed));
+    assert_eq!(trust.calls(), vec!["trusted-signer".to_owned()]);
+    assert_eq!(guard(&tracker.handoffs).len(), 1);
+    assert_eq!(guard(&workspace.created).len(), 1);
+    let issues = guard(&tracker.issues);
+    let issue = issues
+        .iter()
+        .find(|issue| issue.id.as_str() == "XSY-TG-TRUSTED")
+        .ok_or("trusted issue should remain in tracker")?;
+    assert_eq!(issue.state, state("review")?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn trust_gate_skips_local_issues() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let mut issue = local_issue_with_labels("XSY-TG-LOCAL", &["security-sensitive"])?;
+    issue.extra.insert(
+        "signer_agent_id".to_owned(),
+        serde_json::Value::String("blocked-local-signer".to_owned()),
+    );
+    let tracker = Arc::new(StubTracker::with(vec![issue]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "blocked-local-signer",
+        TrustLevel::Blocked,
+    )]));
+    let trust_client: Arc<dyn TrustClient> = trust.clone();
+    let orc = orc_with_trust(
+        Arc::clone(&tracker),
+        runner,
+        Arc::clone(&workspace),
+        sysclock(),
+        trust_config(TrustLevel::Trusted, tmp.path().join("proofs"))?,
+        trust_client,
+    );
+
+    let resolution = orc.run_once().await?;
+
+    assert_eq!(resolution, Some(Resolution::Completed));
+    assert!(trust.calls().is_empty());
+    assert_eq!(guard(&tracker.handoffs).len(), 1);
+    assert_eq!(guard(&workspace.created).len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn trust_gate_skips_non_sensitive_tasks() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let tracker = Arc::new(StubTracker::with(vec![network_issue(
+        "XSY-TG-NON-SENSITIVE",
+        &["feature"],
+        "unknown-signer",
+    )?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "unknown-signer",
+        TrustLevel::Unknown,
+    )]));
+    let trust_client: Arc<dyn TrustClient> = trust.clone();
+    let orc = orc_with_trust(
+        Arc::clone(&tracker),
+        runner,
+        Arc::clone(&workspace),
+        sysclock(),
+        trust_config(TrustLevel::Trusted, tmp.path().join("proofs"))?,
+        trust_client,
+    );
+
+    let resolution = orc.run_once().await?;
+
+    assert_eq!(resolution, Some(Resolution::Completed));
+    assert_eq!(trust.calls(), vec!["unknown-signer".to_owned()]);
+    assert_eq!(guard(&tracker.handoffs).len(), 1);
+    assert!(guard(&tracker.releases).is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn trust_gate_blocked_always_rejected() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let tracker = Arc::new(StubTracker::with(vec![network_issue(
+        "XSY-TG-BLOCKED",
+        &["feature"],
+        "blocked-signer",
+    )?]));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "blocked-signer",
+        TrustLevel::Blocked,
+    )]));
+    let trust_client: Arc<dyn TrustClient> = trust.clone();
+    let orc = orc_with_trust(
+        Arc::clone(&tracker),
+        runner,
+        Arc::clone(&workspace),
+        sysclock(),
+        trust_config(TrustLevel::Trusted, tmp.path().join("proofs"))?,
+        trust_client,
+    );
+
+    let resolution = orc.run_once().await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_eq!(trust.calls(), vec!["blocked-signer".to_owned()]);
+    assert!(guard(&workspace.created).is_empty());
+    assert!(guard(&tracker.releases)
+        .iter()
+        .any(|(id, code)| id.as_str() == "XSY-TG-BLOCKED"
+            && code == &ReleaseReasonCode::InsufficientTrust));
+    Ok(())
+}
+
+#[tokio::test]
+async fn trust_gate_mock_client_covers_all_four_levels() -> Result<(), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let cases = [
+        (
+            "XSY-TG-MATRIX-BLOCKED",
+            "signer-blocked",
+            TrustLevel::Blocked,
+        ),
+        (
+            "XSY-TG-MATRIX-UNKNOWN",
+            "signer-unknown",
+            TrustLevel::Unknown,
+        ),
+        ("XSY-TG-MATRIX-KNOWN", "signer-known", TrustLevel::Known),
+        (
+            "XSY-TG-MATRIX-TRUSTED",
+            "signer-trusted",
+            TrustLevel::Trusted,
+        ),
+    ];
+    let issues = cases
+        .iter()
+        .map(|(id, signer, _level)| network_issue(id, &["security-sensitive"], signer))
+        .collect::<Result<Vec<_>, _>>()?;
+    let tracker = Arc::new(StubTracker::with(issues));
+    let runner = Arc::new(StubRunner::succeeding());
+    let workspace = Arc::new(StubWorkspace {
+        root: tmp.path().join("workspaces"),
+        ..StubWorkspace::default()
+    });
+    let trust = Arc::new(MockTrustClient::with_levels(
+        cases
+            .iter()
+            .map(|(_id, signer, level)| ((*signer).to_owned(), *level)),
+    ));
+    let trust_client: Arc<dyn TrustClient> = trust.clone();
+    let orc = orc_with_trust(
+        Arc::clone(&tracker),
+        runner,
+        Arc::clone(&workspace),
+        sysclock(),
+        trust_config(TrustLevel::Known, tmp.path().join("proofs"))?,
+        trust_client,
+    );
+
+    for _case in cases {
+        let _resolution = orc.run_once().await?;
+    }
+
+    assert_eq!(
+        trust.calls(),
+        vec![
+            "signer-blocked".to_owned(),
+            "signer-unknown".to_owned(),
+            "signer-known".to_owned(),
+            "signer-trusted".to_owned(),
+        ]
+    );
+    assert_eq!(guard(&tracker.handoffs).len(), 2);
+    assert_eq!(guard(&workspace.created).len(), 2);
+    let releases = guard(&tracker.releases);
+    assert_eq!(releases.len(), 2);
+    assert!(releases
+        .iter()
+        .all(|(_id, code)| code == &ReleaseReasonCode::InsufficientTrust));
+    let issues = guard(&tracker.issues);
+    for (id, _signer, level) in cases {
+        let issue = issues
+            .iter()
+            .find(|issue| issue.id.as_str() == id)
+            .ok_or("matrix issue should remain in tracker")?;
+        if level >= TrustLevel::Known && level != TrustLevel::Blocked {
+            assert_eq!(issue.state, state("review")?);
+        } else {
+            assert_eq!(issue.state, state("blocked")?);
+        }
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn orphan_sweep_quarantines_done_and_tracker_missing_workspaces() -> Result<(), Box<dyn Error>>

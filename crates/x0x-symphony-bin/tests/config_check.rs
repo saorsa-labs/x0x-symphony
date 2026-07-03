@@ -1,7 +1,12 @@
 use std::{error::Error, path::PathBuf};
 
 use clap::Parser;
-use x0x_symphony_bin::cli::{self, CommandLine};
+use x0x_symphony_bin::{
+    cli::{self, CommandLine},
+    config::WorkflowConfig,
+};
+use x0x_symphony_core::AgentId;
+use x0x_symphony_orchestrator::TrustLevel;
 
 #[tokio::test]
 async fn repository_workflow_passes_config_check() -> Result<(), Box<dyn Error>> {
@@ -29,6 +34,19 @@ async fn workflow_with_runner_sandbox_passes_config_check() -> Result<(), Box<dy
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.stdout, "config ok\n");
     assert_eq!(output.stderr, "");
+    Ok(())
+}
+
+#[test]
+fn security_required_trust_maps_to_orchestrator_config() -> Result<(), Box<dyn Error>> {
+    let mut workflow = workflow_missing("none");
+    workflow = workflow.replace("agent:\n", "security:\n  required_trust: known\n\nagent:\n");
+
+    let config = WorkflowConfig::from_markdown(&workflow)?;
+    let orchestrator = config.to_orchestrator_config(AgentId::new("agent-a")?)?;
+
+    assert_eq!(config.security.required_trust, TrustLevel::Known);
+    assert_eq!(orchestrator.required_trust, TrustLevel::Known);
     Ok(())
 }
 
