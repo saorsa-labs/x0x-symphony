@@ -249,6 +249,9 @@ x0x-symphony tasks --state review          # filter by state
 x0x-symphony status                        # active claims + counts
 x0x-symphony claim XSY-0001                # claim a task by id
 x0x-symphony handoff XSY-0001 --message "done" [--file path]
+x0x-symphony approvals list                # list network tasks awaiting consent
+x0x-symphony approvals approve XSY-0002    # approve one network-sourced task
+x0x-symphony approvals deny XSY-0003       # deny one network-sourced task
 x0x-symphony proofs list                   # list proof artefacts
 x0x-symphony proofs show <name>            # show one
 x0x-symphony config show   --config WORKFLOW.md
@@ -258,6 +261,32 @@ x0x-symphony routes                        # list daemon HTTP routes
 
 Output is deterministic text (no wall-clock timestamps) so it is
 snapshot-testable and scriptable.
+
+### Approving network-sourced tasks
+
+When `security.network_dispatch: approve`, network-sourced tasks that pass the
+ML-DSA-65 signature and trust gate wait for per-task consent before dispatch
+(see [ADR-0005](../adr/0005-consent-gated-dispatch.md)). The approval or denial
+is itself signed and bound to the issue id, current content hash, and network
+signer; changing the payload or signer voids the decision.
+
+```bash
+x0x-symphony approvals list
+# approvals:
+# - XSY-0100 [todo] signer agent-abc hash 8b2f3a4c9d10 Investigate failure
+
+x0x-symphony approvals approve XSY-0100 \
+  --expected-hash 8b2f3a4c9d10e11f2233445566778899aabbccddeeff00112233445566778899 \
+  --expected-signer agent-abc
+# XSY-0100 approved
+
+x0x-symphony approvals deny XSY-0101
+# XSY-0101 denied
+```
+
+Use `--expected-hash` and `--expected-signer` from a recent list output when an
+operator UI may be stale. If either value no longer matches, the daemon returns
+`409 Conflict`; re-run `approvals list` before retrying.
 
 ## x0x CRDT tracker operations (M3+)
 
