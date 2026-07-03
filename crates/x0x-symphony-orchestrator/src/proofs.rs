@@ -121,7 +121,8 @@ impl ProofRun {
         started_at: DateTime<Utc>,
     ) -> Result<Self> {
         let canonical_root = prepare_root(proofs_root)?;
-        // M5: reaper - retention cleanup for old proof directories belongs here.
+        // Retention cleanup is handled by the daemon proof reaper; run creation
+        // only prepares the directory for the current dispatch.
         let issue_segment = sanitize_segment(issue.id.as_str())?;
         let issue_dir = ensure_child_dir(&canonical_root, issue_segment.as_str())?;
         let base_timestamp = timestamp_segment(started_at);

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env,
     path::{Path, PathBuf},
     sync::Arc,
@@ -11,9 +12,9 @@ use serde_json::json;
 use tokio::{net::TcpListener, sync::broadcast};
 use tracing::{error, info, warn};
 use x0x_symphony_bin::{api, auth, config, workers};
-use x0x_symphony_core::AgentId;
+use x0x_symphony_core::{AgentId, IssueId};
 use x0x_symphony_orchestrator::{
-    DispatchEvent, Orchestrator, SystemClock, TrustClient, X0xdTrustClient,
+    reap_old_proofs, Clock, DispatchEvent, Orchestrator, SystemClock, TrustClient, X0xdTrustClient,
     DISPATCH_EVENT_CHANNEL_CAPACITY,
 };
 use x0x_symphony_runner_shell::{RunnerSpec, ShellRunner};
@@ -103,6 +104,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .with_event_tx(dispatch_events_tx),
     );
     spawn_worker_load_updater(worker_discovery.clone(), orchestrator.clone());
+    spawn_proof_reaper(tracker.clone(), orchestrator.clone(), proofs_dir.clone());
     let _worker_discovery_handle = worker_discovery.clone().run().await;
 
     run_startup_maintenance(&orchestrator).await?;
@@ -294,6 +296,70 @@ fn spawn_worker_load_updater(
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
+}
+
+fn spawn_proof_reaper(
+    tracker: Arc<X0xCrdtTracker>,
+    orchestrator: Arc<Orchestrator<X0xCrdtTracker, ShellRunner, Manager>>,
+    proofs_dir: PathBuf,
+) {
+    let retention = orchestrator.retention_policy();
+    let _proof_reaper = tokio::spawn(async move {
+        loop {
+            run_proof_reaper_scan(&tracker, &orchestrator, &proofs_dir).await;
+            tokio::time::sleep(retention.reap_interval).await;
+        }
+    });
+}
+
+async fn run_proof_reaper_scan(
+    tracker: &X0xCrdtTracker,
+    orchestrator: &Orchestrator<X0xCrdtTracker, ShellRunner, Manager>,
+    proofs_dir: &Path,
+) {
+    let retention = orchestrator.retention_policy();
+    let active_issue_ids = match proof_reaper_active_issue_ids(tracker, orchestrator).await {
+        Ok(active_issue_ids) => active_issue_ids,
+        Err(source) => {
+            warn!(%source, "skipping proof reaper scan; active issue set unavailable");
+            return;
+        }
+    };
+    let clock = SystemClock;
+    let report = reap_old_proofs(
+        proofs_dir,
+        clock.now(),
+        retention.proofs_days,
+        &active_issue_ids,
+    )
+    .await;
+    info!(
+        scanned = report.scanned,
+        reaped = report.reaped,
+        skipped_active = report.skipped_active,
+        errors = report.errors,
+        "proof reaper scan completed"
+    );
+}
+
+async fn proof_reaper_active_issue_ids(
+    tracker: &X0xCrdtTracker,
+    orchestrator: &Orchestrator<X0xCrdtTracker, ShellRunner, Manager>,
+) -> anyhow::Result<BTreeSet<IssueId>> {
+    let issues = tracker
+        .list_issues()
+        .await
+        .context("failed to list issues for proof reaper active set")?;
+    // Tracker state protects every visible in-progress issue, while the local
+    // in-flight set closes the race between a local claim and tracker visibility.
+    let mut active = orchestrator.in_flight_issue_ids();
+    active.extend(
+        issues
+            .into_iter()
+            .filter(|issue| issue.state.as_str() == "in_progress")
+            .map(|issue| issue.id),
+    );
+    Ok(active)
 }
 
 fn local_worker_card_template(
