@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use x0x_symphony_core::{
-    sha256_hex, AgentId, Claim, Handoff, IssueId, Result, ShardRole, SignatureEnvelope,
-    ValidationResult, ValidationStatus, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
+    sha256_hex, AgentId, Claim, Handoff, Issue, IssueId, IssueState, Result, ShardRole,
+    SignatureEnvelope, ValidationResult, ValidationStatus, VerificationNotice,
+    VerificationNoticeKind, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
 };
 
 const SIGNER_AGENT_ID: &str = "agent-schema-survival";
@@ -89,6 +90,29 @@ fn claim_signature_payload_survives_absent_v2_optional_field() -> Result<()> {
     assert_ne!(original_payload, future_payload);
     assert_ne!(original_signature, future_signature);
 
+    Ok(())
+}
+
+#[test]
+fn issue_verification_notices_are_not_serialized() -> Result<()> {
+    let mut issue = Issue::new(
+        IssueId::new("XSY-0045")?,
+        "XSY-0045",
+        "Drop bad claim",
+        IssueState::new("todo")?,
+        "2026-07-03T00:00:00Z",
+    )?;
+    issue.verification_notices.push(VerificationNotice {
+        kind: VerificationNoticeKind::BadClaim,
+        claimant: Some(AgentId::new("agent-a")?),
+        reason: "claim for issue XSY-0045 is unsigned".to_owned(),
+    });
+
+    let serialized = serde_json::to_value(&issue)?;
+
+    assert!(serialized.get("verification_notices").is_none());
+    let decoded: Issue = serde_json::from_value(serialized)?;
+    assert!(decoded.verification_notices.is_empty());
     Ok(())
 }
 
