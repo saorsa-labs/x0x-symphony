@@ -76,6 +76,47 @@ pub struct TaskListEntry {
     pub topic: String,
 }
 
+/// x0xd named group entry returned by `GET /groups`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamedGroupEntry {
+    /// Stable MLS/named-group identifier.
+    pub group_id: String,
+    /// Human-readable group name.
+    pub name: String,
+}
+
+/// x0xd named group details returned by `GET /groups/:id`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamedGroupDetails {
+    /// Stable MLS/named-group identifier.
+    pub group_id: String,
+    /// Human-readable group name.
+    pub name: String,
+    /// Local roster projection returned by x0xd.
+    #[serde(default)]
+    pub members: Vec<NamedGroupMember>,
+}
+
+/// x0xd named group member entry returned inside `GET /groups/:id`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamedGroupMember {
+    /// Agent id as x0xd reports it, normally lowercase hex.
+    pub agent_id: String,
+    /// Membership state (`active`, `pending`, `removed`, `banned`).
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+/// Result returned by `POST /groups/join`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JoinedGroup {
+    /// Stable MLS/named-group identifier joined by x0xd.
+    pub group_id: String,
+    /// Human-readable group name when x0xd includes it.
+    #[serde(default)]
+    pub group_name: Option<String>,
+}
+
 /// x0xd Task entry returned by `GET /task-lists/:id/tasks`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskEntry {
@@ -197,6 +238,15 @@ pub trait X0xdApi: Send + Sync {
 
     /// Create a `TaskList` with `name` and `topic`.
     async fn create_task_list(&self, name: &str, topic: &str) -> Result<String>;
+
+    /// List known named groups.
+    async fn list_named_groups(&self) -> Result<Vec<NamedGroupEntry>>;
+
+    /// Fetch named group details, including the local roster projection.
+    async fn get_named_group(&self, group_id: &str) -> Result<NamedGroupDetails>;
+
+    /// Join a named group via an x0xd invite link or token.
+    async fn join_group(&self, invite: &str, display_name: Option<&str>) -> Result<JoinedGroup>;
 
     /// List tasks in a `TaskList`.
     async fn list_tasks(&self, list_id: &str) -> Result<Vec<TaskEntry>>;
@@ -382,6 +432,30 @@ impl X0xdApi for X0xdClient {
         Ok(response.id)
     }
 
+    async fn list_named_groups(&self) -> Result<Vec<NamedGroupEntry>> {
+        match self.get_json::<ListNamedGroupsResponse>("/groups").await? {
+            ListNamedGroupsResponse::Wrapped { groups, .. } => Ok(groups),
+            ListNamedGroupsResponse::Bare(entries) => Ok(entries),
+        }
+    }
+
+    async fn get_named_group(&self, group_id: &str) -> Result<NamedGroupDetails> {
+        let path = format!("/groups/{group_id}");
+        self.get_json(&path).await
+    }
+
+    async fn join_group(&self, invite: &str, display_name: Option<&str>) -> Result<JoinedGroup> {
+        let request = JoinGroupRequest {
+            invite: invite.to_owned(),
+            display_name: display_name.map(str::to_owned),
+        };
+        let response: JoinGroupResponse = self.post_json("/groups/join", &request).await?;
+        Ok(JoinedGroup {
+            group_id: response.group_id,
+            group_name: response.group_name,
+        })
+    }
+
     async fn list_tasks(&self, list_id: &str) -> Result<Vec<TaskEntry>> {
         let path = format!("/task-lists/{list_id}/tasks");
         match self.get_json::<ListTasksResponse>(&path).await? {
@@ -518,6 +592,13 @@ struct CreateNamedResourceRequest {
 }
 
 #[derive(Serialize)]
+struct JoinGroupRequest {
+    invite: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+}
+
+#[derive(Serialize)]
 struct UpdateTaskRequest {
     action: String,
 }
@@ -537,6 +618,13 @@ struct CreateResourceResponse {
 }
 
 #[derive(Deserialize)]
+struct JoinGroupResponse {
+    group_id: String,
+    #[serde(default)]
+    group_name: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct AddTaskResponse {
     task_id: String,
 }
@@ -546,6 +634,13 @@ struct AddTaskResponse {
 enum ListTaskListsResponse {
     Wrapped { task_lists: Vec<TaskListEntry> },
     Bare(Vec<TaskListEntry>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ListNamedGroupsResponse {
+    Wrapped { groups: Vec<NamedGroupEntry> },
+    Bare(Vec<NamedGroupEntry>),
 }
 
 #[derive(Deserialize)]

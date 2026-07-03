@@ -99,6 +99,8 @@ pub struct TrackerConfig {
     pub kind: String,
     /// Path to the JSONL issue database, relative to the workflow file when not absolute.
     pub path: PathBuf,
+    /// Optional x0xd named/MLS group for group-scoped CRDT trackers.
+    pub group: Option<String>,
     /// Active states configured for dispatch.
     pub active_states: Vec<String>,
     /// Terminal states used for blocker resolution.
@@ -376,6 +378,7 @@ fn parse_tracker(root: &Map<String, Value>, problems: &mut Vec<String>) -> Optio
         }
     }
     let path = required_string(tracker, "tracker.path", problems).map(PathBuf::from);
+    let group = optional_non_empty_string(tracker, "tracker.group", problems);
     let active_states = match optional_string_list(tracker, "tracker.active_states") {
         Some(states) => states,
         None => vec!["todo".to_owned()],
@@ -391,6 +394,7 @@ fn parse_tracker(root: &Map<String, Value>, problems: &mut Vec<String>) -> Optio
     Some(TrackerConfig {
         kind: kind?,
         path: path?,
+        group,
         active_states,
         terminal_states,
     })
@@ -602,6 +606,21 @@ fn optional_string(
         }
         None => None,
     }
+}
+
+fn optional_non_empty_string(
+    map: &Map<String, Value>,
+    path: &'static str,
+    problems: &mut Vec<String>,
+) -> Option<String> {
+    optional_string(map, path, problems).and_then(|value| {
+        if value.trim().is_empty() {
+            problems.push(format!("{path} must not be empty"));
+            None
+        } else {
+            Some(value)
+        }
+    })
 }
 
 fn optional_bool(

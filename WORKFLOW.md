@@ -21,6 +21,11 @@ tracker:
     - blocked
   id_prefix: XSY
   lock_mode: git
+  # Optional for the x0x_crdt tracker: x0xd named/MLS group id, name, or
+  # invite link/token used to scope private project task lists. Symphony asks
+  # x0xd to resolve or join this group on first tracker use and does not manage
+  # MLS keys itself.
+  # group: x0x-symphony-private
 
 # SHARDING (M2 STATIC PLACEHOLDER): this optional static worker roster exists
 # only so `x0x-symphony issue new` can freeze shard.primary/backups at issue

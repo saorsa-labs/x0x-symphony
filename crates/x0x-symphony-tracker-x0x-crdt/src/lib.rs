@@ -22,6 +22,14 @@
 //!   is exposed as Symphony state `review`, not human-closed `done`.
 //! - Release and block transitions update the claim blob because x0xd exposes
 //!   no unclaim or general metadata PATCH endpoint.
+//! - When configured with `tracker.group`, the adapter first resolves the value
+//!   against x0xd's named-group table, or joins via `POST /groups/join` when the
+//!   value is an invite link/token. The x0xd `TaskList` topic is then scoped to
+//!   `x0x.group.<group_id>.symphony.<list-id>` and the metadata `KvStore` remains
+//!   the deterministic `symphony-<scoped-list-id>` sidecar. Symphony performs no
+//!   MLS cryptography; x0xd remains responsible for group membership and any
+//!   encrypted task-list enforcement. If x0xd hides or forbids the scoped list,
+//!   `fetch_candidates` observes zero visible tasks.
 //!
 //! The crate intentionally is not wired into the daemon binary yet; XSY-0024
 //! switches the active tracker after this adapter is reviewed.
@@ -37,7 +45,9 @@ use std::{collections::BTreeSet, sync::Arc};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{SecondsFormat, Utc};
+use reqwest::StatusCode;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tracing::warn;
 use x0x_symphony_core::{
     sha256_hex, AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext, ReleaseReason,
@@ -49,7 +59,7 @@ use x0x_symphony_tracker_git_jsonl::signing::{
 };
 
 use crate::{
-    client::{TaskAction, X0xdApi, X0xdClient},
+    client::{ClientError, TaskAction, X0xdApi, X0xdClient},
     mapping::{
         claim_key, decode_claim_blob, decode_handoff_blob, encode_claim_blob, encode_handoff_blob,
         handoff_key, issue_from_task, store_id_for_list, ClaimBlob, ClaimBlobStatus, HandoffBlob,
@@ -91,6 +101,15 @@ pub enum TrackerError {
         reason: String,
     },
 
+    /// The configured MLS/named group could not be resolved locally or joined.
+    #[error("tracker.group {group} could not be resolved: {reason}")]
+    GroupResolution {
+        /// Group name, id, or invite configured by the operator.
+        group: String,
+        /// Human-readable resolution failure.
+        reason: String,
+    },
+
     /// The claim supplied to a transition is incomplete or stale.
     #[error("invalid claim: {reason}")]
     InvalidClaim {
@@ -110,6 +129,37 @@ impl From<TrackerError> for SymphonyError {
             other => Self::Tracker(other.to_string()),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResourceScope {
+    list_id: String,
+    store_id: String,
+    group_scoped: bool,
+}
+
+impl ResourceScope {
+    fn unscoped(list_id: &str) -> Self {
+        Self {
+            list_id: list_id.to_owned(),
+            store_id: store_id_for_list(list_id),
+            group_scoped: false,
+        }
+    }
+
+    fn grouped(base_list_id: &str, group_id: &str) -> Self {
+        let list_id = group_scoped_list_id(group_id, base_list_id);
+        Self {
+            store_id: store_id_for_list(&list_id),
+            list_id,
+            group_scoped: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedGroup {
+    group_id: String,
 }
 
 #[derive(Clone)]
@@ -169,6 +219,7 @@ pub struct X0xCrdtTrackerBuilder {
     agent_id: AgentId,
     client: Option<Arc<dyn X0xdApi>>,
     signing: SigningRuntime,
+    group: Option<String>,
 }
 
 impl X0xCrdtTrackerBuilder {
@@ -181,7 +232,21 @@ impl X0xCrdtTrackerBuilder {
             agent_id,
             client: None,
             signing: SigningRuntime::disabled(),
+            group: None,
         }
+    }
+
+    /// Scope this tracker to an x0xd named/MLS group.
+    ///
+    /// The value may be a locally-known group id, a locally-known group name,
+    /// or an x0xd invite link/token. Invite values are passed to x0xd's
+    /// `POST /groups/join` on first use; group ids/names must already resolve
+    /// in x0xd's local named-group table.
+    #[must_use]
+    pub fn group(mut self, group: impl Into<String>) -> Self {
+        let group = group.into();
+        self.group = (!group.trim().is_empty()).then_some(group);
+        self
     }
 
     /// Inject a custom API implementation, usually a test mock.
@@ -231,6 +296,7 @@ impl X0xCrdtTrackerBuilder {
             self.agent_id,
             client,
             self.signing,
+            self.group,
         ))
     }
 }
@@ -243,6 +309,7 @@ impl std::fmt::Debug for X0xCrdtTrackerBuilder {
             .field("agent_id", &self.agent_id)
             .field("has_custom_client", &self.client.is_some())
             .field("signing_policy", &self.signing.policy)
+            .field("group", &self.group)
             .finish_non_exhaustive()
     }
 }
@@ -256,6 +323,8 @@ pub struct X0xCrdtTracker {
     agent_id: AgentId,
     client: Arc<dyn X0xdApi>,
     signing: SigningRuntime,
+    group: Option<String>,
+    resolved_scope: Arc<Mutex<Option<ResourceScope>>>,
 }
 
 impl std::fmt::Debug for X0xCrdtTracker {
@@ -266,6 +335,7 @@ impl std::fmt::Debug for X0xCrdtTracker {
             .field("store_id", &self.store_id)
             .field("agent_id", &self.agent_id)
             .field("signing_policy", &self.signing.policy)
+            .field("group", &self.group)
             .finish_non_exhaustive()
     }
 }
@@ -308,6 +378,7 @@ impl X0xCrdtTracker {
             agent_id,
             client,
             SigningRuntime::disabled(),
+            None,
         )
     }
 
@@ -317,13 +388,13 @@ impl X0xCrdtTracker {
         &self.base_url
     }
 
-    /// Return the x0xd `TaskList` id used by this tracker.
+    /// Return the configured x0xd `TaskList` id before optional group scoping.
     #[must_use]
     pub fn list_id(&self) -> &str {
         &self.list_id
     }
 
-    /// Return the x0xd `KvStore` id used for Symphony metadata sidecars.
+    /// Return the configured x0xd `KvStore` sidecar id before optional group scoping.
     #[must_use]
     pub fn store_id(&self) -> &str {
         &self.store_id
@@ -341,6 +412,7 @@ impl X0xCrdtTracker {
         agent_id: AgentId,
         client: Arc<dyn X0xdApi>,
         signing: SigningRuntime,
+        group: Option<String>,
     ) -> Self {
         let store_id = store_id_for_list(&list_id);
         Self {
@@ -350,11 +422,74 @@ impl X0xCrdtTracker {
             agent_id,
             client,
             signing,
+            group,
+            resolved_scope: Arc::new(Mutex::new(None)),
         }
     }
 
+    async fn resource_scope(&self) -> Result<ResourceScope> {
+        let Some(group) = self.group.as_deref() else {
+            return Ok(ResourceScope::unscoped(&self.list_id));
+        };
+        if let Some(scope) = self.resolved_scope.lock().await.clone() {
+            return Ok(scope);
+        }
+        let resolved = self.resolve_or_join_group(group).await?;
+        let scope = ResourceScope::grouped(&self.list_id, &resolved.group_id);
+        let mut cached = self.resolved_scope.lock().await;
+        if cached.is_none() {
+            *cached = Some(scope);
+        }
+        cached.clone().ok_or_else(|| TrackerError::GroupResolution {
+            group: group.to_owned(),
+            reason: "resolved scope cache was unexpectedly empty".to_owned(),
+        })
+    }
+
+    async fn resolve_or_join_group(&self, group: &str) -> Result<ResolvedGroup> {
+        let groups = self.client.list_named_groups().await?;
+        if let Some(entry) = groups
+            .iter()
+            .find(|entry| entry.group_id == group || entry.name == group)
+        {
+            let details = self.client.get_named_group(&entry.group_id).await?;
+            return Ok(ResolvedGroup {
+                group_id: details.group_id,
+            });
+        }
+        if looks_like_group_invite(group) {
+            let joined = self
+                .client
+                .join_group(group, Some(self.agent_id.as_str()))
+                .await?;
+            return Ok(ResolvedGroup {
+                group_id: joined.group_id,
+            });
+        }
+        Err(TrackerError::GroupResolution {
+            group: group.to_owned(),
+            reason: "not found in x0xd /groups and not an invite link/token".to_owned(),
+        })
+    }
+
     async fn list_issues(&self) -> Result<Vec<Issue>> {
-        let tasks = self.client.list_tasks(&self.list_id).await?;
+        let scope = self.resource_scope().await?;
+        let tasks = match self.client.list_tasks(&scope.list_id).await {
+            Ok(tasks) => tasks,
+            Err(ClientError::Http { status, body })
+                if scope.group_scoped
+                    && (status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND) =>
+            {
+                warn!(
+                    list_id = %scope.list_id,
+                    status = %status,
+                    body = %body,
+                    "x0xd denied or hid group-scoped task list; treating as zero visible tasks"
+                );
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let mut issues = Vec::with_capacity(tasks.len());
         for task in tasks {
             let claim_blob = self.claim_blob_for_task(&task.id).await?;
@@ -369,37 +504,41 @@ impl X0xCrdtTracker {
     }
 
     async fn claim_blob_for_task(&self, task_id: &str) -> Result<Option<ClaimBlob>> {
+        let scope = self.resource_scope().await?;
         let key = claim_key(task_id);
         self.client
-            .get_kv(&self.store_id, &key)
+            .get_kv(&scope.store_id, &key)
             .await?
             .map(|value| decode_claim_blob(&value.value).map_err(Into::into))
             .transpose()
     }
 
     async fn handoff_blob_for_task(&self, task_id: &str) -> Result<Option<HandoffBlob>> {
+        let scope = self.resource_scope().await?;
         let key = handoff_key(task_id);
         self.client
-            .get_kv(&self.store_id, &key)
+            .get_kv(&scope.store_id, &key)
             .await?
             .map(|value| decode_handoff_blob(&value.value).map_err(Into::into))
             .transpose()
     }
 
     async fn put_claim_blob(&self, task_id: &str, blob: &ClaimBlob) -> Result<()> {
+        let scope = self.resource_scope().await?;
         let key = claim_key(task_id);
         let encoded = encode_claim_blob(blob)?;
         self.client
-            .put_kv(&self.store_id, &key, &encoded, SYMPHONY_JSON_CONTENT_TYPE)
+            .put_kv(&scope.store_id, &key, &encoded, SYMPHONY_JSON_CONTENT_TYPE)
             .await?;
         Ok(())
     }
 
     async fn put_handoff_blob(&self, task_id: &str, blob: &HandoffBlob) -> Result<()> {
+        let scope = self.resource_scope().await?;
         let key = handoff_key(task_id);
         let encoded = encode_handoff_blob(blob)?;
         self.client
-            .put_kv(&self.store_id, &key, &encoded, SYMPHONY_JSON_CONTENT_TYPE)
+            .put_kv(&scope.store_id, &key, &encoded, SYMPHONY_JSON_CONTENT_TYPE)
             .await?;
         Ok(())
     }
@@ -685,8 +824,9 @@ impl Tracker for X0xCrdtTracker {
         } else {
             self.sign_claim(claim).await.map_err(SymphonyError::from)?
         };
+        let scope = self.resource_scope().await.map_err(SymphonyError::from)?;
         self.client
-            .update_task(&self.list_id, id.as_str(), TaskAction::Claim)
+            .update_task(&scope.list_id, id.as_str(), TaskAction::Claim)
             .await
             .map_err(TrackerError::from)
             .map_err(SymphonyError::from)?;
@@ -742,8 +882,9 @@ impl Tracker for X0xCrdtTracker {
         self.put_handoff_blob(id.as_str(), &HandoffBlob::new(prepared, now_utc()))
             .await
             .map_err(SymphonyError::from)?;
+        let scope = self.resource_scope().await.map_err(SymphonyError::from)?;
         self.client
-            .update_task(&self.list_id, id.as_str(), TaskAction::Complete)
+            .update_task(&scope.list_id, id.as_str(), TaskAction::Complete)
             .await
             .map_err(TrackerError::from)
             .map_err(SymphonyError::from)?;
@@ -800,6 +941,16 @@ const fn priority_sort_key(issue: &Issue) -> u8 {
         Some(priority) => priority,
         None => u8::MAX,
     }
+}
+
+fn group_scoped_list_id(group_id: &str, list_id: &str) -> String {
+    format!("x0x.group.{group_id}.symphony.{list_id}")
+}
+
+fn looks_like_group_invite(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("x0x://invite/")
+        || (trimmed.len() > 80 && !trimmed.chars().any(char::is_whitespace))
 }
 
 fn claim_issue_id(claim: &Claim) -> Result<IssueId> {
@@ -864,7 +1015,8 @@ mod tests {
     use super::*;
     use crate::{
         client::{
-            AddTaskDraft, EventStream, KvKeyEntry, KvValue, TaskEntry, TaskListEntry, X0xdEvent,
+            AddTaskDraft, EventStream, JoinedGroup, KvKeyEntry, KvValue, NamedGroupDetails,
+            NamedGroupEntry, NamedGroupMember, TaskEntry, TaskListEntry, X0xdEvent,
         },
         mapping::{decode_claim_blob, decode_handoff_blob},
     };
@@ -887,6 +1039,10 @@ mod tests {
         kv: BTreeMap<(String, String), Vec<u8>>,
         actions: Vec<(String, String, TaskAction)>,
         puts: Vec<(String, String, Vec<u8>)>,
+        groups: Vec<NamedGroupDetails>,
+        joins: Vec<String>,
+        list_task_calls: Vec<String>,
+        hidden_list_ids: Vec<String>,
     }
 
     impl MockApi {
@@ -894,6 +1050,33 @@ mod tests {
             let api = Arc::new(Self::default());
             api.state.lock().await.tasks = tasks;
             api
+        }
+
+        async fn add_group(&self, group_id: &str, name: &str) {
+            self.state.lock().await.groups.push(NamedGroupDetails {
+                group_id: group_id.to_owned(),
+                name: name.to_owned(),
+                members: vec![NamedGroupMember {
+                    agent_id: AGENT_A.to_owned(),
+                    state: Some("active".to_owned()),
+                }],
+            });
+        }
+
+        async fn join_count(&self) -> usize {
+            self.state.lock().await.joins.len()
+        }
+
+        async fn list_task_calls(&self) -> Vec<String> {
+            self.state.lock().await.list_task_calls.clone()
+        }
+
+        async fn hide_task_list(&self, list_id: &str) {
+            self.state
+                .lock()
+                .await
+                .hidden_list_ids
+                .push(list_id.to_owned());
         }
 
         async fn seed_claim(&self, task_id: &str, claim: Claim) -> TestResult {
@@ -950,8 +1133,66 @@ mod tests {
             Ok(topic.to_owned())
         }
 
-        async fn list_tasks(&self, _list_id: &str) -> client::Result<Vec<TaskEntry>> {
-            Ok(self.state.lock().await.tasks.clone())
+        async fn list_named_groups(&self) -> client::Result<Vec<NamedGroupEntry>> {
+            Ok(self
+                .state
+                .lock()
+                .await
+                .groups
+                .iter()
+                .map(|group| NamedGroupEntry {
+                    group_id: group.group_id.clone(),
+                    name: group.name.clone(),
+                })
+                .collect())
+        }
+
+        async fn get_named_group(&self, group_id: &str) -> client::Result<NamedGroupDetails> {
+            self.state
+                .lock()
+                .await
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .cloned()
+                .ok_or_else(|| ClientError::Http {
+                    status: StatusCode::NOT_FOUND,
+                    body: "group not found".to_owned(),
+                })
+        }
+
+        async fn join_group(
+            &self,
+            invite: &str,
+            _display_name: Option<&str>,
+        ) -> client::Result<JoinedGroup> {
+            let mut state = self.state.lock().await;
+            state.joins.push(invite.to_owned());
+            let group = NamedGroupDetails {
+                group_id: "group-a".to_owned(),
+                name: "joined group".to_owned(),
+                members: vec![NamedGroupMember {
+                    agent_id: AGENT_A.to_owned(),
+                    state: Some("active".to_owned()),
+                }],
+            };
+            state.groups.push(group.clone());
+            Ok(JoinedGroup {
+                group_id: group.group_id,
+                group_name: Some(group.name),
+            })
+        }
+
+        async fn list_tasks(&self, list_id: &str) -> client::Result<Vec<TaskEntry>> {
+            let mut state = self.state.lock().await;
+            state.list_task_calls.push(list_id.to_owned());
+            if state.hidden_list_ids.iter().any(|hidden| hidden == list_id) {
+                return Err(ClientError::Http {
+                    status: StatusCode::NOT_FOUND,
+                    body: "hidden by group membership".to_owned(),
+                });
+            }
+            Ok(state.tasks.clone())
         }
 
         async fn add_task(&self, _list_id: &str, draft: AddTaskDraft) -> client::Result<String> {
@@ -1086,6 +1327,15 @@ mod tests {
         ))
     }
 
+    fn grouped_tracker(api: Arc<MockApi>, group: &str) -> TestResult<X0xCrdtTracker> {
+        Ok(
+            X0xCrdtTracker::builder("mock://x0xd", "list-a", AgentId::new(AGENT_A)?)
+                .client(api)
+                .group(group)
+                .build()?,
+        )
+    }
+
     fn claim_for(task_id: &str, agent: &str) -> TestResult<Claim> {
         Ok(Claim::new(
             Some(IssueId::new(task_id)?),
@@ -1131,6 +1381,65 @@ mod tests {
 
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].id, IssueId::new(ISSUE_B)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_invite_is_joined_on_first_fetch_and_scopes_task_list() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "grouped", "empty", 3)]).await;
+        let tracker = grouped_tracker(api.clone(), "x0x://invite/test-token")?;
+        let ctx = PollContext::new(
+            vec![IssueState::new("todo")?],
+            vec![IssueState::new("done")?],
+        );
+
+        let candidates = tracker.fetch_candidates(&ctx).await?;
+
+        assert_eq!(api.join_count().await, 1);
+        assert_eq!(
+            api.list_task_calls().await,
+            vec![group_scoped_list_id("group-a", "list-a")]
+        );
+        assert_eq!(candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_name_resolves_without_rejoining() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "grouped", "empty", 3)]).await;
+        api.add_group("group-b", "project-alpha").await;
+        let tracker = grouped_tracker(api.clone(), "project-alpha")?;
+        let ctx = PollContext::new(
+            vec![IssueState::new("todo")?],
+            vec![IssueState::new("done")?],
+        );
+
+        let candidates = tracker.fetch_candidates(&ctx).await?;
+
+        assert_eq!(api.join_count().await, 0);
+        assert_eq!(
+            api.list_task_calls().await,
+            vec![group_scoped_list_id("group-b", "list-a")]
+        );
+        assert_eq!(candidates.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn group_hidden_task_list_returns_zero_candidates() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "hidden", "empty", 3)]).await;
+        api.add_group("group-c", "project-charlie").await;
+        api.hide_task_list(&group_scoped_list_id("group-c", "list-a"))
+            .await;
+        let tracker = grouped_tracker(api, "project-charlie")?;
+        let ctx = PollContext::new(
+            vec![IssueState::new("todo")?],
+            vec![IssueState::new("done")?],
+        );
+
+        let candidates = tracker.fetch_candidates(&ctx).await?;
+
+        assert!(candidates.is_empty());
         Ok(())
     }
 
