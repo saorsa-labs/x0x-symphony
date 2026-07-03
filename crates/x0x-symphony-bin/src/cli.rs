@@ -343,7 +343,11 @@ fn run_config(command: &ConfigCommand) -> Result<Output> {
             )))
         }
         ConfigCommand::Check { config } => match WorkflowConfig::load(config) {
-            Ok(_) => Ok(Output::success("config ok\n")),
+            Ok(workflow) => Ok(Output {
+                stdout: "config ok\n".to_owned(),
+                stderr: format_validation_warnings(&workflow.warnings),
+                exit_code: 0,
+            }),
             Err(crate::config::Error::Invalid { problems }) => {
                 Ok(Output::failure(format_validation_errors(&problems)))
             }
@@ -454,6 +458,17 @@ fn format_validation_errors(problems: &[String]) -> String {
     let lines = problems
         .iter()
         .map(|problem| format!("error: {problem}"))
+        .collect::<Vec<_>>();
+    join_lines(&lines)
+}
+
+fn format_validation_warnings(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let lines = warnings
+        .iter()
+        .map(|warning| format!("warning: {warning}"))
         .collect::<Vec<_>>();
     join_lines(&lines)
 }

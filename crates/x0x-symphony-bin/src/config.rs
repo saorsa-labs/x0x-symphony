@@ -18,6 +18,8 @@ use x0x_symphony_orchestrator::{
 use x0x_symphony_runner_shell::RunnerSpec;
 use x0x_symphony_signing::SigningPolicy;
 
+const LEGACY_CODEX_BLOCK_DEPRECATION: &str = "`codex:` top-level block is deprecated and will be removed in M5 (XSY-0031); use `runner: {kind: shell, preset: codex}` instead. See docs/symphony/operator.md#migrating-from-the-legacy-codex-block.";
+
 /// Result alias for workflow configuration operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -94,6 +96,8 @@ pub struct WorkflowConfig {
     pub workers: WorkersConfig,
     /// Raw runner block used by `RunnerSpec`.
     pub runner: Value,
+    /// Non-fatal configuration warnings surfaced by `config check`.
+    pub warnings: Vec<String>,
 }
 
 /// Tracker configuration parsed from the `tracker:` block.
@@ -250,11 +254,14 @@ impl WorkflowConfig {
     /// Returns [`Error::Invalid`] when required keys are missing or invalid.
     pub fn from_raw(raw: Value, prompt_template: String) -> Result<Self> {
         let mut problems = Vec::new();
+        let mut warnings = Vec::new();
         let Some(root) = raw.as_object() else {
             return Err(Error::Invalid {
                 problems: vec!["workflow frontmatter must be a mapping".to_owned()],
             });
         };
+
+        warn_legacy_codex_block(root, &mut warnings);
 
         let tracker = parse_tracker(root, &mut problems);
         let polling = parse_polling(root, &mut problems);
@@ -292,6 +299,7 @@ impl WorkflowConfig {
             sharding: sharding.ok_or_else(internal_validation_gap)?,
             workers: workers.ok_or_else(internal_validation_gap)?,
             runner: runner.ok_or_else(internal_validation_gap)?,
+            warnings,
         })
     }
 
@@ -366,6 +374,13 @@ fn split_frontmatter(content: &str) -> Result<(&str, &str)> {
         return Err(Error::MissingFrontmatter);
     };
     Ok((yaml, body))
+}
+
+fn warn_legacy_codex_block(root: &Map<String, Value>, warnings: &mut Vec<String>) {
+    if root.contains_key("codex") {
+        tracing::warn!("{LEGACY_CODEX_BLOCK_DEPRECATION}");
+        warnings.push(LEGACY_CODEX_BLOCK_DEPRECATION.to_owned());
+    }
 }
 
 fn parse_tracker(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<TrackerConfig> {

@@ -136,6 +136,27 @@ Preset-specific `sandbox_args` can be prepended to child argv as
 defense-in-depth (for example, a harness-native `--sandbox` flag), but the host
 sandbox remains the enforcement boundary.
 
+### Migrating from the legacy `codex:` block
+
+Older `WORKFLOW.md` files may still carry a top-level Codex block:
+
+```yaml
+codex:
+  app_server: true
+```
+
+Current configs should express Codex through the shell runner preset instead:
+
+```yaml
+runner:
+  kind: shell
+  preset: codex
+```
+
+The legacy `codex:` top-level block now emits a WARN during config load and
+`config check`; it becomes a hard error in M5 (XSY-0031). See
+[`runner-authoring.md`](runner-authoring.md#adding-a-preset) for preset details.
+
 Validate without starting the daemon:
 
 ```bash
