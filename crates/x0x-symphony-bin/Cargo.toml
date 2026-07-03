@@ -21,6 +21,7 @@ path = "src/bin/x0x-symphony.rs"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 hex = "0.4"
@@ -42,6 +43,7 @@ x0x-symphony-workspace = { path = "../x0x-symphony-workspace" }
 
 [dev-dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 tempfile = "3"
 
 [lints]

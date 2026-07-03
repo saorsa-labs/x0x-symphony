@@ -64,6 +64,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         X0xdTrustClient::new(&workflow.signing.x0xd_url)
             .context("failed to configure x0xd trust client")?,
     );
+    let api_signing_client: Arc<dyn SigningClient> = signing_client.clone();
     let approval_signing_client: Arc<dyn SigningClient> = signing_client.clone();
     let approval_key_resolver: Arc<dyn TrustedKeyResolver> = signing_client;
     let orchestrator = Arc::new(Orchestrator::new_with_signing(
@@ -92,7 +93,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let orchestrator_handle: Arc<dyn api::OrchestratorHandle> = orchestrator.clone();
     let api_tracker: Arc<dyn x0x_symphony_core::Tracker> = tracker.clone();
     let app_state = api::AppState::new(api_tracker, agent_id, api_token, Some(orchestrator_handle))
-        .with_proofs_dir(proofs_dir);
+        .with_proofs_dir(proofs_dir)
+        .with_signing_client(Some(api_signing_client))
+        .with_approval_ttl(workflow.security.approval_ttl);
     let app = api::build_router(app_state);
     let listener = TcpListener::bind(bind_addr)
         .await

@@ -5,6 +5,7 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -22,15 +23,18 @@ use futures_util::{stream, Stream};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
-use tokio::{
-    sync::broadcast,
-    time::{self, Duration},
+use tokio::{sync::broadcast, time};
+use x0x_symphony_core::{
+    approval_decision, content_hash, sha256_hex, AgentId, ApprovalDecision, ApprovalEvent,
+    ApprovalState, ApprovalVerdict, Claim, Handoff, Issue, IssueId, IssueSource, SignatureEnvelope,
+    SignatureProvenance, Tracker, APPROVAL_CONTEXT, SIGN_ALGORITHM,
 };
-use x0x_symphony_core::{AgentId, Claim, Handoff, Issue, IssueId, Tracker};
+use x0x_symphony_signing::SigningClient;
 
 const AUTH_ERROR: &str = "missing or invalid Authorization: Bearer token";
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const HEARTBEAT_SECS: u64 = 3;
+const DEFAULT_APPROVAL_TTL: Duration = Duration::from_hours(24);
 
 /// Marker trait for a daemon orchestrator handle stored in [`AppState`].
 pub trait OrchestratorHandle: Send + Sync {}
@@ -45,6 +49,8 @@ pub struct AppState {
     agent_id: AgentId,
     orchestrator: Option<Arc<dyn OrchestratorHandle>>,
     api_token: String,
+    signing_client: Option<Arc<dyn SigningClient>>,
+    approval_ttl: Duration,
     events_tx: broadcast::Sender<EventNotice>,
 }
 
@@ -157,6 +163,67 @@ pub struct HandoffResponse {
     pub recorded: bool,
 }
 
+/// One issue awaiting operator approval for network-sourced dispatch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingApproval {
+    /// Issue id whose current payload requires approval.
+    pub issue_id: String,
+    /// Issue title displayed to the operator.
+    pub title: String,
+    /// Current workflow state.
+    pub state: String,
+    /// Current canonical content hash bound by approval events.
+    pub content_hash: String,
+    /// Verified network signer whose issue payload is awaiting consent.
+    pub signer_agent_id: String,
+    /// Source signature provenance attached by the tracker, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PendingApprovalProvenance>,
+    /// Summary of stored approval, denial, and consumption records.
+    pub approval_summary: ApprovalSummary,
+}
+
+/// Stored approval-record counts returned with a pending approval row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalSummary {
+    /// Number of approval or denial events stored for the issue.
+    pub events: usize,
+    /// Number of approval-consumption records stored for the issue.
+    pub consumed: usize,
+    /// Whether any stored event is a denial.
+    pub has_deny: bool,
+}
+
+/// Serializable view of source signature provenance for approval consumers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PendingApprovalProvenance {
+    /// A source signature was verified and binds the issue to this signer.
+    Verified {
+        /// x0x agent id whose ML-DSA-65 signature verified.
+        signer_agent_id: String,
+    },
+    /// A source signature was present but failed verification.
+    Invalid {
+        /// Verification failure detail suitable for operator display.
+        reason: String,
+    },
+    /// Verification could not complete because the verifier transport failed.
+    TransportError {
+        /// Transport failure detail suitable for operator display.
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SubmitApprovalRequest {
+    pub(crate) verdict: ApprovalVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_signer_agent_id: Option<String>,
+}
+
 /// Errors returned by API handlers.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -178,6 +245,15 @@ pub enum Error {
     /// A proof was not found.
     #[error("proof not found: {0}")]
     NotFound(String),
+    /// A request conflicted with the current issue view.
+    #[error("conflict: {0}")]
+    Conflict(String),
+    /// Approval signing is not available for this daemon.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+    /// Approval signing failed.
+    #[error("signing error: {0}")]
+    Signing(String),
     /// A bind address was not loopback.
     #[error("bind address must be loopback; got {0}")]
     NonLoopbackBind(SocketAddr),
@@ -219,6 +295,8 @@ impl AppState {
             agent_id,
             orchestrator,
             api_token,
+            signing_client: None,
+            approval_ttl: DEFAULT_APPROVAL_TTL,
             events_tx,
         }
     }
@@ -227,6 +305,20 @@ impl AppState {
     #[must_use]
     pub fn with_proofs_dir(mut self, proofs_dir: PathBuf) -> Self {
         self.proofs_dir = proofs_dir;
+        self
+    }
+
+    /// Return a copy that signs approval decisions with `client` when configured.
+    #[must_use]
+    pub fn with_signing_client(mut self, client: Option<Arc<dyn SigningClient>>) -> Self {
+        self.signing_client = client;
+        self
+    }
+
+    /// Return a copy that evaluates pending approvals with `ttl`.
+    #[must_use]
+    pub fn with_approval_ttl(mut self, ttl: Duration) -> Self {
+        self.approval_ttl = ttl;
         self
     }
 
@@ -250,6 +342,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/symphony/tasks", get(tasks))
         .route("/symphony/status", get(status))
         .route("/symphony/events", get(events))
+        .route("/symphony/approvals/pending", get(approvals_pending))
+        .route("/symphony/approvals/{id}", post(submit_approval))
         .route("/symphony/claim/{id}", post(claim_issue))
         .route("/symphony/handoff/{id}", post(handoff_issue))
         .route("/symphony/routes", get(routes))
@@ -418,6 +512,116 @@ async fn handoff_issue(
     Ok(Json(HandoffResponse { id, recorded: true }))
 }
 
+async fn approvals_pending(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<PendingApproval>>, Error> {
+    let issues = state
+        .tracker
+        .list_issues()
+        .await
+        .map_err(|error| Error::Tracker(error.to_string()))?;
+    let now = now_utc();
+    let mut pending = Vec::new();
+    for issue in issues {
+        if !is_active_approval_state(&issue) {
+            continue;
+        }
+        let Some(network_signer) = verified_network_signer_for_pending(&issue) else {
+            continue;
+        };
+        let approval_state = state
+            .tracker
+            .load_approval_state(&issue.id)
+            .await
+            .map_err(|error| Error::Tracker(error.to_string()))?;
+        if approval_decision(
+            &approval_state.events,
+            &issue,
+            &network_signer,
+            &now,
+            state.approval_ttl,
+            &approval_state.consumed,
+        ) == ApprovalDecision::Pending
+        {
+            pending.push(pending_approval_from_issue(
+                &issue,
+                &network_signer,
+                &approval_state,
+            ));
+        }
+    }
+    pending.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
+    Ok(Json(pending))
+}
+
+async fn submit_approval(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<SubmitApprovalRequest>,
+) -> Result<Json<ApprovalEvent>, Error> {
+    let signing_client = state
+        .signing_client
+        .as_ref()
+        .ok_or_else(|| Error::ServiceUnavailable("approval signing not configured".to_owned()))?;
+    let issue_id =
+        IssueId::new(id.clone()).map_err(|error| Error::BadRequest(error.to_string()))?;
+    let issues = state
+        .tracker
+        .fetch_by_ids(std::slice::from_ref(&issue_id))
+        .await
+        .map_err(|error| Error::Tracker(error.to_string()))?;
+    let issue = issues
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::NotFound(id.clone()))?;
+    let current_hash = content_hash(&issue);
+    let network_signer = require_verified_network_signer(&issue)?;
+    if let Some(expected_hash) = request.expected_content_hash.as_deref() {
+        if expected_hash != current_hash.as_str() {
+            return Err(Error::Conflict(format!(
+                "issue payload changed: expected content hash {expected_hash}, current {}",
+                current_hash.as_str()
+            )));
+        }
+    }
+    if let Some(expected_signer) = request.expected_signer_agent_id.as_deref() {
+        if expected_signer != network_signer.as_str() {
+            return Err(Error::Conflict(format!(
+                "issue signer changed: expected {expected_signer}, current {}",
+                network_signer.as_str()
+            )));
+        }
+    }
+
+    let approved_at = now_utc();
+    let event = match request.verdict {
+        ApprovalVerdict::Approve => ApprovalEvent::approve(
+            issue_id.clone(),
+            current_hash,
+            network_signer,
+            approved_at,
+            state.agent_id.clone(),
+            None,
+        ),
+        ApprovalVerdict::Deny => ApprovalEvent::deny(
+            issue_id.clone(),
+            current_hash,
+            network_signer,
+            approved_at,
+            state.agent_id.clone(),
+            None,
+        ),
+    };
+    let signed = sign_approval_event(signing_client.as_ref(), event).await?;
+    state
+        .tracker
+        .store_approval(&signed)
+        .await
+        .map_err(|error| Error::Tracker(error.to_string()))?;
+    state.notify_task_changed(issue_id.as_str());
+    Ok(Json(signed))
+}
+
 async fn routes() -> Json<Routes> {
     Json(Routes {
         routes: route_infos(),
@@ -469,14 +673,70 @@ async fn show_proof(
     Ok(Json(Proof { name, content }))
 }
 
+/// Sign an approval or denial event exactly as the dispatch gate verifies it.
+///
+/// The payload is [`ApprovalEvent::signing_payload_bytes`] signed under
+/// [`APPROVAL_CONTEXT`], and the returned event carries a [`SignatureEnvelope`]
+/// whose digest covers those exact bytes.
+///
+/// # Errors
+///
+/// Returns [`Error::Signing`] if the event payload cannot be serialized, x0xd
+/// signing fails, or x0xd returns an algorithm, context, or signer that does not
+/// match the approval event being signed.
+pub async fn sign_approval_event(
+    client: &dyn SigningClient,
+    mut event: ApprovalEvent,
+) -> Result<ApprovalEvent, Error> {
+    let payload = event
+        .signing_payload_bytes()
+        .map_err(|error| Error::Signing(error.to_string()))?;
+    let response = client
+        .sign(APPROVAL_CONTEXT, &payload)
+        .await
+        .map_err(|error| Error::Signing(error.to_string()))?;
+    if response.algorithm != SIGN_ALGORITHM {
+        return Err(Error::Signing(format!(
+            "sign response algorithm {} did not match {SIGN_ALGORITHM}",
+            response.algorithm
+        )));
+    }
+    if response.context != APPROVAL_CONTEXT {
+        return Err(Error::Signing(format!(
+            "sign response context {} did not match {APPROVAL_CONTEXT}",
+            response.context
+        )));
+    }
+    if response.agent_id != event.approver_agent_id.as_str() {
+        return Err(Error::Signing(format!(
+            "sign response agent {} did not match approver {}",
+            response.agent_id,
+            event.approver_agent_id.as_str()
+        )));
+    }
+    event.signature = Some(SignatureEnvelope::new(
+        response.algorithm,
+        response.context,
+        response.public_key_b64,
+        response.signature_b64,
+        sha256_hex(&payload),
+        response.agent_id,
+    ));
+    Ok(event)
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadRequest(_) | Self::InvalidBind { .. } | Self::NonLoopbackBind(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Self::Io { .. } | Self::Tracker(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Io { .. } | Self::Tracker(_) | Self::Signing(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         let body = Json(json!({ "error": self.to_string() }));
         (status, body).into_response()
@@ -545,15 +805,117 @@ fn claim_info_from_issue(issue: &Issue, claim: &Claim) -> ClaimInfo {
     }
 }
 
+fn pending_approval_from_issue(
+    issue: &Issue,
+    signer: &AgentId,
+    approval_state: &ApprovalState,
+) -> PendingApproval {
+    PendingApproval {
+        issue_id: issue.id.to_string(),
+        title: issue.title.clone(),
+        state: issue.state.to_string(),
+        content_hash: content_hash(issue).to_string(),
+        signer_agent_id: signer.to_string(),
+        provenance: issue
+            .signature_provenance
+            .as_ref()
+            .map(PendingApprovalProvenance::from),
+        approval_summary: approval_summary(approval_state),
+    }
+}
+
+fn approval_summary(approval_state: &ApprovalState) -> ApprovalSummary {
+    ApprovalSummary {
+        events: approval_state.events.len(),
+        consumed: approval_state.consumed.len(),
+        has_deny: approval_state.events.iter().any(ApprovalEvent::is_denial),
+    }
+}
+
+fn is_active_approval_state(issue: &Issue) -> bool {
+    matches!(issue.state.as_str(), "todo" | "in_progress")
+}
+
+fn verified_network_signer_for_pending(issue: &Issue) -> Option<AgentId> {
+    if !is_network_sourced(issue) {
+        return None;
+    }
+    match &issue.signature_provenance {
+        Some(SignatureProvenance::Verified { signer_agent_id })
+            if !signer_agent_id.trim().is_empty() =>
+        {
+            AgentId::new(signer_agent_id.trim().to_owned()).ok()
+        }
+        Some(
+            SignatureProvenance::Verified { .. }
+            | SignatureProvenance::Invalid { .. }
+            | SignatureProvenance::TransportError { .. },
+        )
+        | None => None,
+    }
+}
+
+fn require_verified_network_signer(issue: &Issue) -> Result<AgentId, Error> {
+    if !is_network_sourced(issue) {
+        return Err(Error::Conflict(
+            "issue is not network-sourced; approval not applicable".to_owned(),
+        ));
+    }
+    match &issue.signature_provenance {
+        Some(SignatureProvenance::Verified { signer_agent_id })
+            if !signer_agent_id.trim().is_empty() =>
+        {
+            AgentId::new(signer_agent_id.trim().to_owned())
+                .map_err(|error| Error::Conflict(error.to_string()))
+        }
+        Some(SignatureProvenance::Verified { .. }) | None => Err(Error::Conflict(
+            "network-sourced issue lacks verified ML-DSA-65 signature provenance".to_owned(),
+        )),
+        Some(SignatureProvenance::Invalid { reason }) => Err(Error::Conflict(format!(
+            "network-sourced issue signature is invalid: {reason}"
+        ))),
+        Some(SignatureProvenance::TransportError { reason }) => Err(Error::Conflict(format!(
+            "network-sourced issue signature verification transport failed: {reason}"
+        ))),
+    }
+}
+
+fn is_network_sourced(issue: &Issue) -> bool {
+    IssueSource::from_issue(issue) == IssueSource::NetworkSourced
+        || issue.signature_provenance.is_some()
+}
+
+fn now_utc() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
+impl From<&SignatureProvenance> for PendingApprovalProvenance {
+    fn from(value: &SignatureProvenance) -> Self {
+        match value {
+            SignatureProvenance::Verified { signer_agent_id } => Self::Verified {
+                signer_agent_id: signer_agent_id.clone(),
+            },
+            SignatureProvenance::Invalid { reason } => Self::Invalid {
+                reason: reason.clone(),
+            },
+            SignatureProvenance::TransportError { reason } => Self::TransportError {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
 fn route_infos() -> Vec<RouteInfo> {
     [
         ("GET", "/health"),
+        ("GET", "/symphony/approvals/pending"),
         ("GET", "/symphony/events"),
         ("GET", "/symphony/proofs"),
         ("GET", "/symphony/proofs/{name}"),
         ("GET", "/symphony/routes"),
         ("GET", "/symphony/status"),
         ("GET", "/symphony/tasks"),
+        ("POST", "/symphony/approvals/{id}"),
         ("POST", "/symphony/claim/{id}"),
         ("POST", "/symphony/handoff/{id}"),
     ]
