@@ -7,17 +7,17 @@
 //
 // X0XD_URL=http://127.0.0.1:<port> \
 // X0XD_TOKEN=... \
-// cargo test -p x0x-symphony-tracker-git-jsonl --test live_signing -- --ignored --nocapture
+// cargo test -p x0x-symphony-signing --test live_signing -- --ignored --nocapture
 
 use std::{env, error::Error};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use x0x_symphony_core::{AgentId, Claim, IssueId, ShardRole, CLAIM_CONTEXT, SIGN_ALGORITHM};
-use x0x_symphony_tracker_git_jsonl::signing::{SigningClient, X0xdClient};
+use x0x_symphony_signing::{SigningClient, X0xdClient};
 
 const ML_DSA_65_PUBLIC_KEY_BYTES: usize = 1952;
 const MANUAL_RUN: &str = "X0XD_URL=http://127.0.0.1:<port> X0XD_TOKEN=... \
-cargo test -p x0x-symphony-tracker-git-jsonl --test live_signing -- --ignored --nocapture";
+cargo test -p x0x-symphony-signing --test live_signing -- --ignored --nocapture";
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -60,10 +60,7 @@ async fn live_x0xd_sign_verify_claim_payload_round_trip() -> TestResult {
         .verify(CLAIM_CONTEXT, &payload, &signature, &public_key)
         .await?;
     assert!(
-        matches!(
-            verified,
-            x0x_symphony_tracker_git_jsonl::signing::VerifyOutcome::Valid
-        ),
+        matches!(verified, x0x_symphony_signing::VerifyOutcome::Valid),
         "x0xd /agent/verify rejected the payload signed by /agent/sign: {verified:?}"
     );
     Ok(())

@@ -1,9 +1,9 @@
 # Operator guide
 
-Operational guidance for running an x0x-symphony agent against a local
-`issues/issues.jsonl` backlog.
+Operational guidance for running an x0x-symphony agent against an x0xd
+`TaskList` backlog.
 
-This guide describes the current shipped behaviour of `x0x-symphonyd` and the
+This guide describes the current M3 behaviour of `x0x-symphonyd` and the
 `x0x-symphony` CLI. It is kept consistent with what the code actually does —
 where a boundary exists it is stated explicitly rather than papered over.
 
@@ -12,11 +12,11 @@ architecture see [`../design/symphony.md`](../design/symphony.md).
 
 ## Current scope (what ships)
 
-M1 is a single-host vertical slice:
+M3 is a single-daemon vertical slice backed by x0xd:
 
-- **Tracker:** the `git_jsonl` adapter — one local `issues/issues.jsonl` file,
-  every state transition (claim / heartbeat / release / handoff / block)
-  committed to a local git repo.
+- **Tracker:** the `x0x_crdt` adapter — one x0xd `TaskList` plus its
+  deterministic `symphony-<list-id>` `KvStore` sidecar. Claims, heartbeats,
+  releases, handoffs, and blocks are written through x0xd REST endpoints.
 - **Runner:** the shell runner — resolves a `RunnerSpec` from `WORKFLOW.md`
   and executes it as a static argv with the issue prompt streamed over stdin.
 - **Workspace:** per-issue workspace created under `workspace.root/<sanitized-id>/`
@@ -34,15 +34,17 @@ M1 is a single-host vertical slice:
 
 ### Current boundaries (what still does NOT ship — stated, not hidden)
 
-- **No distributed workers, no MLS.** The runner can be host-sandboxed when
-  `runner.sandbox` is configured; omitting that block intentionally preserves
-  unsandboxed local-development behavior. Execution is local-backlog-only until
-  M3. The operator vouches for every command in `WORKFLOW.md` (see
-  [`security.md`](./security.md)).
+- **x0xd is required.** The daemon reads its agent identity from x0xd's
+  `/agent` endpoint and uses `signing.x0xd_url` as the base URL for both
+  signing and `TaskList`/`KvStore` tracker operations.
+- **Distributed worker discovery is not shipped yet.** The runner can be
+  host-sandboxed when `runner.sandbox` is configured; omitting that block
+  intentionally preserves unsandboxed local-development behavior. The operator
+  vouches for every command in `WORKFLOW.md` (see [`security.md`](./security.md)).
 - **SSE is an in-process broadcast.** `/symphony/events` streams heartbeats and
-  task-change events originating from this daemon's own API mutations;
-  external edits to the JSONL are visible on the next poll/read but are not
-  pushed cross-process.
+  task-change events originating from this daemon's own API mutations; x0xd
+  gossip updates are visible on the next tracker poll/read but are not pushed
+  into this daemon's SSE stream yet.
 
 ## Quickstart (the §2 demo)
 
@@ -50,11 +52,10 @@ From a clean checkout:
 
 ```bash
 just check                                    # fmt, clippy -D warnings, nextest, doc — all green
-cargo run --bin x0x-symphonyd -- --config WORKFLOW.md &   # starts, loads config, polls
-x0x-symphony tasks                            # lists the backlog
-# ... daemon dispatches a todo issue: workspace created, runner executes, handoff written ...
-x0x-symphony tasks --state review             # the issue is now in review with a handoff
-git log --oneline issues/issues.jsonl         # shows the claim + handoff commits
+cargo run --bin x0x-symphonyd -- --config WORKFLOW.md &   # starts, connects to x0xd, polls
+x0x-symphony tasks                            # lists the x0xd TaskList backlog
+# ... daemon dispatches a todo task: workspace created, runner executes, handoff written ...
+x0x-symphony tasks --state review             # the task is now in review with a handoff sidecar
 ```
 
 A worked, reproducible transcript of this (against a stub runner) is committed
@@ -77,12 +78,32 @@ non-zero on any missing/invalid key, printing one clear error per problem:
 
 | Block | Required keys |
 |-------|---------------|
-| `tracker` | `kind` (`git_issues`), `path` |
+| `tracker` | `kind` (`x0x_crdt`; aliases `crdt`, `x0x`), `list_id`; optional `group` for x0xd named/MLS scoping |
 | `polling` | `interval_ms` (≥ 1) |
 | `workspace` | `root` (`~` expanded) |
 | `hooks` | `timeout_ms`; `after_create`, `before_run`, `after_run`, and `before_remove` are optional scripts (absent or empty = disabled) |
 | `agent` | `max_concurrent_agents`, `max_concurrent_agents_by_state`, `max_turns`, `max_retry_backoff_ms` |
 | `runner` | `kind` (`shell`); the `runner:` block is then resolved by `RunnerSpec::from_workflow_config` (so `runner.preset` and optional `runner.sandbox` are accepted) |
+
+Minimal M3 tracker/signing configuration:
+
+```yaml
+tracker:
+  kind: x0x_crdt
+  list_id: x0x-symphony          # x0xd TaskList id/topic
+  # group: private-project      # optional x0xd group id, name, or invite
+
+signing:
+  policy: required              # disabled for local dev, required for signed records
+  x0xd_url: http://127.0.0.1:12700
+```
+
+`x0x-symphonyd` always contacts `signing.x0xd_url` during startup to resolve
+its agent id from `/agent`. When `signing.policy: required`, claim and handoff
+payloads are signed through `/agent/sign` and verified through `/agent/verify`.
+The old local JSONL tracker and `x0x-symphony issue new` writer were removed in
+M3; create backlog items in the configured x0xd TaskList until daemon-backed
+task creation lands in M4.
 
 Optional runner sandbox schema:
 
@@ -238,56 +259,34 @@ x0x-symphony routes                        # list daemon HTTP routes
 Output is deterministic text (no wall-clock timestamps) so it is
 snapshot-testable and scriptable.
 
-## Tracker lock semantics (M1–M2 git_jsonl adapter)
+## x0x CRDT tracker operations (M3+)
 
-The M1 `git_jsonl` tracker serializes every state transition
-(claim / heartbeat / release / handoff) with a file lock. Three behaviors
-matter operationally:
+The M3 daemon uses `x0x-symphony-tracker-x0x-crdt` directly. It maps the
+configured `tracker.list_id` to x0xd `/task-lists/<list-id>/tasks` and stores
+Symphony-only claim/handoff metadata in `/stores/symphony-<list-id>`. When
+`tracker.group` is configured, the adapter resolves or joins the named/MLS
+group through x0xd and scopes the task-list id to
+`x0x.group.<group-id>.symphony.<list-id>`.
 
-1. **The lock is `<git-dir>/index.lock` — the same path `git` uses.** The
-   adapter takes it with an exclusive `create_new` and releases it *before*
-   running `git add`/`git commit`, so git can re-acquire its own index lock.
-   **Concurrent operator `git` commands** (a manual `git commit`, a second
-   symphony process, etc.) contend on this single path. Under contention the
-   adapter retries with backoff and, if it cannot acquire the lock within its
-   budget, returns a structured `LockExhausted` error instead of corrupting
-   the file. If you see `LockExhausted`, another writer is active — wait and
-   retry, or serialize your manual git operations.
+Operational implications:
 
-2. **A crashed process leaves a stale lock that must be removed by hand.** The
-   adapter deletes only the lock file *it* created; it does **not** remove
-   locks left behind by other (possibly crashed) processes. If a previous run
-   was killed while holding `<git-dir>/index.lock`, every subsequent write
-   fails with `LockExhausted` until you remove the orphaned file:
-
-   ```sh
-   rm -f .git/index.lock   # only after confirming no symphony/git process is running
-   ```
-
-   Confirm no writer is actually running before removing it — removing a lock
-   that a live process still holds can corrupt the JSONL under concurrent
-   writes. (Automated stale-lock recovery with a liveliness probe is tracked
-   as a follow-up in XSY-0040.)
-
-3. **Tracker commits skip git hooks (`--no-verify`).** The adapter commits
-   issue-line rewrites with `git commit --no-verify`. This is deliberate: the
-   tracker owns the issue backlog and must not be blocked by pre-commit or
-   pre-push hooks installed in the operator's environment. Any policy you want
-   to enforce via hooks must be applied out-of-band (e.g. a CI check on the
-   tracker commit, or a separate review step).
-
-For the full concurrency model, retry/backoff tuning, and the M3 supersession
-path (this adapter is deleted by XSY-0024 when the `x0x_crdt` tracker becomes
-the permanent backend), see the crate-level documentation of
-`x0x-symphony-tracker-git-jsonl`.
+1. **Run x0xd first.** Daemon startup fails if `signing.x0xd_url` is
+   unreachable or `/agent` cannot return the local agent id.
+2. **TaskList/KvStore availability is an x0xd concern.** The daemon assumes the
+   configured TaskList and its sidecar store are available through x0xd. x0xd
+   permissions or MLS membership determine what the daemon can see.
+3. **No git commits or file locks.** The removed M1-M2 JSONL adapter no longer
+   writes `issues/issues.jsonl`, takes `.git/index.lock`, or commits tracker
+   transitions. The bootstrap issue database remains only as project history and
+   for this repository's human handoff records.
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---------|-------------|
 | `401` on every `/symphony/*` call | CLI is reading the wrong token; pass `--token` or `--data-dir` matching the running daemon. |
-| `LockExhausted` on writes | A writer (git or another symphony) holds `.git/index.lock`; wait, or remove it only after confirming nothing is running (see above). |
-| Daemon exits with a schema violation at startup | `issues/issues.jsonl` has a malformed or blank line. Re-init the file empty (0 bytes) — do **not** seed it with `echo ""`, which adds a blank line. |
+| Daemon exits while reading `/agent` | x0xd is not running at `signing.x0xd_url`, the token is wrong, or x0xd's local agent identity is unavailable. Start x0xd and export `X0X_API_TOKEN` if required. |
+| Tasks endpoint returns a tracker error | The configured `tracker.list_id` or group-scoped TaskList/KvStore is missing or not visible to this x0xd identity. Create or join it in x0xd, then retry. |
 | Daemon refuses to start: "bind address must be loopback" | `--bind` was set to a non-loopback address. Use `127.0.0.1:0`. |
 | Issue stuck in `in_progress` after a crash | Restart the daemon; startup reconciliation releases the stale claim (it has expired past `claim_ttl`). |
 | Hooks not running | Confirm the script key is present and non-empty, `hooks.timeout_ms` is long enough, and the lifecycle point actually occurs. `before_remove` only runs when a workspace is about to be destroyed for a configured terminal state. |

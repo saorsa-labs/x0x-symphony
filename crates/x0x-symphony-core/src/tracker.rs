@@ -207,6 +207,15 @@ impl ReleaseReason {
 /// ```
 #[async_trait]
 pub trait Tracker: Send + Sync {
+    /// List every issue visible to this tracker without dispatch filtering.
+    ///
+    /// Adapters that predate this method return a structured unsupported error.
+    async fn list_issues(&self) -> Result<Vec<Issue>> {
+        Err(crate::SymphonyError::Tracker(
+            "tracker does not support listing all issues".into(),
+        ))
+    }
+
     /// Fetch issues currently dispatchable to an agent.
     async fn fetch_candidates(&self, ctx: &PollContext) -> Result<Vec<Issue>>;
 

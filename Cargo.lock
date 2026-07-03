@@ -2102,6 +2102,7 @@ name = "x0x-symphony-bin"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "futures-util",
@@ -2119,7 +2120,8 @@ dependencies = [
  "x0x-symphony-core",
  "x0x-symphony-orchestrator",
  "x0x-symphony-runner-shell",
- "x0x-symphony-tracker-git-jsonl",
+ "x0x-symphony-signing",
+ "x0x-symphony-tracker-x0x-crdt",
  "x0x-symphony-workspace",
 ]
 
@@ -2153,7 +2155,6 @@ dependencies = [
  "tokio",
  "tracing",
  "x0x-symphony-core",
- "x0x-symphony-tracker-git-jsonl",
  "x0x-symphony-workspace",
 ]
 
@@ -2177,20 +2178,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "x0x-symphony-tracker-git-jsonl"
+name = "x0x-symphony-signing"
 version = "0.0.0"
 dependencies = [
  "async-trait",
  "base64",
- "chrono",
- "proptest",
  "reqwest",
  "serde",
- "serde_json",
- "tempfile",
  "thiserror",
  "tokio",
- "tracing",
  "x0x-symphony-core",
 ]
 
@@ -2210,7 +2206,7 @@ dependencies = [
  "tokio",
  "tracing",
  "x0x-symphony-core",
- "x0x-symphony-tracker-git-jsonl",
+ "x0x-symphony-signing",
 ]
 
 [[package]]

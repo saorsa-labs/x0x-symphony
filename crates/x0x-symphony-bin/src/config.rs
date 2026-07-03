@@ -14,7 +14,7 @@ use x0x_symphony_core::{
 };
 use x0x_symphony_orchestrator::{Config as OrchestratorConfig, RetryPolicy, TrustLevel};
 use x0x_symphony_runner_shell::RunnerSpec;
-use x0x_symphony_tracker_git_jsonl::signing::SigningPolicy;
+use x0x_symphony_signing::SigningPolicy;
 
 /// Result alias for workflow configuration operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -95,10 +95,10 @@ pub struct WorkflowConfig {
 /// Tracker configuration parsed from the `tracker:` block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrackerConfig {
-    /// Tracker kind. M1 accepts only `git_issues`.
+    /// Tracker kind. M3 accepts `x0x_crdt` (aliases: `crdt`, `x0x`).
     pub kind: String,
-    /// Path to the JSONL issue database, relative to the workflow file when not absolute.
-    pub path: PathBuf,
+    /// x0xd `TaskList` id used by the CRDT tracker.
+    pub list_id: String,
     /// Optional x0xd named/MLS group for group-scoped CRDT trackers.
     pub group: Option<String>,
     /// Active states configured for dispatch.
@@ -194,15 +194,6 @@ pub struct ShardingConfig {
     pub replication_factor: usize,
 }
 
-/// Resolved tracker filesystem paths.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TrackerPaths {
-    /// Repository root passed to the JSONL tracker.
-    pub repo_root: PathBuf,
-    /// JSONL file path read by API list/status endpoints.
-    pub issues_path: PathBuf,
-}
-
 impl WorkflowConfig {
     /// Load and validate a workflow file from disk.
     ///
@@ -290,24 +281,6 @@ impl WorkflowConfig {
         serde_json::to_string_pretty(&sorted).map_err(|source| Error::Json { source })
     }
 
-    /// Resolve the configured tracker paths relative to the workflow file.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Invalid`] when a relative tracker path has no parent.
-    pub fn tracker_paths(&self, workflow_path: &Path) -> Result<TrackerPaths> {
-        let base = match workflow_path.parent() {
-            Some(parent) => parent,
-            None => Path::new("."),
-        };
-        let issues_path = absolutize_against(base, &self.tracker.path);
-        let repo_root = repo_root_from_issues_path(&issues_path)?;
-        Ok(TrackerPaths {
-            repo_root,
-            issues_path,
-        })
-    }
-
     /// Convert validated config into orchestrator configuration.
     ///
     /// # Errors
@@ -371,13 +344,25 @@ fn split_frontmatter(content: &str) -> Result<(&str, &str)> {
 
 fn parse_tracker(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<TrackerConfig> {
     let tracker = required_object(root, "tracker", problems)?;
-    let kind = required_string(tracker, "tracker.kind", problems);
-    if let Some(value) = &kind {
-        if value != "git_issues" {
-            problems.push("tracker.kind must be `git_issues` for M1".to_owned());
+    let raw_kind = required_string(tracker, "tracker.kind", problems)?;
+    let Some(kind) = normalize_tracker_kind(&raw_kind) else {
+        if raw_kind == "git_issues" || raw_kind == "git_jsonl" {
+            problems.push("tracker.kind `git_issues` was removed in M3; use `x0x_crdt`".to_owned());
+        } else {
+            problems.push("tracker.kind must be `x0x_crdt` (aliases: `crdt`, `x0x`)".to_owned());
         }
-    }
-    let path = required_string(tracker, "tracker.path", problems).map(PathBuf::from);
+        return None;
+    };
+    let list_id =
+        if let Some(list_id) = optional_non_empty_string(tracker, "tracker.list_id", problems) {
+            Some(list_id)
+        } else {
+            let legacy = optional_non_empty_string(tracker, "tracker.path", problems);
+            if legacy.is_some() {
+                problems.push("tracker.path is deprecated for M3; use tracker.list_id".to_owned());
+            }
+            legacy
+        };
     let group = optional_non_empty_string(tracker, "tracker.group", problems);
     let active_states = match optional_string_list(tracker, "tracker.active_states") {
         Some(states) => states,
@@ -391,13 +376,23 @@ fn parse_tracker(root: &Map<String, Value>, problems: &mut Vec<String>) -> Optio
             "duplicate".to_owned(),
         ],
     };
+    if list_id.is_none() {
+        problems.push("missing required key `tracker.list_id`".to_owned());
+    }
     Some(TrackerConfig {
-        kind: kind?,
-        path: path?,
+        kind,
+        list_id: list_id?,
         group,
         active_states,
         terminal_states,
     })
+}
+
+fn normalize_tracker_kind(value: &str) -> Option<String> {
+    match value {
+        "x0x_crdt" | "crdt" | "x0x" => Some("x0x_crdt".to_owned()),
+        _ => None,
+    }
 }
 
 fn parse_polling(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<PollingConfig> {
@@ -844,28 +839,6 @@ fn states_from_strings(values: &[String]) -> std::result::Result<Vec<IssueState>
         .iter()
         .map(|value| IssueState::new(value.clone()))
         .collect()
-}
-
-fn absolutize_against(base: &Path, value: &Path) -> PathBuf {
-    if value.is_absolute() {
-        value.to_path_buf()
-    } else {
-        base.join(value)
-    }
-}
-
-fn repo_root_from_issues_path(path: &Path) -> Result<PathBuf> {
-    let Some(parent) = path.parent() else {
-        return Err(Error::Invalid {
-            problems: vec!["tracker.path must have a parent directory".to_owned()],
-        });
-    };
-    if parent.file_name().and_then(|name| name.to_str()) == Some("issues") {
-        if let Some(root) = parent.parent() {
-            return Ok(root.to_path_buf());
-        }
-    }
-    Ok(parent.to_path_buf())
 }
 
 fn sort_json_value(value: &Value) -> Value {

@@ -46,12 +46,12 @@ End-state v1.0 invariants:
 
 | Symphony concept           | x0x-symphony equivalent                                              |
 |----------------------------|----------------------------------------------------------------------|
-| Linear issue tracker       | git JSONL (M1–M2), then x0x CRDT TaskList (M3+)                      |
+| Linear issue tracker       | x0x CRDT TaskList (M3+; git JSONL was M1–M2 bootstrap only)           |
 | Issue state                | TaskItem checkbox + LWW metadata register                            |
 | Issue claim                | Signed CRDT claim record with TTL heartbeat                          |
 | Per-issue workspace        | Per-task isolated workspace under runner-controlled root             |
 | Codex app-server runner    | Pluggable runner trait with `shell`, `codex`, `claude_code` impls    |
-| Tracker polling            | JSONL polling (M1–M2), then gossip pubsub on TaskList topic (M3+)    |
+| Tracker polling            | x0xd TaskList polling now; gossip pubsub on TaskList topic later      |
 | Status/logging             | x0xd REST + WebSocket + per-issue `proofs/` artefact tree            |
 | Handoff state              | Signed handoff payload in TaskItem metadata + linked artefact dir    |
 | Linear comments / PR links | TaskItem metadata + optional outbound PR push                        |
@@ -73,10 +73,10 @@ End-state v1.0 invariants:
 │     │                                              │         │
 │     ▼                                              ▼         │
 │  ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐     │
-│  │ git_jsonl   │  │ shell        │  │ Validation +    │     │
-│  │ (M1–M2)     │  │ codex        │  │ proofs/<id>/<t>/│     │
-│  │ x0x_crdt    │  │ claude_code  │  └─────────────────┘     │
-│  │ (M3+)       │  │ ...          │                          │
+│  │ x0x_crdt    │  │ shell        │  │ Validation +    │     │
+│  │ (M3+)       │  │ codex        │  │ proofs/<id>/<t>/│     │
+│  │             │  │ claude_code  │  └─────────────────┘     │
+│  │             │  │ ...          │                          │
 │  └─────────────┘  └──────────────┘                          │
 └─────────────────────────────────────────────────────────────┘
         │
@@ -128,7 +128,7 @@ Adapters:
 
 | Adapter      | Backed by                                | Lifespan        |
 |--------------|------------------------------------------|-----------------|
-| `git_jsonl`  | `issues/issues.jsonl` + git commits      | M1–M2 only      |
+| `git_jsonl`  | `issues/issues.jsonl` + git commits      | M1–M2 only; deleted at M3 |
 | `github`     | GitHub Issues REST API (mirror only)     | (Not built)     |
 | `x0x_crdt`   | x0xd `/task-lists/:id` + `/stores/:id`   | M3 → permanent  |
 
@@ -288,11 +288,12 @@ rewrites the task record and is rare.
 }
 ```
 
-### 7.2 JSONL adapter mapping (M1–M2)
+### 7.2 Removed JSONL bootstrap adapter (M1–M2)
 
-The above is the in-memory representation. The git_jsonl adapter serializes
-one JSON object per line in `issues/issues.jsonl`. State changes commit a
-JSONL diff. File locking uses git index lock.
+The M1–M2 git JSONL adapter serialized one issue per line in
+`issues/issues.jsonl` and committed each state change. M3 deleted that adapter;
+JSONL remains only as this repository's historical issue database for human
+handoff records, not as a runtime tracker.
 
 ### 7.3 x0x TaskList adapter mapping (M3+)
 
@@ -339,8 +340,9 @@ ADR-0004 records this choice and the convergence path with
 Loads `WORKFLOW.md` (frontmatter YAML + Liquid-style prompt template).
 Required keys:
 
-- `tracker.kind` — `git_issues` (M1–M2) or `x0x` (M3+). `github` is **not**
-  a v1 target; see ADR-0003.
+- `tracker.kind` — `x0x_crdt` (aliases `crdt` / `x0x`) for M3+. `github` is
+  **not** a v1 target; see ADR-0003.
+- `tracker.list_id` — x0xd TaskList id/topic used by the CRDT tracker.
 - `polling.interval_ms`
 - `workspace.root`
 - `hooks.{after_create, before_run, after_run, before_remove}` with

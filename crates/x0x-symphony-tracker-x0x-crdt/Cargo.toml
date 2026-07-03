@@ -22,7 +22,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 x0x-symphony-core = { path = "../x0x-symphony-core" }
-x0x-symphony-tracker-git-jsonl = { path = "../x0x-symphony-tracker-git-jsonl" }
+x0x-symphony-signing = { path = "../x0x-symphony-signing" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

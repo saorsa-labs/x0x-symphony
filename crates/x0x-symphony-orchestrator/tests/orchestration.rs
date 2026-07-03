@@ -33,7 +33,6 @@ use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
     Orchestrator, SystemClock, TrustClient, TrustLevel,
 };
-use x0x_symphony_tracker_git_jsonl::{serialize_issue, JsonlTracker};
 use x0x_symphony_workspace::{Config as WorkspaceConfig, Manager};
 
 fn make_issue(id: &str, state: &str) -> Result<Issue, Box<dyn Error>> {
@@ -2607,13 +2606,12 @@ async fn reconcile_conflict_abandons_higher_index_self_claim() -> Result<(), Box
     Ok(())
 }
 
-fn seed_dual_claim_jsonl(
-    repo_root: &Path,
+fn dual_claim_issues(
     issue_id: &str,
     primary: &AgentId,
     backup: &AgentId,
     now: DateTime<Utc>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Vec<Issue>, Box<dyn Error>> {
     let fresh_ts =
         (now - chrono::Duration::seconds(10)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let shard = Shard::new(primary.clone(), vec![backup.clone()], 60_000, 1);
@@ -2631,58 +2629,7 @@ fn seed_dual_claim_jsonl(
         fresh_ts,
         shard,
     )?;
-    let issues_dir = repo_root.join("issues");
-    std::fs::create_dir_all(&issues_dir)?;
-    std::fs::write(
-        issues_dir.join("issues.jsonl"),
-        format!(
-            "{}\n{}\n",
-            serialize_issue(&winner)?,
-            serialize_issue(&loser)?
-        ),
-    )?;
-    Ok(())
-}
-
-fn assert_jsonl_conflict_abandon(
-    tracker: &JsonlTracker,
-    issue_id: &str,
-    primary: &AgentId,
-    backup: &AgentId,
-) -> Result<(), Box<dyn Error>> {
-    let records = tracker.load_issues()?;
-    assert_eq!(records.len(), 2);
-    let winning_record = records
-        .iter()
-        .find(|issue| {
-            issue
-                .claim
-                .as_ref()
-                .is_some_and(|claim| claim.by.eq(primary))
-        })
-        .ok_or("primary winner remains claimed in JSONL")?;
-    assert_eq!(winning_record.state, state("in_progress")?);
-    assert_eq!(
-        winning_record
-            .claim
-            .as_ref()
-            .ok_or("winner claim present")?
-            .shard_role,
-        x0x_symphony_core::ShardRole::Primary
-    );
-
-    let abandoned_record = records
-        .iter()
-        .find(|issue| issue.claim.is_none() && issue.id.as_str() == issue_id)
-        .ok_or("backup loser abandoned in JSONL")?;
-    assert_eq!(abandoned_record.state, state("todo")?);
-    let abandon = abandoned_record
-        .extra
-        .get("abandon")
-        .ok_or("JSONL abandon record present")?;
-    assert_eq!(abandon_agent(abandon, "claim"), Some(backup.as_str()));
-    assert_eq!(abandon_reason_code(abandon), Some("conflict"));
-    Ok(())
+    Ok(vec![winner, loser])
 }
 
 fn assert_abandon_marker(
@@ -2735,16 +2682,17 @@ fn abandon_reason_code(value: &serde_json::Value) -> Option<&str> {
 }
 
 #[tokio::test]
-async fn startup_reconcile_conflict_abandon_persists_jsonl_and_proof_marker(
+async fn startup_reconcile_conflict_abandon_persists_tracker_and_proof_marker(
 ) -> Result<(), Box<dyn Error>> {
     let backup = agent()?;
     let primary = AgentId::new("agent-b")?;
     let now = parse_ts("2026-07-02T12:00:00Z")?;
     let tmp = TempDir::new()?;
-    seed_dual_claim_jsonl(tmp.path(), "XSY-9110", &primary, &backup, now)?;
+    let tracker = Arc::new(StubTracker::with(dual_claim_issues(
+        "XSY-9110", &primary, &backup, now,
+    )?));
 
     let artifacts_root = tmp.path().join("proofs");
-    let tracker = Arc::new(JsonlTracker::new(tmp.path()));
     let runner = Arc::new(StubRunner::succeeding());
     let workspace = Arc::new(StubWorkspace {
         root: tmp.path().join("workspaces"),
@@ -2767,7 +2715,10 @@ async fn startup_reconcile_conflict_abandon_persists_jsonl_and_proof_marker(
     let summary = orc.reconcile().await?;
 
     assert_eq!(summary.conflicts_abandoned, 1);
-    assert_jsonl_conflict_abandon(&tracker, "XSY-9110", &primary, &backup)?;
+    assert_eq!(
+        lock(&tracker.abandons)?.clone(),
+        vec![(IssueId::new("XSY-9110")?, backup.clone())]
+    );
     assert_abandon_marker(
         &artifacts_root,
         "XSY-9110",

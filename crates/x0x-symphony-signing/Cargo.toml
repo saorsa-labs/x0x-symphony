@@ -1,6 +1,6 @@
 [package]
-name = "x0x-symphony-tracker-git-jsonl"
-description = "Bootstrap git JSONL Tracker adapter for x0x-symphony."
+name = "x0x-symphony-signing"
+description = "x0xd signing and verification infrastructure for x0x-symphony."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,17 +12,12 @@ authors.workspace = true
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 thiserror = "2"
-tracing = "0.1"
 x0x-symphony-core = { path = "../x0x-symphony-core" }
 
 [dev-dependencies]
-proptest = "1"
-tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]

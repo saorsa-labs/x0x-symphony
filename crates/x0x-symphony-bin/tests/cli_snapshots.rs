@@ -5,7 +5,6 @@ use clap::Parser;
 use serde_json::json;
 use tokio::{net::TcpListener, task::JoinHandle};
 use x0x_symphony_bin::cli::{self, CommandLine};
-use x0x_symphony_tracker_git_jsonl::parse_issue_line;
 
 struct StubDaemon {
     server: String,
@@ -105,7 +104,7 @@ async fn proofs_list_snapshot() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn issue_new_writes_sharded_issue() -> Result<(), Box<dyn Error>> {
+async fn issue_new_reports_jsonl_removal() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let workflow_path = dir.path().join("WORKFLOW.md");
     std::fs::write(
@@ -114,7 +113,7 @@ async fn issue_new_writes_sharded_issue() -> Result<(), Box<dyn Error>> {
     )?;
     let config_arg = workflow_path.to_string_lossy().into_owned();
 
-    let stdout = run_cli(&[
+    let command_line = CommandLine::try_parse_from([
         "x0x-symphony",
         "issue",
         "new",
@@ -126,20 +125,15 @@ async fn issue_new_writes_sharded_issue() -> Result<(), Box<dyn Error>> {
         "2",
         "--label",
         "x0x-symphony",
-    ])
-    .await?;
+    ])?;
+    let output = cli::run(command_line).await?;
 
-    assert!(stdout.starts_with("created XSY-0001\nshard: primary="));
-    let issues_path = dir.path().join("issues").join("issues.jsonl");
-    let content = std::fs::read_to_string(issues_path)?;
-    let issue = parse_issue_line(1, content.trim())?;
-    assert_eq!(issue.title, "Shard me");
-    assert_eq!(issue.priority, Some(2));
-    assert_eq!(issue.labels, vec!["x0x-symphony"]);
-    let shard = issue
-        .shard
-        .ok_or_else(|| std::io::Error::other("issue new did not write a shard"))?;
-    assert_eq!(shard.backups.len(), 2);
+    assert_eq!(output.exit_code, 1);
+    assert_eq!(output.stdout, "");
+    assert_eq!(
+        output.stderr,
+        "x0x-symphony issue new used the removed M1-M2 JSONL tracker; create tasks in x0xd TaskList for M3 (daemon/API task creation is M4 work)\n"
+    );
     Ok(())
 }
 
@@ -177,8 +171,8 @@ async fn config_show_snapshot() -> Result<(), Box<dyn Error>> {
             "    \"kind\": \"shell\"\n",
             "  },\n",
             "  \"tracker\": {\n",
-            "    \"kind\": \"git_issues\",\n",
-            "    \"path\": \"issues/issues.jsonl\"\n",
+            "    \"kind\": \"x0x_crdt\",\n",
+            "    \"list_id\": \"x0x-symphony\"\n",
             "  },\n",
             "  \"workspace\": {\n",
             "    \"root\": \"/tmp/xsy-workspaces\"\n",
@@ -284,8 +278,8 @@ fn valid_workflow(root: &str) -> String {
         concat!(
             "---\n",
             "tracker:\n",
-            "  kind: git_issues\n",
-            "  path: issues/issues.jsonl\n",
+            "  kind: x0x_crdt\n",
+            "  list_id: x0x-symphony\n",
             "polling:\n",
             "  interval_ms: 1\n",
             "workspace:\n",

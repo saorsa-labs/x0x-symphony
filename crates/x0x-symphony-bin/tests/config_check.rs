@@ -70,11 +70,11 @@ fn network_dispatch_defaults_off() -> Result<(), Box<dyn Error>> {
 #[test]
 fn tracker_group_is_optional_and_preserved() -> Result<(), Box<dyn Error>> {
     let workflow = workflow_missing("none").replace(
-        "tracker:\n  kind: git_issues\n  path: issues/issues.jsonl\n",
+        "tracker:\n  kind: x0x_crdt\n  list_id: x0x-symphony\n",
         concat!(
             "tracker:\n",
-            "  kind: git_issues\n",
-            "  path: issues/issues.jsonl\n",
+            "  kind: x0x_crdt\n",
+            "  list_id: x0x-symphony\n",
             "  group: private-project\n",
         ),
     );
@@ -140,7 +140,7 @@ fn workflow_with_sandbox() -> String {
 fn workflow_missing(block: &str) -> String {
     let mut content = String::from("---\n");
     if block != "tracker" {
-        content.push_str("tracker:\n  kind: git_issues\n  path: issues/issues.jsonl\n");
+        content.push_str("tracker:\n  kind: x0x_crdt\n  list_id: x0x-symphony\n");
     }
     if block != "polling" {
         content.push_str("polling:\n  interval_ms: 1\n");
