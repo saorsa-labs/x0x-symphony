@@ -355,8 +355,8 @@ Required keys:
   runner-specific config blocks: `runner.shell.{...}`, `runner.codex.{...}`,
   `runner.claude_code.{...}`.
 
-The legacy top-level `codex:` block was removed in M5. Configs must express
-Codex through the shell runner preset with
+The legacy top-level `codex:` block was removed in XSY-0031 (M5 cleanup).
+Configs must express Codex through the shell runner preset with
 `runner: {kind: shell, preset: codex}`.
 
 ## 9. Lifecycle (locked at M0)
@@ -413,17 +413,19 @@ in M3 — no parallel UI.
 Inherits x0x's three-layer identity (Machine → Agent → User) and its
 trust store. Symphony adds:
 
-- **Network dispatch gate.** Network-sourced issues are default-off and,
-  when `security.network_dispatch_enabled` is explicitly enabled, may only
-  dispatch after verified ML-DSA-65 signature provenance and the configured
-  x0xd trust threshold both hold. The older `security-sensitive` trust gate
-  remains a narrower policy layered under this universal M3 gate.
+- **Network dispatch gate.** Network-sourced issues are default-off via
+  `security.network_dispatch: "off"`. In `approve` mode they may only dispatch
+  after verified ML-DSA-65 signature provenance, the configured x0xd trust
+  threshold, and a signed payload-bound approval all hold. `auto` mode keeps the
+  M3 signer+trust behavior and requires `network_dispatch_auto_ack: true` so a
+  typo cannot enable it silently. The older `security-sensitive` trust gate
+  remains a narrower policy layered under this universal gate.
 - **Sandbox profiles** (M4): `read-only`, `repo-write`, `no-network`,
   `full-dev`, `ci-only`. The `shell` runner enforces via host sandbox
-  (Bubblewrap on Linux — firejail was rejected for this track — and
-  `sandbox-exec` on macOS). Profile is declared on the issue; the
-  orchestrator refuses to dispatch a task whose required profile cannot be
-  enforced by the available runner.
+  (native Landlock + cgroup-v2 on Linux when available, Bubblewrap /
+  `landlock-restrict` fallback, and Tier-1 `sandbox-exec` on macOS). Profile is
+  declared on the issue; the orchestrator refuses to dispatch a task whose
+  required profile cannot be enforced by the available runner.
 - **Signed claims and handoffs.** ML-DSA-65 signatures over the claim and
   handoff records using the agent's keypair. Verified on read by the
   Tracker adapter; mismatches are dropped.

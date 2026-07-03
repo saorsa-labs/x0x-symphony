@@ -13,28 +13,22 @@ the shared backlog.
 
 ## Status
 
-**M1 passed** — the vertical slice (tracker → runner → workspace → orchestrator
-→ daemon + CLI) is implemented and the M1 gate demos are committed under
-[`proofs/m1/`](proofs/m1/). The architecture and four ADRs remain frozen; see
-[`docs/plan/2026-07-m1-execution-plan.md`](docs/plan/2026-07-m1-execution-plan.md).
-Operator and runner-authoring guides live in
+`v0.0.M3` is tagged. Current `main` contains post-M3 M4/M5 work: x0x CRDT
+tracking only, worker discovery, consent-gated network dispatch, observability
+polish, proof retention, and the Linux native sandbox backend. The M1/M2
+`git_jsonl` runtime tracker has been removed; `issues/issues.jsonl` remains only
+this repository's historical issue database and handoff log.
+
+Read [`docs/design/symphony.md`](docs/design/symphony.md) first for the design
+contract. Operator and runner-authoring guides live in
 [`docs/symphony/`](docs/symphony/).
-The v1.0 shipping tracker is x0x's native CRDT TaskList, accessed through the
-local x0xd REST API; until M3 the daemon reads only the operator-controlled
-`issues/issues.jsonl` backlog.
-
-## Design
-
-Read [`docs/design/symphony.md`](docs/design/symphony.md) first. It is the
-authoritative architecture document for this project.
-
-Architecture decisions are tracked in [`docs/adr/`](docs/adr/).
 
 ## Repositories
 
-x0x-symphony depends on x0x as a sibling checkout:
+x0x-symphony expects a sibling x0x checkout for development and a running
+`x0xd` daemon for real dispatch:
 
-```
+```text
 projects/
   x0x/             # github.com/saorsa-labs/x0x
   x0x-symphony/    # this repo
@@ -42,6 +36,52 @@ projects/
 
 The runner consumes the local `x0xd` REST API (default
 `http://127.0.0.1:12700`); it does not link x0x as a Rust dependency.
+
+## Quickstart
+
+The commands below were verified on macOS in this worktree. Linux builds and
+sandbox paths are CI-validated on `ubuntu-latest`; this README does not claim a
+separate local Linux smoke run.
+
+```bash
+git clone https://github.com/saorsa-labs/x0x-symphony.git
+cd x0x-symphony
+
+cargo build --release
+./target/release/x0x-symphonyd --help
+./target/release/x0x-symphony --help
+./target/release/x0x-symphony config check --config WORKFLOW.md
+```
+
+Expected highlights:
+
+- `x0x-symphonyd` requires `--config <CONFIG>` and accepts `--data-dir`,
+  `--bind`, and `--agent-id`.
+- `x0x-symphony` exposes `tasks`, `claim`, `handoff`, `status`, `workers`,
+  `approvals`, `proofs`, `issue`, `config`, and `routes` subcommands.
+- `config check` should print `config ok` for the repository `WORKFLOW.md`.
+
+To dispatch real work, start `x0xd` first so `signing.x0xd_url` can answer
+`/agent`, `/task-lists`, `/stores`, `/contacts`, `/agent/sign`, and
+`/agent/verify`, then start the symphony daemon:
+
+```bash
+./target/release/x0x-symphonyd --config WORKFLOW.md --data-dir ~/.x0x-symphony
+
+# in another terminal
+./target/release/x0x-symphony --data-dir ~/.x0x-symphony status
+./target/release/x0x-symphony --data-dir ~/.x0x-symphony tasks
+```
+
+For a complete operator flow (configure workflow, start daemon, create an
+issue, approve network-sourced work, and inspect proofs), see
+[`docs/symphony/operator.md`](docs/symphony/operator.md#worked-example-end-to-end).
+
+## Design
+
+Architecture decisions are tracked in [`docs/adr/`](docs/adr/). Current
+operator guidance, security posture, and runner authoring notes are in
+[`docs/symphony/`](docs/symphony/).
 
 ## License
 
