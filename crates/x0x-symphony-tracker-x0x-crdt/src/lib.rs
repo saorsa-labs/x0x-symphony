@@ -53,8 +53,9 @@ use tracing::warn;
 use x0x_symphony_core::{
     sha256_hex, shard, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff,
     Issue, IssueDraft, IssueId, IssueState, PollContext, ReleaseReason, ShardRole,
-    SignatureEnvelope, SymphonyError, Tracker, WorkerCard, CLAIM_CONTEXT, HANDOFF_CONTEXT,
-    SIGN_ALGORITHM, WORKER_CARD_CONTEXT, WORKER_CARD_SCHEMA_VERSION,
+    SignatureEnvelope, SymphonyError, Tracker, VerificationNotice, VerificationNoticeKind,
+    WorkerCard, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM, WORKER_CARD_CONTEXT,
+    WORKER_CARD_SCHEMA_VERSION,
 };
 use x0x_symphony_signing::{
     SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver, VerifyOutcome,
@@ -824,30 +825,44 @@ impl X0xCrdtTracker {
             return Ok(issues);
         }
         let mut verified = Vec::with_capacity(issues.len());
-        for issue in issues {
-            match self.verify_issue_result(&issue).await {
-                Ok(()) => verified.push(issue),
-                Err(TrackerError::VerifyTransport { reason }) => {
-                    return Err(TrackerError::VerifyTransport {
-                        reason: format!("issue {}: {reason}", issue.id),
-                    });
+        for mut issue in issues {
+            if let Some(claim) = issue.claim.clone() {
+                match self.verify_claim(&issue, &claim).await {
+                    Ok(()) => {}
+                    Err(TrackerError::VerifyTransport { reason }) => {
+                        return Err(TrackerError::VerifyTransport {
+                            reason: format!("issue {}: {reason}", issue.id),
+                        });
+                    }
+                    Err(error) => {
+                        let reason = error.to_string();
+                        warn!(
+                            issue_id = %issue.id,
+                            claimant = %claim.by,
+                            error = %reason,
+                            "stripping invalid claim from issue"
+                        );
+                        strip_bad_claim(&mut issue, &claim, reason)?;
+                    }
                 }
-                Err(error) => {
-                    warn!(issue_id = %issue.id, error = %error, "dropping issue with invalid signature");
+            }
+            if let Some(handoff) = &issue.handoff {
+                match self.verify_handoff(&issue, handoff).await {
+                    Ok(()) => verified.push(issue),
+                    Err(TrackerError::VerifyTransport { reason }) => {
+                        return Err(TrackerError::VerifyTransport {
+                            reason: format!("issue {}: {reason}", issue.id),
+                        });
+                    }
+                    Err(error) => {
+                        warn!(issue_id = %issue.id, error = %error, "dropping issue with invalid handoff signature");
+                    }
                 }
+            } else {
+                verified.push(issue);
             }
         }
         Ok(verified)
-    }
-
-    async fn verify_issue_result(&self, issue: &Issue) -> Result<()> {
-        if let Some(claim) = &issue.claim {
-            self.verify_claim(issue, claim).await?;
-        }
-        if let Some(handoff) = &issue.handoff {
-            self.verify_handoff(issue, handoff).await?;
-        }
-        Ok(())
     }
 
     async fn verify_claim(&self, issue: &Issue, claim: &Claim) -> Result<()> {
@@ -977,6 +992,19 @@ impl X0xCrdtTracker {
             cache.insert(key, outcome);
         }
     }
+}
+
+fn strip_bad_claim(issue: &mut Issue, claim: &Claim, reason: String) -> Result<()> {
+    issue.claim = None;
+    if issue.state.as_str() == "in_progress" {
+        issue.state = IssueState::new("todo")?;
+    }
+    issue.verification_notices.push(VerificationNotice {
+        kind: VerificationNoticeKind::BadClaim,
+        claimant: Some(claim.by.clone()),
+        reason,
+    });
+    Ok(())
 }
 
 fn verify_outcome_to_result(outcome: VerifyOutcome) -> Result<()> {
@@ -1311,7 +1339,9 @@ mod tests {
 
     use async_trait::async_trait;
     use tokio::sync::Mutex;
-    use x0x_symphony_core::{ReleaseReasonCode, ValidationResult, ValidationStatus};
+    use x0x_symphony_core::{
+        ReleaseReasonCode, ValidationResult, ValidationStatus, VerificationNoticeKind,
+    };
 
     use super::*;
     use crate::{
@@ -1386,6 +1416,16 @@ mod tests {
             self.state.lock().await.kv.insert(
                 (store_id_for_list("list-a"), key),
                 encode_claim_blob(&blob)?,
+            );
+            Ok(())
+        }
+
+        async fn seed_handoff(&self, task_id: &str, handoff: Handoff) -> TestResult {
+            let blob = HandoffBlob::new(handoff, "2026-07-03T02:00:00Z");
+            let key = handoff_key(task_id);
+            self.state.lock().await.kv.insert(
+                (store_id_for_list("list-a"), key),
+                encode_handoff_blob(&blob)?,
             );
             Ok(())
         }
@@ -1701,6 +1741,20 @@ mod tests {
                 .client(api)
                 .worker_view(provider)
                 .replication_factor(shard::DEFAULT_REPLICATION_FACTOR)
+                .build()?,
+        )
+    }
+
+    fn required_tracker(
+        api: Arc<MockApi>,
+        signing: Arc<MockSigning>,
+    ) -> TestResult<X0xCrdtTracker> {
+        let signing_client: Arc<dyn SigningClient> = signing.clone();
+        let resolver: Arc<dyn TrustedKeyResolver> = signing;
+        Ok(
+            X0xCrdtTracker::builder("mock://x0xd", "list-a", AgentId::new(AGENT_A)?)
+                .client(api)
+                .required_signing(signing_client, resolver)
                 .build()?,
         )
     }
@@ -2134,6 +2188,161 @@ mod tests {
             agent,
         ));
         Ok(claim)
+    }
+
+    fn signed_handoff_for(task_id: &str, agent: &str, public_key: &[u8]) -> TestResult<Handoff> {
+        let mut handoff = Handoff::new("ready")
+            .with_issue_id(IssueId::new(task_id)?)
+            .with_signer_agent_id(agent);
+        let payload = handoff.signing_payload_bytes()?;
+        handoff.signature = Some(SignatureEnvelope::new(
+            SIGN_ALGORITHM,
+            HANDOFF_CONTEXT,
+            BASE64.encode(public_key),
+            BASE64.encode(b"signature"),
+            sha256_hex(&payload),
+            agent,
+        ));
+        Ok(handoff)
+    }
+
+    fn assert_bad_claim_notice(issue: &Issue, reason: &str) -> TestResult {
+        assert_eq!(issue.verification_notices.len(), 1);
+        let notice = &issue.verification_notices[0];
+        assert_eq!(notice.kind, VerificationNoticeKind::BadClaim);
+        assert_eq!(notice.claimant, Some(AgentId::new(AGENT_A)?));
+        assert!(
+            notice.reason.contains(reason),
+            "notice reason {:?} did not contain {reason:?}",
+            notice.reason
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bad_signature_claim_strips_claim_and_keeps_issue_visible() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "forged", "claimed:agent-a", 3)]).await;
+        let public_key = b"trusted-key".to_vec();
+        api.seed_claim(ISSUE_A, signed_claim_for(ISSUE_A, AGENT_A, &public_key)?)
+            .await?;
+        let tracker = required_tracker(
+            api,
+            Arc::new(MockSigning {
+                verify_outcome: VerifyOutcome::Invalid("forged claim".to_owned()),
+                public_key,
+            }),
+        )?;
+        let ctx = PollContext::new(
+            vec![IssueState::new("todo")?],
+            vec![IssueState::new("done")?],
+        );
+
+        let candidates = tracker.fetch_candidates(&ctx).await?;
+        let fetched = tracker.fetch_by_ids(&[IssueId::new(ISSUE_A)?]).await?;
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, IssueId::new(ISSUE_A)?);
+        assert_eq!(candidates[0].state, IssueState::new("todo")?);
+        assert!(candidates[0].claim.is_none());
+        assert_bad_claim_notice(&candidates[0], "forged claim")?;
+        assert_eq!(fetched.len(), 1);
+        assert!(fetched[0].claim.is_none());
+        assert_eq!(fetched[0].state, IssueState::new("todo")?);
+        assert_bad_claim_notice(&fetched[0], "forged claim")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsigned_claim_strips_claim_and_keeps_issue_visible() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "unsigned", "claimed:agent-a", 3)]).await;
+        api.seed_claim(ISSUE_A, claim_for(ISSUE_A, AGENT_A)?)
+            .await?;
+        let tracker = required_tracker(
+            api,
+            Arc::new(MockSigning {
+                verify_outcome: VerifyOutcome::Valid,
+                public_key: b"trusted-key".to_vec(),
+            }),
+        )?;
+        let ctx = PollContext::new(
+            vec![IssueState::new("todo")?],
+            vec![IssueState::new("done")?],
+        );
+
+        let candidates = tracker.fetch_candidates(&ctx).await?;
+        let fetched = tracker.fetch_by_ids(&[IssueId::new(ISSUE_A)?]).await?;
+
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].claim.is_none());
+        assert_eq!(candidates[0].state, IssueState::new("todo")?);
+        assert_bad_claim_notice(&candidates[0], "unsigned")?;
+        assert_eq!(fetched.len(), 1);
+        assert!(fetched[0].claim.is_none());
+        assert_eq!(fetched[0].state, IssueState::new("todo")?);
+        assert_bad_claim_notice(&fetched[0], "unsigned")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn valid_claim_remains_unchanged() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "valid", "claimed:agent-a", 3)]).await;
+        let public_key = b"trusted-key".to_vec();
+        api.seed_claim(ISSUE_A, signed_claim_for(ISSUE_A, AGENT_A, &public_key)?)
+            .await?;
+        let tracker = required_tracker(
+            api,
+            Arc::new(MockSigning {
+                verify_outcome: VerifyOutcome::Valid,
+                public_key,
+            }),
+        )?;
+
+        let fetched = tracker.fetch_by_ids(&[IssueId::new(ISSUE_A)?]).await?;
+
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].state, IssueState::new("in_progress")?);
+        assert_eq!(
+            fetched[0].claim.as_ref().map(|claim| &claim.by),
+            Some(&AgentId::new(AGENT_A)?)
+        );
+        assert!(fetched[0].verification_notices.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_handoff_still_drops_issue() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "handoff", "done:agent-a", 3)]).await;
+        let public_key = b"trusted-key".to_vec();
+        api.seed_handoff(ISSUE_A, signed_handoff_for(ISSUE_A, AGENT_A, &public_key)?)
+            .await?;
+        let tracker = required_tracker(
+            api,
+            Arc::new(MockSigning {
+                verify_outcome: VerifyOutcome::Invalid("forged handoff".to_owned()),
+                public_key,
+            }),
+        )?;
+
+        let fetched = tracker.fetch_by_ids(&[IssueId::new(ISSUE_A)?]).await?;
+
+        assert!(fetched.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_signing_keeps_everything() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "disabled", "claimed:agent-a", 3)]).await;
+        api.seed_claim(ISSUE_A, claim_for(ISSUE_A, AGENT_A)?)
+            .await?;
+        let tracker = tracker(api)?;
+
+        let fetched = tracker.fetch_by_ids(&[IssueId::new(ISSUE_A)?]).await?;
+
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].state, IssueState::new("in_progress")?);
+        assert!(fetched[0].claim.is_some());
+        assert!(fetched[0].verification_notices.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

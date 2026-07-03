@@ -8,8 +8,8 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use x0x_symphony_bin::api::{build_router, AppState};
 use x0x_symphony_core::{
     AgentId, ApprovalState, Claim, Handoff, Issue, IssueDraft, IssueId, IssueState, PlatformInfo,
-    PollContext, ReleaseReason, Result as CoreResult, SignatureProvenance, Tracker, WorkerCard,
-    WORKER_CARD_SCHEMA_VERSION,
+    PollContext, ReleaseReason, Result as CoreResult, SignatureProvenance, Tracker,
+    VerificationNotice, VerificationNoticeKind, WorkerCard, WORKER_CARD_SCHEMA_VERSION,
 };
 use x0x_symphony_tracker_x0x_crdt::{WorkerViewProvider, WorkerViewSnapshot};
 
@@ -136,6 +136,54 @@ async fn task_detail_returns_issue_and_404_when_absent() -> Result<(), Box<dyn E
         .send()
         .await?;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn task_routes_surface_verification_notices() -> Result<(), Box<dyn Error>> {
+    let mut issue = issue("XSY-BAD-CLAIM", "Bad claim surfaced")?;
+    issue.verification_notices.push(VerificationNotice {
+        kind: VerificationNoticeKind::BadClaim,
+        claimant: Some(AgentId::new("agent-a")?),
+        reason: "claim for issue XSY-BAD-CLAIM is unsigned".to_owned(),
+    });
+    let server = spawn_server(AppState::new(
+        Arc::new(ObservabilityTracker::new(vec![issue])),
+        AgentId::new("symphonyd")?,
+        API_TOKEN.to_owned(),
+        None,
+    ))
+    .await?;
+    let client = reqwest::Client::new();
+
+    let list_response = client
+        .get(format!("{}/symphony/tasks", server.base_url))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await?;
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_body = list_response.json::<Value>().await?;
+    assert_eq!(list_body[0]["verification_notices"][0]["kind"], "bad_claim");
+    assert_eq!(
+        list_body[0]["verification_notices"][0]["claimant"],
+        "agent-a"
+    );
+    assert!(list_body[0]["verification_notices"][0]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("unsigned")));
+
+    let detail_response = client
+        .get(format!("{}/symphony/tasks/XSY-BAD-CLAIM", server.base_url))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await?;
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail_body = detail_response.json::<Value>().await?;
+    assert_eq!(detail_body["verification_notices"][0]["kind"], "bad_claim");
+    assert_eq!(
+        detail_body["verification_notices"][0]["claimant"],
+        "agent-a"
+    );
     Ok(())
 }
 

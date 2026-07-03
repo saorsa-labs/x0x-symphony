@@ -26,6 +26,7 @@ pub use error::{Result, SymphonyError};
 pub use handoff::{Handoff, ValidationResult, ValidationStatus};
 pub use issue::{
     AgentId, Issue, IssueDraft, IssueId, IssueRef, IssueSource, IssueState, SignatureProvenance,
+    VerificationNotice, VerificationNoticeKind,
 };
 pub use runner::{
     EventStream, Prompt, Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext,

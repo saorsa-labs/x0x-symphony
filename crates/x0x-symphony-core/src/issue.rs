@@ -369,6 +369,29 @@ impl SignatureProvenance {
     }
 }
 
+/// Kind of read-path verification notice attached in memory by a tracker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationNoticeKind {
+    /// A claim failed verification and was stripped while the issue stayed visible.
+    BadClaim,
+}
+
+/// Non-serialized read-path verification notice for operator visibility.
+///
+/// Trackers attach notices after sanitizing network-sourced records. The owning
+/// [`Issue`] skips this field during serde so notices never alter stored issue
+/// records or signed claim/handoff bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationNotice {
+    /// Notice category.
+    pub kind: VerificationNoticeKind,
+    /// Agent that made the offending claim, when known.
+    pub claimant: Option<AgentId>,
+    /// Human-readable verification failure detail.
+    pub reason: String,
+}
+
 /// Minimal blocker reference embedded inside another issue.
 ///
 /// # Examples
@@ -482,6 +505,9 @@ pub struct Issue {
     /// Non-serialized verified signature provenance attached by network trackers.
     #[serde(skip)]
     pub signature_provenance: Option<SignatureProvenance>,
+    /// Non-serialized verification notices attached by network trackers.
+    #[serde(skip)]
+    pub verification_notices: Vec<VerificationNotice>,
     /// Creation timestamp as ISO-8601 UTC text.
     pub created_at: String,
     /// Last update timestamp as ISO-8601 UTC text.
@@ -545,6 +571,7 @@ fn is_issue_field(key: &str) -> bool {
             | "shard"
             | "claim"
             | "handoff"
+            | "verification_notices"
             | "created_at"
             | "updated_at"
     )
@@ -617,6 +644,7 @@ impl Issue {
             claim: None,
             handoff: None,
             signature_provenance: None,
+            verification_notices: Vec::new(),
             created_at: created_at.clone(),
             updated_at: created_at,
             extra: BTreeMap::new(),

@@ -30,7 +30,8 @@ use tokio::{sync::broadcast, time};
 use x0x_symphony_core::{
     approval_decision, content_hash, sha256_hex, AgentId, ApprovalDecision, ApprovalEvent,
     ApprovalState, ApprovalVerdict, Claim, Handoff, Issue, IssueDraft, IssueId, IssueSource,
-    SignatureEnvelope, SignatureProvenance, Tracker, WorkerCard, APPROVAL_CONTEXT, SIGN_ALGORITHM,
+    SignatureEnvelope, SignatureProvenance, Tracker, VerificationNotice, WorkerCard,
+    APPROVAL_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_signing::SigningClient;
 use x0x_symphony_tracker_x0x_crdt::WorkerViewProvider;
@@ -78,6 +79,9 @@ pub struct Task {
     /// Current claim owner when the issue is claimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_by: Option<String>,
+    /// Non-serialized tracker verification notices surfaced for operators.
+    #[serde(default)]
+    pub verification_notices: Vec<VerificationNotice>,
 }
 
 /// Active claim row returned by `/symphony/status`.
@@ -124,6 +128,7 @@ pub struct Workers {
 struct TaskDetail {
     #[serde(flatten)]
     issue: Issue,
+    verification_notices: Vec<VerificationNotice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signature_provenance: Option<PendingApprovalProvenance>,
     approval_summary: ApprovalSummary,
@@ -532,6 +537,7 @@ async fn task_detail(
         .signature_provenance
         .as_ref()
         .map(PendingApprovalProvenance::from);
+    let verification_notices = issue.verification_notices.clone();
     let approval_state = state
         .tracker
         .load_approval_state(&issue_id)
@@ -539,6 +545,7 @@ async fn task_detail(
         .map_err(|error| Error::Tracker(error.to_string()))?;
     Ok(Json(TaskDetail {
         issue,
+        verification_notices,
         signature_provenance,
         approval_summary: approval_summary(&approval_state),
     }))
@@ -1015,6 +1022,7 @@ fn task_from_issue(issue: Issue) -> Task {
         priority: issue.priority,
         labels: issue.labels,
         claim_by: issue.claim.map(|claim| claim.by.to_string()),
+        verification_notices: issue.verification_notices,
     }
 }
 
