@@ -753,59 +753,66 @@ where
             .clock
             .now()
             .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        let effective_events = if let (Some(signing_client), Some(key_resolver)) =
+        let (signing_client, key_resolver) = if let (Some(signing_client), Some(key_resolver)) =
             (&self.signing_client, &self.key_resolver)
         {
-            let mut kept = Vec::new();
-            for event in &state.events {
-                if event.is_valid(
-                    issue,
-                    signer,
-                    &now,
-                    self.config.approval_ttl,
-                    &state.consumed,
-                ) != ApprovalValidity::Valid
-                {
-                    continue;
+            (signing_client.clone(), key_resolver.clone())
+        } else {
+            // Fail-closed: Approve-policy dispatch requires cryptographic approval
+            // verification. A None verifier means we cannot confirm operator consent
+            // — refuse rather than fall back to the weaker envelope-consistency path.
+            self.block_for_dispatch_refusal(
+                guard,
+                claim,
+                ReleaseReasonCode::ApprovalVerifierUnconfigured,
+                "approval verifier not configured for Approve-policy dispatch".to_owned(),
+            )
+            .await?;
+            return Ok(DispatchGateOutcome::PendingApproval);
+        };
+
+        let mut kept = Vec::new();
+        for event in &state.events {
+            if event.is_valid(
+                issue,
+                signer,
+                &now,
+                self.config.approval_ttl,
+                &state.consumed,
+            ) != ApprovalValidity::Valid
+            {
+                continue;
+            }
+            match self
+                .verify_approval_signature(signing_client.as_ref(), key_resolver.as_ref(), event)
+                .await
+            {
+                CryptoVerify::Valid => kept.push(event.clone()),
+                CryptoVerify::Invalid => {
+                    // Make forged/stale/unknown-approver approval events visible to
+                    // operators rather than silently dropping them. A spike of these
+                    // is a signal of either a misconfigured approver or an attempted
+                    // consent forgery against the dispatch gate.
+                    warn!(
+                        issue_id = %issue.id,
+                        approver = %event.approver_agent_id,
+                        "dropping approval event: cryptographic signature verification failed; event treated as invalid"
+                    );
                 }
-                match self
-                    .verify_approval_signature(
-                        signing_client.as_ref(),
-                        key_resolver.as_ref(),
-                        event,
+                CryptoVerify::TransportError => {
+                    self.block_for_dispatch_refusal(
+                        guard,
+                        claim,
+                        ReleaseReasonCode::VerifyTransportError,
+                        "approval signature verification transport failed".to_owned(),
                     )
-                    .await
-                {
-                    CryptoVerify::Valid => kept.push(event.clone()),
-                    CryptoVerify::Invalid => {
-                        // Make forged/stale/unknown-approver approval events visible to
-                        // operators rather than silently dropping them. A spike of these
-                        // is a signal of either a misconfigured approver or an attempted
-                        // consent forgery against the dispatch gate.
-                        warn!(
-                            issue_id = %issue.id,
-                            approver = %event.approver_agent_id,
-                            "dropping approval event: cryptographic signature verification failed; event treated as invalid"
-                        );
-                    }
-                    CryptoVerify::TransportError => {
-                        self.block_for_dispatch_refusal(
-                            guard,
-                            claim,
-                            ReleaseReasonCode::VerifyTransportError,
-                            "approval signature verification transport failed".to_owned(),
-                        )
-                        .await?;
-                        return Ok(DispatchGateOutcome::PendingApproval);
-                    }
+                    .await?;
+                    return Ok(DispatchGateOutcome::PendingApproval);
                 }
             }
-            kept
-        } else {
-            state.events.clone()
-        };
+        }
         let effective_state = ApprovalState {
-            events: effective_events,
+            events: kept,
             consumed: state.consumed.clone(),
         };
         match approval_decision(
