@@ -12,6 +12,7 @@ readme = "README.md"
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -21,6 +22,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "process"] }
 tracing = "0.1"
 x0x-symphony-core = { path = "../x0x-symphony-core" }
+x0x-symphony-signing = { path = "../x0x-symphony-signing" }
 x0x-symphony-workspace = { path = "../x0x-symphony-workspace" }
 
 [target.'cfg(unix)'.dependencies]

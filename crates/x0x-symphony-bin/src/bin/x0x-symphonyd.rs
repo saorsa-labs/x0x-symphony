@@ -49,7 +49,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let api_token = auth::load_or_generate_api_token(&data_dir).await?;
-    let (tracker, agent_id) = build_tracker(&workflow).await?;
+    let (tracker, agent_id, signing_client) = build_tracker(&workflow).await?;
     let runner_spec = RunnerSpec::from_workflow_config(&workflow.definition.config)
         .context("runner configuration did not resolve")?;
     let runner = Arc::new(ShellRunner::new(runner_spec).context("failed to build shell runner")?);
@@ -64,13 +64,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
         X0xdTrustClient::new(&workflow.signing.x0xd_url)
             .context("failed to configure x0xd trust client")?,
     );
-    let orchestrator = Arc::new(Orchestrator::new_with_trust_client(
+    let approval_signing_client: Arc<dyn SigningClient> = signing_client.clone();
+    let approval_key_resolver: Arc<dyn TrustedKeyResolver> = signing_client;
+    let orchestrator = Arc::new(Orchestrator::new_with_signing(
         tracker.clone(),
         runner,
         workspace,
         Arc::new(SystemClock),
         orchestrator_config,
         trust_client,
+        Some(approval_signing_client),
+        Some(approval_key_resolver),
     ));
 
     let _ = orchestrator.reconcile().await;
@@ -129,7 +133,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 /// Construct the x0x CRDT tracker, returning the x0xd-resolved agent identity.
 async fn build_tracker(
     workflow: &config::WorkflowConfig,
-) -> anyhow::Result<(Arc<X0xCrdtTracker>, AgentId)> {
+) -> anyhow::Result<(Arc<X0xCrdtTracker>, AgentId, Arc<X0xdClient>)> {
     let signing_client = Arc::new(
         X0xdClient::new(&workflow.signing.x0xd_url)
             .context("failed to configure x0xd signing client")?,
@@ -149,13 +153,13 @@ async fn build_tracker(
     }
     if workflow.signing.policy == SigningPolicy::Required {
         let signing: Arc<dyn SigningClient> = signing_client.clone();
-        let resolver: Arc<dyn TrustedKeyResolver> = signing_client;
+        let resolver: Arc<dyn TrustedKeyResolver> = signing_client.clone();
         tracker_builder = tracker_builder.required_signing(signing, resolver);
     }
     let tracker = tracker_builder
         .build()
         .context("failed to configure x0x CRDT tracker")?;
-    Ok((Arc::new(tracker), agent_id))
+    Ok((Arc::new(tracker), agent_id, signing_client))
 }
 
 fn workflow_root(config_path: &Path) -> PathBuf {
