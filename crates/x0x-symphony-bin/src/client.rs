@@ -5,9 +5,13 @@ use std::path::{Path, PathBuf};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
+use x0x_symphony_core::{ApprovalEvent, ApprovalVerdict};
 
 use crate::{
-    api::{ClaimResponse, HandoffRequest, HandoffResponse, Proof, ProofList, Routes, Status, Task},
+    api::{
+        ClaimResponse, HandoffRequest, HandoffResponse, PendingApproval, Proof, ProofList, Routes,
+        Status, SubmitApprovalRequest, Task,
+    },
     auth, config,
 };
 
@@ -171,6 +175,55 @@ impl SymphonyClient {
         self.get_json("/symphony/status").await
     }
 
+    /// List network-sourced issues awaiting approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`enum@Error`] for transport, status, or decoding failures.
+    pub async fn approvals_pending(&self) -> Result<Vec<PendingApproval>> {
+        self.get_json("/symphony/approvals/pending").await
+    }
+
+    /// Approve one network-sourced issue for dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`enum@Error`] for transport, status, or decoding failures.
+    pub async fn approve(
+        &self,
+        id: &str,
+        expected_content_hash: Option<&str>,
+        expected_signer_agent_id: Option<&str>,
+    ) -> Result<ApprovalEvent> {
+        self.submit_approval(
+            id,
+            ApprovalVerdict::Approve,
+            expected_content_hash,
+            expected_signer_agent_id,
+        )
+        .await
+    }
+
+    /// Deny one network-sourced issue for dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`enum@Error`] for transport, status, or decoding failures.
+    pub async fn deny(
+        &self,
+        id: &str,
+        expected_content_hash: Option<&str>,
+        expected_signer_agent_id: Option<&str>,
+    ) -> Result<ApprovalEvent> {
+        self.submit_approval(
+            id,
+            ApprovalVerdict::Deny,
+            expected_content_hash,
+            expected_signer_agent_id,
+        )
+        .await
+    }
+
     /// Claim an issue.
     ///
     /// # Errors
@@ -221,6 +274,22 @@ impl SymphonyClient {
     /// Returns [`enum@Error`] for transport, status, or decoding failures.
     pub async fn proof(&self, name: &str) -> Result<Proof> {
         self.get_json(&format!("/symphony/proofs/{name}")).await
+    }
+
+    async fn submit_approval(
+        &self,
+        id: &str,
+        verdict: ApprovalVerdict,
+        expected_content_hash: Option<&str>,
+        expected_signer_agent_id: Option<&str>,
+    ) -> Result<ApprovalEvent> {
+        let request = SubmitApprovalRequest {
+            verdict,
+            expected_content_hash: expected_content_hash.map(str::to_owned),
+            expected_signer_agent_id: expected_signer_agent_id.map(str::to_owned),
+        };
+        self.post_json(&format!("/symphony/approvals/{id}"), &request)
+            .await
     }
 
     async fn get_json<T>(&self, path: &str) -> Result<T>
