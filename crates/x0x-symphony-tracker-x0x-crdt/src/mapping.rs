@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use x0x_symphony_core::{
-    Claim, Handoff, Issue, IssueId, IssueSource, IssueState, ReleaseReason, SymphonyError,
+    ApprovalConsumed, ApprovalEvent, Claim, Handoff, Issue, IssueId, IssueSource, IssueState,
+    ReleaseReason, SymphonyError,
 };
 
 use crate::client::{AddTaskDraft, TaskEntry};
@@ -19,6 +20,9 @@ pub const CLAIM_BLOB_KIND: &str = "x0x-symphony-claim-v1";
 
 /// Handoff blob kind marker.
 pub const HANDOFF_BLOB_KIND: &str = "x0x-symphony-handoff-v1";
+
+/// Approval blob kind marker.
+pub const APPROVAL_BLOB_KIND: &str = "x0x-symphony-approval-v1";
 
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
@@ -159,6 +163,58 @@ impl HandoffBlob {
     }
 }
 
+/// Approval metadata stored under `approval-<task-id>` in `symphony-<list-id>`.
+///
+/// `events` is a JSON array of the current approval/denial events retained for
+/// the issue, normally the latest valid approve and latest denial for the active
+/// payload. `consumed` is the append-only list of single-execution consumption
+/// records. A matching consumed event invalidates the approval regardless of the
+/// claim id that later dispatch minted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalBlob {
+    /// Blob schema version.
+    pub schema_version: u32,
+    /// Blob kind marker.
+    pub kind: String,
+    /// Issue this approval blob belongs to.
+    pub issue_id: IssueId,
+    /// Approval and denial events for this issue.
+    pub events: Vec<ApprovalEvent>,
+    /// Consumption events that spend approvals once.
+    pub consumed: Vec<ApprovalConsumed>,
+    /// Last time this blob was written, as ISO-8601 UTC text.
+    pub updated_at: String,
+}
+
+impl ApprovalBlob {
+    /// Build an empty approval blob for an issue.
+    #[must_use]
+    pub fn new(issue_id: IssueId, updated_at: impl Into<String>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            kind: APPROVAL_BLOB_KIND.to_owned(),
+            issue_id,
+            events: Vec::new(),
+            consumed: Vec::new(),
+            updated_at: updated_at.into(),
+        }
+    }
+
+    /// Return a copy with one approval or denial event appended.
+    #[must_use]
+    pub fn with_event(mut self, event: ApprovalEvent) -> Self {
+        self.events.push(event);
+        self
+    }
+
+    /// Return a copy with one consumption event appended.
+    #[must_use]
+    pub fn with_consumed(mut self, consumed: ApprovalConsumed) -> Self {
+        self.consumed.push(consumed);
+        self
+    }
+}
+
 /// Return the `KvStore` id used for Symphony metadata for a `TaskList`.
 #[must_use]
 pub fn store_id_for_list(list_id: &str) -> String {
@@ -175,6 +231,18 @@ pub fn claim_key(task_id: &str) -> String {
 #[must_use]
 pub fn handoff_key(task_id: &str) -> String {
     format!("handoff-{task_id}")
+}
+
+/// Return the `KvStore` key for a task's approval blob.
+#[must_use]
+pub fn approval_key(issue_id: &IssueId) -> String {
+    format!("approval-{issue_id}")
+}
+
+/// Return the `KvStore` key reserved for a task's consumption list.
+#[must_use]
+pub fn consumed_key(issue_id: &IssueId) -> String {
+    format!("approval-consumed-{issue_id}")
 }
 
 /// Encode a claim blob as JSON bytes for x0xd `KvStore`.
@@ -210,6 +278,24 @@ pub fn encode_handoff_blob(blob: &HandoffBlob) -> Result<Vec<u8>> {
 ///
 /// Returns [`MappingError::Json`] if the blob cannot be decoded.
 pub fn decode_handoff_blob(bytes: &[u8]) -> Result<HandoffBlob> {
+    serde_json::from_slice(bytes).map_err(|source| MappingError::Json { source })
+}
+
+/// Encode an approval blob as JSON bytes for x0xd `KvStore`.
+///
+/// # Errors
+///
+/// Returns [`MappingError::Json`] if the blob cannot be serialized.
+pub fn encode_approval_blob(blob: &ApprovalBlob) -> Result<Vec<u8>> {
+    serde_json::to_vec(blob).map_err(|source| MappingError::Json { source })
+}
+
+/// Decode an approval blob from x0xd `KvStore` JSON bytes.
+///
+/// # Errors
+///
+/// Returns [`MappingError::Json`] if the blob cannot be decoded.
+pub fn decode_approval_blob(bytes: &[u8]) -> Result<ApprovalBlob> {
     serde_json::from_slice(bytes).map_err(|source| MappingError::Json { source })
 }
 
@@ -404,7 +490,11 @@ fn validate_handoff_blob(task: &TaskEntry, handoff_blob: Option<&HandoffBlob>) -
 
 #[cfg(test)]
 mod tests {
-    use x0x_symphony_core::{AgentId, ShardRole, ValidationResult, ValidationStatus};
+    use x0x_symphony_core::{
+        content_hash, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalVerdict, ShardRole,
+        SignatureEnvelope, ValidationResult, ValidationStatus, APPROVAL_CONSUMED_CONTEXT,
+        APPROVAL_CONTEXT, SIGN_ALGORITHM,
+    };
 
     use super::*;
 
@@ -517,6 +607,71 @@ mod tests {
         );
         let encoded_handoff = encode_handoff_blob(&handoff_blob)?;
         assert_eq!(decode_handoff_blob(&encoded_handoff)?, handoff_blob);
+        Ok(())
+    }
+
+    #[test]
+    fn approval_blob_encodes_as_json_array_shape() -> TestResult {
+        let id = IssueId::new("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")?;
+        let mut issue = Issue::new(
+            id.clone(),
+            id.as_str(),
+            "Approve me",
+            IssueState::new("todo")?,
+            "2026-07-03T00:00:00Z",
+        )?;
+        issue.description = "Network task payload".to_owned();
+        let signer = AgentId::new("network-signer")?;
+        let mut event = ApprovalEvent::approve(
+            id.clone(),
+            content_hash(&issue),
+            signer.clone(),
+            "2026-07-03T01:00:00Z",
+            AgentId::new("approver")?,
+            Some("claim-audit-only".to_owned()),
+        );
+        event.signature = Some(SignatureEnvelope::new(
+            SIGN_ALGORITHM,
+            APPROVAL_CONTEXT,
+            "public-key",
+            "signature",
+            event.signing_payload_sha256()?,
+            event.approver_agent_id.to_string(),
+        ));
+        assert_eq!(event.verdict, ApprovalVerdict::Approve);
+
+        let placeholder = SignatureEnvelope::new(
+            SIGN_ALGORITHM,
+            APPROVAL_CONSUMED_CONTEXT,
+            "public-key",
+            "signature",
+            "placeholder",
+            "consumer",
+        );
+        let mut consumed = ApprovalConsumed::new(
+            id.clone(),
+            event.content_hash.clone(),
+            signer,
+            "nonce-1",
+            "2026-07-03T01:30:00Z",
+            placeholder,
+        );
+        consumed.signature = SignatureEnvelope::new(
+            SIGN_ALGORITHM,
+            APPROVAL_CONSUMED_CONTEXT,
+            "public-key",
+            "signature",
+            consumed.signing_payload_sha256()?,
+            "consumer",
+        );
+
+        let blob = ApprovalBlob::new(id.clone(), "2026-07-03T02:00:00Z")
+            .with_event(event)
+            .with_consumed(consumed);
+        let encoded = encode_approval_blob(&blob)?;
+        assert_eq!(decode_approval_blob(&encoded)?, blob);
+        assert_eq!(approval_key(&id), format!("approval-{id}"));
+        assert_eq!(consumed_key(&id), format!("approval-consumed-{id}"));
         Ok(())
     }
 }
