@@ -777,7 +777,17 @@ where
                     .await
                 {
                     CryptoVerify::Valid => kept.push(event.clone()),
-                    CryptoVerify::Invalid => {}
+                    CryptoVerify::Invalid => {
+                        // Make forged/stale/unknown-approver approval events visible to
+                        // operators rather than silently dropping them. A spike of these
+                        // is a signal of either a misconfigured approver or an attempted
+                        // consent forgery against the dispatch gate.
+                        warn!(
+                            issue_id = %issue.id,
+                            approver = %event.approver_agent_id,
+                            "dropping approval event: cryptographic signature verification failed; event treated as invalid"
+                        );
+                    }
                     CryptoVerify::TransportError => {
                         self.block_for_dispatch_refusal(
                             guard,
