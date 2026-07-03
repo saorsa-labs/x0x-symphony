@@ -51,6 +51,13 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// A spawned child process did not expose an operating-system identifier.
+    #[error("child process for {command} did not expose a process id")]
+    MissingChildPid {
+        /// Command path or executable name.
+        command: String,
+    },
+
     /// A required child stdio pipe was not available after spawning.
     #[error("child process for {command} did not expose {stream} pipe")]
     MissingPipe {

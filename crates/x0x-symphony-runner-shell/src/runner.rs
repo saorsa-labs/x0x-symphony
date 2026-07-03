@@ -32,8 +32,8 @@ use x0x_symphony_core::{
 use crate::{
     env,
     error::{Error, Result},
-    CommandPlan, EventOverflowPolicy, HostSandbox, IssueSource, NoopSession, PreparedCommand,
-    RunnerSpec, Sandbox, SandboxSession, WrappedCommand,
+    CommandPlan, EventOverflowPolicy, HostSandbox, IssueSource, NoopSession, RunnerSpec, Sandbox,
+    SandboxSession, WrappedCommand,
 };
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -135,6 +135,18 @@ impl ShellRunner {
                 });
             }
         };
+        let Some(child_pid) = child.id() else {
+            kill_child_after_start_failure(&mut child, &self.spec.command);
+            shutdown_after_spawn_error(&mut *sandbox_session).await;
+            return Err(Error::MissingChildPid {
+                command: self.spec.command.clone(),
+            });
+        };
+        if let Err(error) = sandbox_session.child_started(child_pid).await {
+            kill_child_after_start_failure(&mut child, &self.spec.command);
+            shutdown_after_spawn_error(&mut *sandbox_session).await;
+            return Err(Error::from(error));
+        }
 
         let outcome = async {
             let stdin = take_pipe(child.stdin.take(), "stdin", &self.spec.command, &mut child)?;
@@ -196,16 +208,23 @@ impl ShellRunner {
             sess.workspace_path.clone(),
             child_env,
         );
-        let PreparedCommand { command, session } = if let Some(sandbox) = &self.sandbox {
-            sandbox.prepare(plan, IssueSource::Local).await?
+        // XSY-0042 step 3 note: propagate the real issue source through the
+        // runner/orchestrator path without changing dispatch-gate semantics.
+        let source = IssueSource::Local;
+        let mut session: Box<dyn SandboxSession> = if let Some(sandbox) = &self.sandbox {
+            sandbox.prepare(source).await?
         } else {
-            PreparedCommand {
-                command: WrappedCommand::from(plan),
-                session: Box::new(NoopSession),
+            Box::new(NoopSession)
+        };
+        let wrapped = match session.wrap(&plan).await {
+            Ok(wrapped) => wrapped,
+            Err(error) => {
+                shutdown_after_wrap_error(&mut *session).await;
+                return Err(Error::from(error));
             }
         };
         Ok(PreparedProcessCommand {
-            command: command_from_wrapped(command),
+            command: command_from_wrapped(wrapped, &plan.env),
             sandbox_session: session,
         })
     }
@@ -216,13 +235,15 @@ struct PreparedProcessCommand {
     sandbox_session: Box<dyn SandboxSession>,
 }
 
-fn command_from_wrapped(plan: WrappedCommand) -> Command {
+fn command_from_wrapped(plan: WrappedCommand, base_env: &BTreeMap<String, String>) -> Command {
+    let mut merged_env = base_env.clone();
+    merged_env.extend(plan.env_additions);
     let mut command = Command::new(&plan.program);
     command
         .args(&plan.args)
         .current_dir(&plan.cwd)
         .env_clear()
-        .envs(plan.env)
+        .envs(merged_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -230,9 +251,21 @@ fn command_from_wrapped(plan: WrappedCommand) -> Command {
     command
 }
 
+async fn shutdown_after_wrap_error(session: &mut dyn SandboxSession) {
+    if let Err(error) = session.shutdown().await {
+        tracing::warn!(%error, "sandbox session shutdown failed after wrap error");
+    }
+}
+
 async fn shutdown_after_spawn_error(session: &mut dyn SandboxSession) {
     if let Err(error) = session.shutdown().await {
         tracing::warn!(%error, "sandbox session shutdown failed after spawn error");
+    }
+}
+
+fn kill_child_after_start_failure(child: &mut Child, command: &str) {
+    if let Err(error) = kill_process_group(child, command) {
+        tracing::warn!(%error, "failed to kill child after sandbox start hook error");
     }
 }
 
@@ -662,7 +695,8 @@ mod tests {
     struct RecordingSandbox {
         spec: SandboxSpec,
         shutdowns: Arc<AtomicUsize>,
-        prepared_cwds: Arc<Mutex<Vec<PathBuf>>>,
+        wrapped_cwds: Arc<Mutex<Vec<PathBuf>>>,
+        child_starts: Arc<AtomicUsize>,
         injected_env: Option<(String, String)>,
         command_override: Option<String>,
     }
@@ -672,7 +706,8 @@ mod tests {
             Self {
                 spec: SandboxSpec::default(),
                 shutdowns: Arc::new(AtomicUsize::new(0)),
-                prepared_cwds: Arc::new(Mutex::new(Vec::new())),
+                wrapped_cwds: Arc::new(Mutex::new(Vec::new())),
+                child_starts: Arc::new(AtomicUsize::new(0)),
                 injected_env: None,
                 command_override: None,
             }
@@ -692,8 +727,12 @@ mod tests {
             self.shutdowns.load(AtomicOrdering::SeqCst)
         }
 
-        fn prepared_cwds(&self) -> Result<Vec<PathBuf>> {
-            self.prepared_cwds
+        fn child_start_count(&self) -> usize {
+            self.child_starts.load(AtomicOrdering::SeqCst)
+        }
+
+        fn wrapped_cwds(&self) -> Result<Vec<PathBuf>> {
+            self.wrapped_cwds
                 .lock()
                 .map(|cwds| cwds.clone())
                 .map_err(|_| Error::SessionRegistryPoisoned)
@@ -704,32 +743,16 @@ mod tests {
     impl Sandbox for RecordingSandbox {
         async fn prepare(
             &self,
-            plan: CommandPlan,
             source: IssueSource,
-        ) -> saorsa_sandbox::Result<PreparedCommand> {
+        ) -> saorsa_sandbox::Result<Box<dyn SandboxSession>> {
             assert_eq!(source, IssueSource::Local);
-            let mut command = WrappedCommand::from(plan);
-            if let Some((key, value)) = &self.injected_env {
-                command.env.insert(key.clone(), value.clone());
-            }
-            if let Some(program) = &self.command_override {
-                command.program = program.clone();
-            }
-            self.prepared_cwds
-                .lock()
-                .map_err(|_| {
-                    saorsa_sandbox::Error::invalid_config(
-                        "recording_sandbox.prepared_cwds",
-                        "mutex poisoned",
-                    )
-                })?
-                .push(command.cwd.clone());
-            Ok(PreparedCommand {
-                command,
-                session: Box::new(RecordingSession {
-                    shutdowns: Arc::clone(&self.shutdowns),
-                }),
-            })
+            Ok(Box::new(RecordingSession {
+                shutdowns: Arc::clone(&self.shutdowns),
+                wrapped_cwds: Arc::clone(&self.wrapped_cwds),
+                child_starts: Arc::clone(&self.child_starts),
+                injected_env: self.injected_env.clone(),
+                command_override: self.command_override.clone(),
+            }))
         }
 
         async fn probe(&self) -> saorsa_sandbox::Result<ProbeReport> {
@@ -747,10 +770,39 @@ mod tests {
 
     struct RecordingSession {
         shutdowns: Arc<AtomicUsize>,
+        wrapped_cwds: Arc<Mutex<Vec<PathBuf>>>,
+        child_starts: Arc<AtomicUsize>,
+        injected_env: Option<(String, String)>,
+        command_override: Option<String>,
     }
 
     #[async_trait::async_trait]
     impl SandboxSession for RecordingSession {
+        async fn wrap(&self, plan: &CommandPlan) -> saorsa_sandbox::Result<WrappedCommand> {
+            let mut command = WrappedCommand::from_plan(plan);
+            if let Some((key, value)) = &self.injected_env {
+                command.env_additions.insert(key.clone(), value.clone());
+            }
+            if let Some(program) = &self.command_override {
+                command.program = program.clone();
+            }
+            self.wrapped_cwds
+                .lock()
+                .map_err(|_| {
+                    saorsa_sandbox::Error::invalid_config(
+                        "recording_sandbox.wrapped_cwds",
+                        "mutex poisoned",
+                    )
+                })?
+                .push(command.cwd.clone());
+            Ok(command)
+        }
+
+        async fn child_started(&self, _pid: u32) -> saorsa_sandbox::Result<()> {
+            self.child_starts.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+
         async fn shutdown(&mut self) -> saorsa_sandbox::Result<()> {
             self.shutdowns.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(())
@@ -781,6 +833,7 @@ mod tests {
         assert!(stdout_text(&runner, &handle)
             .await
             .contains("visible-from-sandbox"));
+        assert_eq!(sandbox.child_start_count(), 1);
         assert_eq!(sandbox.shutdown_count(), 1);
         runner.stop_session(handle).await?;
         Ok(())
@@ -788,7 +841,38 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_receives_distinct_cwd_for_each_session() -> TestResult {
+    async fn env_additions_override_caller_on_collision() -> TestResult {
+        let workspace = tempdir()?;
+        let spec = RunnerSpec::new("/bin/sh")?
+            .with_args([
+                "-c".to_owned(),
+                "printf '%s' \"$SANDBOX_COLLISION\"".to_owned(),
+            ])
+            .with_env("SANDBOX_COLLISION", "caller-value")
+            .with_turn_timeout_ms(2_000);
+        let sandbox = Arc::new(
+            RecordingSandbox::new().with_injected_env("SANDBOX_COLLISION", "backend-value"),
+        );
+        let runner = runner_with_sandbox(spec, sandbox.clone())?;
+        let mut handle = runner
+            .start_session(session_context(workspace.path())?)
+            .await?;
+
+        let outcome = runner.run_turn(&mut handle, Prompt::new("")).await?;
+
+        assert_eq!(outcome.status, TurnStatus::Succeeded);
+        assert!(stdout_text(&runner, &handle)
+            .await
+            .contains("backend-value"));
+        assert_eq!(sandbox.child_start_count(), 1);
+        assert_eq!(sandbox.shutdown_count(), 1);
+        runner.stop_session(handle).await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrap_receives_distinct_cwd_for_each_session() -> TestResult {
         let workspace_one = tempdir()?;
         let workspace_two = tempdir()?;
         let spec = RunnerSpec::new("/bin/pwd")?.with_turn_timeout_ms(2_000);
@@ -813,7 +897,7 @@ mod tests {
             .await
             .contains(&path_string(workspace_two.path())));
         assert_eq!(
-            sandbox.prepared_cwds()?,
+            sandbox.wrapped_cwds()?,
             vec![
                 workspace_one.path().to_path_buf(),
                 workspace_two.path().to_path_buf()

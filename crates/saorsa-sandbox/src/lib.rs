@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 //! Host sandbox profile planning for the shell runner.
 //!
-//! The sandbox layer prepares a structured [`CommandPlan`] into a [`WrappedCommand`]
-//! before the runner builds `tokio::process::Command`. It never attempts to inspect
-//! a built command because Tokio's command type intentionally has no getters for
-//! argv, cwd, or environment.
+//! The sandbox layer creates a per-command session, then wraps a structured
+//! [`CommandPlan`] into a [`WrappedCommand`] before the runner builds
+//! `tokio::process::Command`. It never attempts to inspect a built command
+//! because Tokio's command type intentionally has no getters for argv, cwd, or
+//! environment.
 
 use std::{
     collections::BTreeMap,
@@ -12,6 +13,7 @@ use std::{
     ffi::OsString,
     io,
     path::{Path, PathBuf},
+    process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -125,8 +127,23 @@ pub struct WrappedCommand {
     pub args: Vec<String>,
     /// Working directory used when spawning the wrapped command.
     pub cwd: PathBuf,
-    /// Complete child environment after runner and sandbox additions.
-    pub env: BTreeMap<String, String>,
+    /// Environment additions the backend needs, applied over the caller's
+    /// allow-list at spawn time. This is not a complete child environment;
+    /// collisions deliberately let the backend override the caller.
+    pub env_additions: BTreeMap<String, String>,
+}
+
+impl WrappedCommand {
+    /// Return an unwrapped command view for a caller plan.
+    #[must_use]
+    pub fn from_plan(plan: &CommandPlan) -> Self {
+        Self {
+            program: plan.program.clone(),
+            args: plan.args.clone(),
+            cwd: plan.cwd.clone(),
+            env_additions: BTreeMap::new(),
+        }
+    }
 }
 
 impl From<CommandPlan> for WrappedCommand {
@@ -135,22 +152,35 @@ impl From<CommandPlan> for WrappedCommand {
             program: plan.program,
             args: plan.args,
             cwd: plan.cwd,
-            env: plan.env,
+            env_additions: BTreeMap::new(),
         }
     }
 }
 
-/// Result of preparing a command for sandboxed execution.
-pub struct PreparedCommand {
-    /// Wrapped command to spawn.
-    pub command: WrappedCommand,
-    /// Per-session sandbox lifecycle handle.
-    pub session: Box<dyn SandboxSession>,
-}
-
-/// Per-session sandbox resources that must be released after execution.
+/// Per-session sandbox resources and wrapping hooks for one command lifetime.
 #[async_trait]
-pub trait SandboxSession: Send {
+pub trait SandboxSession: Send + Sync {
+    /// Produce the wrapped command for this plan after [`Sandbox::prepare`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan cannot be represented by the backend.
+    async fn wrap(&self, plan: &CommandPlan) -> Result<WrappedCommand>;
+
+    /// Observe the spawned child before any backend-specific release step.
+    ///
+    /// The Linux native launcher needs the parent to attach the spawned PID to
+    /// its cgroup before the launcher is released through its synchronization
+    /// pipe. This hook is the split point that makes that race-free attach
+    /// possible. Backends that do not need it use the default no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend cannot finish child setup.
+    async fn child_started(&self, _pid: u32) -> Result<()> {
+        Ok(())
+    }
+
     /// Release backend resources associated with this prepared command.
     ///
     /// # Errors
@@ -165,6 +195,10 @@ pub struct NoopSession;
 
 #[async_trait]
 impl SandboxSession for NoopSession {
+    async fn wrap(&self, plan: &CommandPlan) -> Result<WrappedCommand> {
+        Ok(WrappedCommand::from_plan(plan))
+    }
+
     async fn shutdown(&mut self) -> Result<()> {
         Ok(())
     }
@@ -415,16 +449,17 @@ pub struct ProbeReport {
 /// Object-safe sandbox interface used by the runner.
 #[async_trait]
 pub trait Sandbox: Send + Sync {
-    /// Prepare a command for sandboxed execution.
+    /// Set up backend resources for one command lifetime.
     ///
-    /// The command plan's `cwd` is per call, and `source` controls fail-closed
-    /// behavior for future network-sourced work.
+    /// `source` controls fail-closed behavior. The runner still hard-codes the
+    /// local source today; the real source is propagated by the next native
+    /// backend step without changing dispatch-gate semantics.
     ///
     /// # Errors
     ///
     /// Returns an error when the configured backend is unavailable under a
-    /// fail-closed policy or when the plan cannot be represented safely.
-    async fn prepare(&self, plan: CommandPlan, source: IssueSource) -> Result<PreparedCommand>;
+    /// fail-closed policy.
+    async fn prepare(&self, source: IssueSource) -> Result<Box<dyn SandboxSession>>;
 
     /// Run the backend self-test and return a structured report.
     ///
@@ -441,6 +476,18 @@ pub trait Sandbox: Send + Sync {
 pub struct HostSandbox {
     spec: SandboxSpec,
     backend_available: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostWrapMode {
+    Available,
+    UnavailableWarn,
+}
+
+#[derive(Debug)]
+struct HostSandboxSession {
+    spec: SandboxSpec,
+    mode: HostWrapMode,
 }
 
 impl HostSandbox {
@@ -470,9 +517,9 @@ impl HostSandbox {
         })
     }
 
-    fn handle_unavailable(&self, plan: &CommandPlan, source: IssueSource) -> Result<bool> {
+    fn prepare_mode(&self, source: IssueSource) -> Result<HostWrapMode> {
         if self.spec.backend != Backend::None && self.backend_available {
-            return Ok(false);
+            return Ok(HostWrapMode::Available);
         }
         let message = if self.spec.backend == Backend::None {
             "sandbox backend resolved to none".to_owned()
@@ -487,15 +534,81 @@ impl HostSandbox {
                 message,
             });
         }
-        tracing::warn!(
-            backend = self.spec.backend.as_str(),
-            command = plan.program,
-            "sandbox unavailable; running local work without host sandbox"
-        );
-        Ok(true)
+        Ok(HostWrapMode::UnavailableWarn)
     }
 
-    fn wrap_available(&self, plan: &mut CommandPlan) {
+    async fn probe_check(
+        &self,
+        workspace: &Path,
+        name: &str,
+        program: &str,
+        args: Vec<String>,
+    ) -> ProbeCheck {
+        let mut env = BTreeMap::new();
+        if let Some(path) = env::var_os("PATH").and_then(os_string_into_string) {
+            env.insert("PATH".to_owned(), path);
+        }
+        let plan = CommandPlan::new(program, args, workspace.to_path_buf(), env);
+        let mut session = match self.prepare(IssueSource::Local).await {
+            Ok(session) => session,
+            Err(error) => {
+                return ProbeCheck {
+                    name: name.to_owned(),
+                    status: ProbeStatus::NotApplicable,
+                    detail: format!("probe could not prepare command: {error}"),
+                };
+            }
+        };
+        let command = match session.wrap(&plan).await {
+            Ok(command) => command,
+            Err(error) => {
+                let detail = format!("probe could not wrap command: {error}");
+                if let Err(shutdown_error) = session.shutdown().await {
+                    return ProbeCheck {
+                        name: name.to_owned(),
+                        status: ProbeStatus::Fail,
+                        detail: format!(
+                            "probe sandbox shutdown failed after wrap error: {shutdown_error}"
+                        ),
+                    };
+                }
+                return ProbeCheck {
+                    name: name.to_owned(),
+                    status: ProbeStatus::NotApplicable,
+                    detail,
+                };
+            }
+        };
+        let run = run_probe_plan(&command, &plan.env, &*session).await;
+        if let Err(error) = session.shutdown().await {
+            return ProbeCheck {
+                name: name.to_owned(),
+                status: ProbeStatus::Fail,
+                detail: format!("probe sandbox shutdown failed: {error}"),
+            };
+        }
+        match run {
+            ProbeRun::Blocked(detail) => ProbeCheck {
+                name: name.to_owned(),
+                status: ProbeStatus::Pass,
+                detail,
+            },
+            ProbeRun::Allowed(detail) => ProbeCheck {
+                name: name.to_owned(),
+                status: ProbeStatus::Fail,
+                detail,
+            },
+            ProbeRun::NotApplicable(detail) => ProbeCheck {
+                name: name.to_owned(),
+                status: ProbeStatus::NotApplicable,
+                detail,
+            },
+        }
+    }
+}
+
+impl HostSandboxSession {
+    fn wrap_available(&self, plan: &mut WrappedCommand) {
         match self.spec.backend {
             Backend::SandboxRuntime => self.wrap_sandbox_runtime(plan),
             Backend::Bubblewrap => self.wrap_bubblewrap(plan),
@@ -506,7 +619,7 @@ impl HostSandbox {
         self.apply_resource_limits(plan);
     }
 
-    fn wrap_sandbox_runtime(&self, plan: &mut CommandPlan) {
+    fn wrap_sandbox_runtime(&self, plan: &mut WrappedCommand) {
         let mut args = vec![
             "run".to_owned(),
             "--profile".to_owned(),
@@ -530,7 +643,7 @@ impl HostSandbox {
         replace_with_wrapper(plan, SRT_BINARY, args);
     }
 
-    fn wrap_bubblewrap(&self, plan: &mut CommandPlan) {
+    fn wrap_bubblewrap(&self, plan: &mut WrappedCommand) {
         let mut args = bubblewrap_namespace_args(&self.spec);
         args.extend(["--ro-bind".to_owned(), "/".to_owned(), "/".to_owned()]);
         if self.spec.profile.workspace_read_only() {
@@ -562,7 +675,7 @@ impl HostSandbox {
         replace_with_wrapper(plan, BWRAP_BINARY, args);
     }
 
-    fn wrap_landlock(&self, plan: &mut CommandPlan) {
+    fn wrap_landlock(&self, plan: &mut WrappedCommand) {
         let mut args = Vec::new();
         if self.spec.profile.workspace_read_only() {
             args.push("--ro".to_owned());
@@ -583,87 +696,49 @@ impl HostSandbox {
         replace_with_wrapper(plan, LANDLOCK_BINARY, args);
     }
 
-    fn wrap_sandbox_exec(&self, plan: &mut CommandPlan) {
+    fn wrap_sandbox_exec(&self, plan: &mut WrappedCommand) {
         let profile = sandbox_exec_profile(&self.spec, &plan.cwd);
         let args = vec!["-p".to_owned(), profile];
         replace_with_wrapper(plan, SANDBOX_EXEC_PATH, args);
     }
 
-    fn apply_resource_limits(&self, plan: &mut CommandPlan) {
+    fn apply_resource_limits(&self, plan: &mut WrappedCommand) {
         if self.spec.cpu_seconds.is_none() && self.spec.memory_bytes.is_none() {
             return;
         }
         apply_platform_resource_limits(&self.spec, plan);
     }
+}
 
-    async fn probe_check(
-        &self,
-        workspace: &Path,
-        name: &str,
-        program: &str,
-        args: Vec<String>,
-    ) -> ProbeCheck {
-        let mut env = BTreeMap::new();
-        if let Some(path) = env::var_os("PATH").and_then(os_string_into_string) {
-            env.insert("PATH".to_owned(), path);
-        }
-        let plan = CommandPlan::new(program, args, workspace.to_path_buf(), env);
-        let prepared = match self.prepare(plan, IssueSource::Local).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return ProbeCheck {
-                    name: name.to_owned(),
-                    status: ProbeStatus::NotApplicable,
-                    detail: format!("probe could not prepare command: {error}"),
-                };
+#[async_trait]
+impl SandboxSession for HostSandboxSession {
+    async fn wrap(&self, plan: &CommandPlan) -> Result<WrappedCommand> {
+        let mut command = WrappedCommand::from_plan(plan);
+        match self.mode {
+            HostWrapMode::Available => self.wrap_available(&mut command),
+            HostWrapMode::UnavailableWarn => {
+                tracing::warn!(
+                    backend = self.spec.backend.as_str(),
+                    command = plan.program,
+                    "sandbox unavailable; running local work without host sandbox"
+                );
             }
-        };
-        let PreparedCommand {
-            command,
-            mut session,
-        } = prepared;
-        let run = run_probe_plan(&command).await;
-        if let Err(error) = session.shutdown().await {
-            return ProbeCheck {
-                name: name.to_owned(),
-                status: ProbeStatus::Fail,
-                detail: format!("probe sandbox shutdown failed: {error}"),
-            };
         }
-        match run {
-            ProbeRun::Blocked(detail) => ProbeCheck {
-                name: name.to_owned(),
-                status: ProbeStatus::Pass,
-                detail,
-            },
-            ProbeRun::Allowed(detail) => ProbeCheck {
-                name: name.to_owned(),
-                status: ProbeStatus::Fail,
-                detail,
-            },
-            ProbeRun::NotApplicable(detail) => ProbeCheck {
-                name: name.to_owned(),
-                status: ProbeStatus::NotApplicable,
-                detail,
-            },
-        }
+        Ok(command)
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
 #[async_trait]
 impl Sandbox for HostSandbox {
-    async fn prepare(&self, mut plan: CommandPlan, source: IssueSource) -> Result<PreparedCommand> {
-        if self.handle_unavailable(&plan, source)? {
-            return Ok(PreparedCommand {
-                command: WrappedCommand::from(plan),
-                session: Box::new(NoopSession),
-            });
-        }
-        self.wrap_available(&mut plan);
-        Ok(PreparedCommand {
-            command: WrappedCommand::from(plan),
-            session: Box::new(NoopSession),
-        })
+    async fn prepare(&self, source: IssueSource) -> Result<Box<dyn SandboxSession>> {
+        Ok(Box::new(HostSandboxSession {
+            spec: self.spec.clone(),
+            mode: self.prepare_mode(source)?,
+        }))
     }
 
     async fn probe(&self) -> Result<ProbeReport> {
@@ -869,7 +944,7 @@ fn sandbox_exec_profile(spec: &SandboxSpec, workspace: &Path) -> String {
     lines.join("\n")
 }
 
-fn replace_with_wrapper(plan: &mut CommandPlan, wrapper: &str, mut wrapper_args: Vec<String>) {
+fn replace_with_wrapper(plan: &mut WrappedCommand, wrapper: &str, mut wrapper_args: Vec<String>) {
     let original_program = std::mem::replace(&mut plan.program, wrapper.to_owned());
     let original_args = std::mem::take(&mut plan.args);
     wrapper_args.push(original_program);
@@ -877,7 +952,7 @@ fn replace_with_wrapper(plan: &mut CommandPlan, wrapper: &str, mut wrapper_args:
     plan.args = wrapper_args;
 }
 
-fn apply_platform_resource_limits(spec: &SandboxSpec, plan: &mut CommandPlan) {
+fn apply_platform_resource_limits(spec: &SandboxSpec, plan: &mut WrappedCommand) {
     if cfg!(target_os = "linux") {
         apply_linux_resource_limits(spec, plan);
     } else if cfg!(target_os = "macos") {
@@ -887,7 +962,7 @@ fn apply_platform_resource_limits(spec: &SandboxSpec, plan: &mut CommandPlan) {
     }
 }
 
-fn apply_linux_resource_limits(spec: &SandboxSpec, plan: &mut CommandPlan) {
+fn apply_linux_resource_limits(spec: &SandboxSpec, plan: &mut WrappedCommand) {
     if !command_available("systemd-run") {
         tracing::warn!("systemd-run unavailable; sandbox resource limits not applied");
         return;
@@ -913,7 +988,7 @@ fn apply_linux_resource_limits(spec: &SandboxSpec, plan: &mut CommandPlan) {
     plan.args = args;
 }
 
-fn apply_macos_resource_limits(spec: &SandboxSpec, plan: &mut CommandPlan) {
+fn apply_macos_resource_limits(spec: &SandboxSpec, plan: &mut WrappedCommand) {
     let original_program = std::mem::replace(&mut plan.program, "/bin/sh".to_owned());
     let original_args = std::mem::take(&mut plan.args);
     let mut script = String::new();
@@ -1059,14 +1134,42 @@ enum ProbeRun {
     NotApplicable(String),
 }
 
-async fn run_probe_plan(plan: &WrappedCommand) -> ProbeRun {
+async fn run_probe_plan(
+    plan: &WrappedCommand,
+    base_env: &BTreeMap<String, String>,
+    session: &dyn SandboxSession,
+) -> ProbeRun {
+    let mut merged_env = base_env.clone();
+    merged_env.extend(plan.env_additions.clone());
     let mut command = Command::new(&plan.program);
     command
         .args(&plan.args)
         .current_dir(&plan.cwd)
         .env_clear()
-        .envs(&plan.env);
-    match tokio::time::timeout(PROBE_TIMEOUT, command.output()).await {
+        .envs(merged_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProbeRun::NotApplicable(format!("probe command not found: {error}"));
+        }
+        Err(error) => return ProbeRun::Blocked(format!("probe command failed to spawn: {error}")),
+    };
+    let Some(pid) = child.id() else {
+        if let Err(error) = child.start_kill() {
+            tracing::warn!(%error, "failed to kill pid-less probe child");
+        }
+        return ProbeRun::Blocked("probe command spawned without a child id".to_owned());
+    };
+    if let Err(error) = session.child_started(pid).await {
+        if let Err(kill_error) = child.start_kill() {
+            tracing::warn!(%kill_error, "failed to kill probe child after child-start hook error");
+        }
+        return ProbeRun::Blocked(format!("probe child-start hook failed: {error}"));
+    }
+    match tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => {
             if output.status.success() {
                 ProbeRun::Allowed("forbidden action succeeded".to_owned())
@@ -1076,10 +1179,7 @@ async fn run_probe_plan(plan: &WrappedCommand) -> ProbeRun {
                 ProbeRun::Blocked(exit_detail(&output))
             }
         }
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            ProbeRun::NotApplicable(format!("probe command not found: {error}"))
-        }
-        Ok(Err(error)) => ProbeRun::Blocked(format!("probe command failed to spawn: {error}")),
+        Ok(Err(error)) => ProbeRun::Blocked(format!("probe command failed while waiting: {error}")),
         Err(_elapsed) => ProbeRun::Blocked("probe command timed out".to_owned()),
     }
 }
@@ -1126,10 +1226,8 @@ mod tests {
     }
 
     async fn prepared_command(sandbox: &HostSandbox, plan: CommandPlan) -> Result<WrappedCommand> {
-        let PreparedCommand {
-            command,
-            mut session,
-        } = sandbox.prepare(plan, IssueSource::Local).await?;
+        let mut session = sandbox.prepare(IssueSource::Local).await?;
+        let command = session.wrap(&plan).await?;
         session.shutdown().await?;
         Ok(command)
     }
@@ -1335,7 +1433,7 @@ mod tests {
         let Ok(sandbox) = sandbox else {
             unreachable!("test spec is valid");
         };
-        let result = sandbox.prepare(plan(), IssueSource::Local).await;
+        let result = sandbox.prepare(IssueSource::Local).await;
 
         assert!(matches!(result, Err(Error::SandboxUnavailable { .. })));
     }
@@ -1367,7 +1465,7 @@ mod tests {
             unreachable!("test spec is valid");
         };
 
-        let network_result = sandbox.prepare(plan(), IssueSource::NetworkSourced).await;
+        let network_result = sandbox.prepare(IssueSource::NetworkSourced).await;
 
         assert!(matches!(
             network_result,
@@ -1379,6 +1477,85 @@ mod tests {
         if let Ok(command) = local_result {
             assert_eq!(command, WrappedCommand::from(original));
         }
+    }
+
+    #[tokio::test]
+    async fn wrap_returns_env_additions_not_complete_env() -> Result<()> {
+        let sandbox = available_sandbox(spec(SandboxProfile::RepoWrite, Backend::Bubblewrap));
+        let mut caller_env = BTreeMap::new();
+        caller_env.insert("CALLER_ONLY".to_owned(), "visible".to_owned());
+        caller_env.insert("PATH".to_owned(), "/usr/bin".to_owned());
+        let plan = CommandPlan::new(
+            "/bin/echo",
+            vec!["hello".to_owned()],
+            PathBuf::from("/tmp/repo"),
+            caller_env,
+        );
+
+        let mut session = sandbox.prepare(IssueSource::Local).await?;
+        let wrapped = session.wrap(&plan).await?;
+
+        assert_eq!(wrapped.program, BWRAP_BINARY);
+        assert!(wrapped.env_additions.is_empty());
+        assert!(!wrapped.env_additions.contains_key("CALLER_ONLY"));
+        assert!(!wrapped.env_additions.contains_key("PATH"));
+        session.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn absent_caller_vars_do_not_leak_via_additions() -> Result<()> {
+        let mut spec = spec(SandboxProfile::RepoWrite, Backend::None);
+        spec.on_unavailable = UnavailablePolicy::Warn;
+        let sandbox = available_sandbox(spec);
+        let mut caller_env = BTreeMap::new();
+        caller_env.insert("ALLOWED_BY_CALLER".to_owned(), "kept".to_owned());
+        let plan = CommandPlan::new(
+            "/bin/echo",
+            vec!["hello".to_owned()],
+            PathBuf::from("/tmp/repo"),
+            caller_env,
+        );
+
+        let mut session = sandbox.prepare(IssueSource::Local).await?;
+        let wrapped = session.wrap(&plan).await?;
+
+        assert!(wrapped.env_additions.is_empty());
+        assert!(!wrapped.env_additions.contains_key("ALLOWED_BY_CALLER"));
+        assert!(!wrapped.env_additions.contains_key("STRIPPED_BY_CALLER"));
+        session.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn prepare_returns_session_and_wrap_is_separate_call() -> Result<()> {
+        let sandbox = available_sandbox(spec(SandboxProfile::RepoWrite, Backend::Bubblewrap));
+        let mut session = sandbox.prepare(IssueSource::Local).await?;
+        let plan = plan();
+
+        let wrapped = session.wrap(&plan).await?;
+
+        assert_eq!(wrapped.program, BWRAP_BINARY);
+        assert_eq!(wrapped.cwd, plan.cwd);
+        session.shutdown().await
+    }
+
+    struct DefaultHookSession;
+
+    #[async_trait]
+    impl SandboxSession for DefaultHookSession {
+        async fn wrap(&self, plan: &CommandPlan) -> Result<WrappedCommand> {
+            Ok(WrappedCommand::from_plan(plan))
+        }
+
+        async fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn child_started_default_is_noop() -> Result<()> {
+        let session = DefaultHookSession;
+
+        session.child_started(42).await
     }
 
     #[test]
