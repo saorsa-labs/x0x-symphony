@@ -69,6 +69,25 @@ fn network_issue_with_provenance(
     Ok(issue)
 }
 
+/// Like [`network_issue_with_provenance`] but the source marker deliberately
+/// claims `local`. Used to prove the dispatch gate is self-enforcing: an issue
+/// carrying network provenance must be gated even when the marker is absent or
+/// claims local (defends against a tampered/missing marker).
+fn local_marker_with_provenance(
+    id: &str,
+    labels: &[&str],
+    provenance: Option<SignatureProvenance>,
+) -> Result<Issue, Box<dyn Error>> {
+    let mut issue = make_issue(id, "todo")?;
+    issue.labels = labels.iter().map(|label| (*label).to_owned()).collect();
+    issue.extra.insert(
+        "issue_source".to_owned(),
+        serde_json::Value::String("local".to_owned()),
+    );
+    issue.signature_provenance = provenance;
+    Ok(issue)
+}
+
 fn local_issue_with_labels(id: &str, labels: &[&str]) -> Result<Issue, Box<dyn Error>> {
     let mut issue = make_issue(id, "todo")?;
     issue.labels = labels.iter().map(|label| (*label).to_owned()).collect();
@@ -1114,6 +1133,82 @@ async fn verified_trusted_enabled_dispatches() -> Result<(), Box<dyn Error>> {
     assert_eq!(guard(&tracker.handoffs).len(), 1);
     assert!(guard(&tracker.releases).is_empty());
     Ok(())
+}
+
+#[tokio::test]
+async fn provenance_with_local_marker_still_gated() -> Result<(), Box<dyn Error>> {
+    // Self-enforcing gate: an issue whose marker claims `local` but carries
+    // network signature provenance must NOT slip past the gate. The old
+    // fail-open classification (marker == Local => bypass) would dispatch this;
+    // the hardened gate treats provenance presence as network-sourced and
+    // refuses because network dispatch is disabled (M3 default).
+    let issue = local_marker_with_provenance(
+        "XSY-GATE-TAMPER",
+        &["feature"],
+        Some(SignatureProvenance::verified("agent-tamper")),
+    )?;
+    let config = network_config(TrustLevel::Trusted, false, default_test_proofs_dir())?;
+    let trust = Arc::new(MockTrustClient::default());
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy);
+    assert!(
+        trust.calls().is_empty(),
+        "disabled dispatch must never query trust"
+    );
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-GATE-TAMPER",
+        &ReleaseReasonCode::NetworkDispatchDisabled,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_network_claim_is_re_gated_not_trusted_from_prior_state(
+) -> Result<(), Box<dyn Error>> {
+    // After a restart, a network-sourced issue is re-gated on every run_claim
+    // — it is never trusted from a prior pass. Two independent orchestrator
+    // lifecycles (fresh state = restart) both refuse the same unsigned network
+    // issue with zero execution calls.
+    let issue = unsigned_network_issue("XSY-GATE-RESUME", &["feature"])?;
+
+    // First lifecycle: blocked, zero execution.
+    let (res1, spy1, tracker1, _) = run_spy_dispatch(
+        issue.clone(),
+        network_config_trusted_enabled()?,
+        Arc::new(MockTrustClient::default()),
+    )
+    .await?;
+    assert_eq!(res1, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy1);
+    assert_blocked_with_code(
+        &tracker1,
+        "XSY-GATE-RESUME",
+        &ReleaseReasonCode::MissingVerifiedSignature,
+    )?;
+
+    // Restart: fresh orchestrator, same network issue — re-gated, not trusted.
+    let (res2, spy2, tracker2, _) = run_spy_dispatch(
+        issue,
+        network_config_trusted_enabled()?,
+        Arc::new(MockTrustClient::default()),
+    )
+    .await?;
+    assert_eq!(res2, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy2);
+    assert_blocked_with_code(
+        &tracker2,
+        "XSY-GATE-RESUME",
+        &ReleaseReasonCode::MissingVerifiedSignature,
+    )?;
+    Ok(())
+}
+
+fn network_config_trusted_enabled() -> Result<Config, Box<dyn Error>> {
+    network_config(TrustLevel::Trusted, true, default_test_proofs_dir())
 }
 
 #[tokio::test]
