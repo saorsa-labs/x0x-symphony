@@ -18,7 +18,7 @@ use x0x_symphony_orchestrator::{
 use x0x_symphony_runner_shell::RunnerSpec;
 use x0x_symphony_signing::SigningPolicy;
 
-const LEGACY_CODEX_BLOCK_DEPRECATION: &str = "`codex:` top-level block is deprecated and will be removed in M5 (XSY-0031); use `runner: {kind: shell, preset: codex}` instead. See docs/symphony/operator.md#migrating-from-the-legacy-codex-block.";
+const LEGACY_CODEX_BLOCK_REMOVAL: &str = "`codex:` top-level block was removed in XSY-0031 and is no longer supported; use `runner: {kind: shell, preset: codex}` instead. See docs/symphony/operator.md#migrating-from-the-legacy-codex-block.";
 
 /// Result alias for workflow configuration operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -254,14 +254,14 @@ impl WorkflowConfig {
     /// Returns [`Error::Invalid`] when required keys are missing or invalid.
     pub fn from_raw(raw: Value, prompt_template: String) -> Result<Self> {
         let mut problems = Vec::new();
-        let mut warnings = Vec::new();
+        let warnings = Vec::new();
         let Some(root) = raw.as_object() else {
             return Err(Error::Invalid {
                 problems: vec!["workflow frontmatter must be a mapping".to_owned()],
             });
         };
 
-        warn_legacy_codex_block(root, &mut warnings);
+        reject_legacy_codex_block(root, &mut problems);
 
         let tracker = parse_tracker(root, &mut problems);
         let polling = parse_polling(root, &mut problems);
@@ -376,10 +376,9 @@ fn split_frontmatter(content: &str) -> Result<(&str, &str)> {
     Ok((yaml, body))
 }
 
-fn warn_legacy_codex_block(root: &Map<String, Value>, warnings: &mut Vec<String>) {
+fn reject_legacy_codex_block(root: &Map<String, Value>, problems: &mut Vec<String>) {
     if root.contains_key("codex") {
-        tracing::warn!("{LEGACY_CODEX_BLOCK_DEPRECATION}");
-        warnings.push(LEGACY_CODEX_BLOCK_DEPRECATION.to_owned());
+        problems.push(LEGACY_CODEX_BLOCK_REMOVAL.to_owned());
     }
 }
 
