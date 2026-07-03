@@ -13,9 +13,13 @@ authors.workspace = true
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "process", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "net", "process", "sync", "time"] }
 tracing = "0.1"
 x0x-symphony-core = { path = "../x0x-symphony-core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

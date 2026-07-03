@@ -23,6 +23,9 @@ use thiserror::Error;
 use tokio::process::Command;
 use x0x_symphony_core::IssueSource;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 /// Result alias for sandbox operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -56,6 +59,38 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+
+    /// Runtime sandbox filesystem or socket setup failed.
+    #[error("sandbox I/O error at {path}: {source}")]
+    SandboxIo {
+        /// Path involved in the sandbox operation.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Launcher socket protocol failed.
+    #[error("sandbox launcher protocol error: {message}")]
+    Protocol {
+        /// Human-readable protocol failure.
+        message: String,
+    },
+
+    /// Linux access-control setup failed.
+    #[error("landlock setup failed: {message}")]
+    Landlock {
+        /// Human-readable setup failure.
+        message: String,
+    },
+
+    /// Process replacement in the launcher failed.
+    #[error("launcher exec failed: {source}")]
+    Exec {
+        /// Underlying process replacement failure.
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl Error {
@@ -64,6 +99,31 @@ impl Error {
     pub fn invalid_config(field: &'static str, message: impl Into<String>) -> Self {
         Self::InvalidConfig {
             field,
+            message: message.into(),
+        }
+    }
+
+    /// Construct a runtime sandbox I/O error.
+    #[must_use]
+    pub fn sandbox_io(path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self::SandboxIo {
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// Construct a launcher protocol error.
+    #[must_use]
+    pub fn protocol(message: impl Into<String>) -> Self {
+        Self::Protocol {
+            message: message.into(),
+        }
+    }
+
+    /// Construct a Linux access-control setup error.
+    #[must_use]
+    pub fn landlock(message: impl Into<String>) -> Self {
+        Self::Landlock {
             message: message.into(),
         }
     }
@@ -211,6 +271,9 @@ pub enum Backend {
     /// Probe the best backend available on this host at sandbox construction.
     #[default]
     Auto,
+    /// Linux self-reexec Landlock plus cgroup-v2 backend.
+    #[serde(alias = "linux-native", alias = "linux_native")]
+    Native,
     /// External sandbox-runtime (`srt`) command.
     #[serde(alias = "srt", alias = "sandbox_runtime")]
     SandboxRuntime,
@@ -232,6 +295,7 @@ impl Backend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Native => "native",
             Self::SandboxRuntime => "sandbox-runtime",
             Self::Bubblewrap => "bubblewrap",
             Self::Landlock => "landlock",
@@ -325,6 +389,9 @@ pub struct SandboxSpec {
     /// Optional address-space / memory ceiling in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
+    /// Optional descendant process ceiling for cgroup-v2 backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_max: Option<u32>,
 }
 
 impl SandboxSpec {
@@ -378,6 +445,12 @@ impl SandboxSpec {
                 "must be greater than zero when set",
             ));
         }
+        if self.pids_max == Some(0) {
+            return Err(Error::invalid_config(
+                "runner.sandbox.pids_max",
+                "must be greater than zero when set",
+            ));
+        }
         Ok(())
     }
 
@@ -409,6 +482,7 @@ impl Default for SandboxSpec {
             secrets_deny: default_secret_denies(),
             cpu_seconds: None,
             memory_bytes: None,
+            pids_max: None,
         }
     }
 }
@@ -499,7 +573,7 @@ impl HostSandbox {
     pub fn new(mut spec: SandboxSpec) -> Result<Self> {
         spec.normalize_paths();
         spec.validate()?;
-        let (backend, available) = resolve_backend(spec.backend);
+        let (backend, available) = resolve_backend(spec.backend, &spec);
         spec.backend = backend;
         Ok(Self {
             spec,
@@ -614,7 +688,7 @@ impl HostSandboxSession {
             Backend::Bubblewrap => self.wrap_bubblewrap(plan),
             Backend::Landlock => self.wrap_landlock(plan),
             Backend::SandboxExec => self.wrap_sandbox_exec(plan),
-            Backend::Auto | Backend::None => {}
+            Backend::Native | Backend::Auto | Backend::None => {}
         }
         self.apply_resource_limits(plan);
     }
@@ -703,7 +777,10 @@ impl HostSandboxSession {
     }
 
     fn apply_resource_limits(&self, plan: &mut WrappedCommand) {
-        if self.spec.cpu_seconds.is_none() && self.spec.memory_bytes.is_none() {
+        if self.spec.cpu_seconds.is_none()
+            && self.spec.memory_bytes.is_none()
+            && self.spec.pids_max.is_none()
+        {
             return;
         }
         apply_platform_resource_limits(&self.spec, plan);
@@ -720,7 +797,7 @@ impl SandboxSession for HostSandboxSession {
                 tracing::warn!(
                     backend = self.spec.backend.as_str(),
                     command = plan.program,
-                    "sandbox unavailable; running local work without host sandbox"
+                    "sandbox unavailable; running local work with path containment only"
                 );
             }
         }
@@ -735,13 +812,46 @@ impl SandboxSession for HostSandboxSession {
 #[async_trait]
 impl Sandbox for HostSandbox {
     async fn prepare(&self, source: IssueSource) -> Result<Box<dyn SandboxSession>> {
+        let mode = self.prepare_mode(source)?;
+        if mode == HostWrapMode::Available && self.spec.backend == Backend::Native {
+            #[cfg(target_os = "linux")]
+            {
+                return linux::LinuxSandboxSession::prepare(self.spec.clone())
+                    .map(|session| Box::new(session) as Box<dyn SandboxSession>);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(Error::SandboxUnavailable {
+                    backend: self.spec.backend.as_str().to_owned(),
+                    message: "native backend is Linux-only".to_owned(),
+                });
+            }
+        }
         Ok(Box::new(HostSandboxSession {
             spec: self.spec.clone(),
-            mode: self.prepare_mode(source)?,
+            mode,
         }))
     }
 
     async fn probe(&self) -> Result<ProbeReport> {
+        if self.spec.backend == Backend::Native {
+            #[cfg(target_os = "linux")]
+            {
+                return Ok(linux::native_probe_report(self.spec.profile));
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Ok(ProbeReport {
+                    backend: self.spec.backend,
+                    profile: self.spec.profile,
+                    checks: vec![ProbeCheck {
+                        name: "native-linux-only".to_owned(),
+                        status: ProbeStatus::NotApplicable,
+                        detail: "native backend is Linux-only".to_owned(),
+                    }],
+                });
+            }
+        }
         let root = probe_root();
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).map_err(|source| Error::ProbeIo {
@@ -982,6 +1092,10 @@ fn apply_linux_resource_limits(spec: &SandboxSpec, plan: &mut WrappedCommand) {
         args.push("-p".to_owned());
         args.push(format!("RuntimeMaxSec={cpu_seconds}"));
     }
+    if let Some(pids_max) = spec.pids_max {
+        args.push("-p".to_owned());
+        args.push(format!("TasksMax={pids_max}"));
+    }
     args.push("--".to_owned());
     args.push(original_program);
     args.extend(original_args);
@@ -1012,9 +1126,10 @@ fn apply_macos_resource_limits(spec: &SandboxSpec, plan: &mut WrappedCommand) {
     );
 }
 
-fn resolve_backend(requested: Backend) -> (Backend, bool) {
+fn resolve_backend(requested: Backend, spec: &SandboxSpec) -> (Backend, bool) {
     match requested {
-        Backend::Auto => auto_backend(),
+        Backend::Auto => auto_backend(spec),
+        Backend::Native => (Backend::Native, native_backend_available(spec)),
         Backend::SandboxRuntime => (Backend::SandboxRuntime, command_available(SRT_BINARY)),
         Backend::Bubblewrap => (Backend::Bubblewrap, command_available(BWRAP_BINARY)),
         Backend::Landlock => (Backend::Landlock, command_available(LANDLOCK_BINARY)),
@@ -1023,22 +1138,43 @@ fn resolve_backend(requested: Backend) -> (Backend, bool) {
     }
 }
 
-fn auto_backend() -> (Backend, bool) {
-    if command_available(SRT_BINARY) {
-        return (Backend::SandboxRuntime, true);
-    }
-    if cfg!(target_os = "linux") {
+fn auto_backend(spec: &SandboxSpec) -> (Backend, bool) {
+    #[cfg(target_os = "linux")]
+    {
+        if native_backend_available(spec) {
+            return (Backend::Native, true);
+        }
         if command_available(BWRAP_BINARY) {
             return (Backend::Bubblewrap, true);
         }
         if command_available(LANDLOCK_BINARY) {
             return (Backend::Landlock, true);
         }
+        (Backend::None, false)
     }
-    if cfg!(target_os = "macos") && command_available(SANDBOX_EXEC_PATH) {
-        return (Backend::SandboxExec, true);
+    #[cfg(not(target_os = "linux"))]
+    {
+        if command_available(SRT_BINARY) {
+            return (Backend::SandboxRuntime, true);
+        }
+        if cfg!(target_os = "macos") && command_available(SANDBOX_EXEC_PATH) {
+            return (Backend::SandboxExec, true);
+        }
+        let _ = spec;
+        (Backend::None, false)
     }
-    (Backend::None, false)
+}
+
+fn native_backend_available(spec: &SandboxSpec) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::native_probe_with_network_policy(!spec.network_allowed()).is_supported()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = spec;
+        false
+    }
 }
 
 fn command_available(command: &str) -> bool {
@@ -1215,6 +1351,7 @@ mod tests {
             secrets_deny: vec![PathBuf::from("/home/me/.ssh")],
             cpu_seconds: None,
             memory_bytes: None,
+            pids_max: None,
         }
     }
 
@@ -1244,7 +1381,9 @@ mod tests {
             Backend::Bubblewrap => assert_bubblewrap_profile(profile, plan),
             Backend::Landlock => assert_landlock_profile(profile, plan),
             Backend::SandboxExec => assert_sandbox_exec_profile(profile, plan),
-            Backend::Auto | Backend::None => unreachable!("matrix uses concrete backends"),
+            Backend::Native | Backend::Auto | Backend::None => {
+                unreachable!("matrix uses concrete backends")
+            }
         }
     }
 
@@ -1461,6 +1600,29 @@ mod tests {
         let mut spec = spec(SandboxProfile::RepoWrite, Backend::None);
         spec.on_unavailable = UnavailablePolicy::Warn;
         let sandbox = HostSandbox::from_resolved(spec.clone(), false);
+        let Ok(sandbox) = sandbox else {
+            unreachable!("test spec is valid");
+        };
+
+        let network_result = sandbox.prepare(IssueSource::NetworkSourced).await;
+
+        assert!(matches!(
+            network_result,
+            Err(Error::SandboxUnavailable { .. })
+        ));
+        let original = plan();
+        let local_result = prepared_command(&sandbox, original.clone()).await;
+        assert!(local_result.is_ok());
+        if let Ok(command) = local_result {
+            assert_eq!(command, WrappedCommand::from(original));
+        }
+    }
+
+    #[tokio::test]
+    async fn network_sourced_native_unavailable_refuses_local_warns() {
+        let mut spec = spec(SandboxProfile::RepoWrite, Backend::Native);
+        spec.on_unavailable = UnavailablePolicy::Warn;
+        let sandbox = HostSandbox::from_resolved(spec, false);
         let Ok(sandbox) = sandbox else {
             unreachable!("test spec is valid");
         };

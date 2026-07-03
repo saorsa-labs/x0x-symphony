@@ -96,12 +96,16 @@ impl ShellRunner {
     fn session_parts(
         &self,
         id: &SessionId,
-    ) -> Result<(BoundedEventQueue, BTreeMap<String, String>)> {
+    ) -> Result<(BoundedEventQueue, BTreeMap<String, String>, IssueSource)> {
         let sessions = self.sessions()?;
         let session = sessions.get(id).ok_or_else(|| Error::UnknownSession {
             session_id: id.as_str().to_owned(),
         })?;
-        Ok((session.events.clone(), session.env.clone()))
+        Ok((
+            session.events.clone(),
+            session.env.clone(),
+            session.issue_source,
+        ))
     }
 
     fn set_last_usage(&self, id: &SessionId, usage: UsageReport) -> Result<()> {
@@ -119,12 +123,15 @@ impl ShellRunner {
         prompt: Prompt,
         events: BoundedEventQueue,
         child_env: BTreeMap<String, String>,
+        issue_source: IssueSource,
     ) -> Result<TurnOutcome> {
         let started = Instant::now();
         let PreparedProcessCommand {
             mut command,
             mut sandbox_session,
-        } = self.command_for_session(sess, child_env).await?;
+        } = self
+            .command_for_session(sess, child_env, issue_source)
+            .await?;
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(source) => {
@@ -201,6 +208,7 @@ impl ShellRunner {
         &self,
         sess: &SessionHandle,
         child_env: BTreeMap<String, String>,
+        issue_source: IssueSource,
     ) -> Result<PreparedProcessCommand> {
         let plan = CommandPlan::new(
             self.spec.command.clone(),
@@ -208,11 +216,8 @@ impl ShellRunner {
             sess.workspace_path.clone(),
             child_env,
         );
-        // XSY-0042 step 3 note: propagate the real issue source through the
-        // runner/orchestrator path without changing dispatch-gate semantics.
-        let source = IssueSource::Local;
         let mut session: Box<dyn SandboxSession> = if let Some(sandbox) = &self.sandbox {
-            sandbox.prepare(source).await?
+            sandbox.prepare(issue_source).await?
         } else {
             Box::new(NoopSession)
         };
@@ -309,6 +314,7 @@ impl Runner for ShellRunner {
 
         let state = SessionState {
             env: child_env,
+            issue_source: ctx.issue_source,
             events,
             receiver,
             stream_taken: false,
@@ -325,9 +331,10 @@ impl Runner for ShellRunner {
         sess: &mut SessionHandle,
         prompt: Prompt,
     ) -> x0x_symphony_core::Result<TurnOutcome> {
-        let (events, child_env) = self.session_parts(&sess.id).map_err(SymphonyError::from)?;
+        let (events, child_env, issue_source) =
+            self.session_parts(&sess.id).map_err(SymphonyError::from)?;
         let outcome = self
-            .run_child(sess, prompt, events, child_env)
+            .run_child(sess, prompt, events, child_env, issue_source)
             .await
             .map_err(SymphonyError::from)?;
         self.set_last_usage(&sess.id, outcome.usage.clone())
@@ -370,6 +377,7 @@ impl Runner for ShellRunner {
 
 struct SessionState {
     env: BTreeMap<String, String>,
+    issue_source: IssueSource,
     events: BoundedEventQueue,
     receiver: Arc<Mutex<mpsc::Receiver<RunnerEvent>>>,
     stream_taken: bool,
@@ -697,6 +705,7 @@ mod tests {
         shutdowns: Arc<AtomicUsize>,
         wrapped_cwds: Arc<Mutex<Vec<PathBuf>>>,
         child_starts: Arc<AtomicUsize>,
+        sources: Arc<Mutex<Vec<IssueSource>>>,
         injected_env: Option<(String, String)>,
         command_override: Option<String>,
     }
@@ -708,6 +717,7 @@ mod tests {
                 shutdowns: Arc::new(AtomicUsize::new(0)),
                 wrapped_cwds: Arc::new(Mutex::new(Vec::new())),
                 child_starts: Arc::new(AtomicUsize::new(0)),
+                sources: Arc::new(Mutex::new(Vec::new())),
                 injected_env: None,
                 command_override: None,
             }
@@ -737,6 +747,13 @@ mod tests {
                 .map(|cwds| cwds.clone())
                 .map_err(|_| Error::SessionRegistryPoisoned)
         }
+
+        fn sources(&self) -> Result<Vec<IssueSource>> {
+            self.sources
+                .lock()
+                .map(|sources| sources.clone())
+                .map_err(|_| Error::SessionRegistryPoisoned)
+        }
     }
 
     #[async_trait::async_trait]
@@ -745,7 +762,15 @@ mod tests {
             &self,
             source: IssueSource,
         ) -> saorsa_sandbox::Result<Box<dyn SandboxSession>> {
-            assert_eq!(source, IssueSource::Local);
+            self.sources
+                .lock()
+                .map_err(|_| {
+                    saorsa_sandbox::Error::invalid_config(
+                        "recording_sandbox.sources",
+                        "mutex poisoned",
+                    )
+                })?
+                .push(source);
             Ok(Box::new(RecordingSession {
                 shutdowns: Arc::clone(&self.shutdowns),
                 wrapped_cwds: Arc::clone(&self.wrapped_cwds),
@@ -947,6 +972,48 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(sandbox.shutdown_count(), 1);
+        runner.stop_session(handle).await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_propagates_network_source_to_sandbox() -> TestResult {
+        let workspace = tempdir()?;
+        let spec = RunnerSpec::new("/bin/sh")?
+            .with_args(["-c".to_owned(), "true".to_owned()])
+            .with_turn_timeout_ms(2_000);
+        let sandbox = Arc::new(RecordingSandbox::new());
+        let runner = runner_with_sandbox(spec, sandbox.clone())?;
+        let mut context = session_context(workspace.path())?;
+        context.issue_source = IssueSource::NetworkSourced;
+        let mut handle = runner.start_session(context).await?;
+
+        let outcome = runner.run_turn(&mut handle, Prompt::new("")).await?;
+
+        assert_eq!(outcome.status, TurnStatus::Succeeded);
+        assert_eq!(sandbox.sources()?, vec![IssueSource::NetworkSourced]);
+        runner.stop_session(handle).await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_defaults_local_source_at_existing_call_sites() -> TestResult {
+        let workspace = tempdir()?;
+        let spec = RunnerSpec::new("/bin/sh")?
+            .with_args(["-c".to_owned(), "true".to_owned()])
+            .with_turn_timeout_ms(2_000);
+        let sandbox = Arc::new(RecordingSandbox::new());
+        let runner = runner_with_sandbox(spec, sandbox.clone())?;
+        let mut handle = runner
+            .start_session(session_context(workspace.path())?)
+            .await?;
+
+        let outcome = runner.run_turn(&mut handle, Prompt::new("")).await?;
+
+        assert_eq!(outcome.status, TurnStatus::Succeeded);
+        assert_eq!(sandbox.sources()?, vec![IssueSource::Local]);
         runner.stop_session(handle).await?;
         Ok(())
     }

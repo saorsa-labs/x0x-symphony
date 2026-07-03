@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::{Issue, Result};
+use crate::{Issue, IssueSource, Result};
 
 /// Stream of structured runner events.
 ///
@@ -278,6 +278,9 @@ pub struct SessionContext {
     pub issue: Issue,
     /// Workspace path where the runner must execute.
     pub workspace_path: PathBuf,
+    /// Source classification carried into execution-time sandbox policy.
+    #[serde(default)]
+    pub issue_source: IssueSource,
     /// Environment variables explicitly allowed for the runner.
     pub env_allowlist: BTreeMap<String, String>,
 }
@@ -298,11 +301,36 @@ impl SessionContext {
     /// ```
     #[must_use]
     pub fn new(issue: Issue, workspace_path: PathBuf) -> Self {
+        let issue_source = IssueSource::for_execution(&issue);
         Self {
             issue,
             workspace_path,
+            issue_source,
             env_allowlist: BTreeMap::new(),
         }
+    }
+
+    /// Return a copy with an explicit issue source.
+    ///
+    /// Existing callers use [`SessionContext::new`], which defaults local work
+    /// to [`IssueSource::Local`] and upgrades network-marked issues.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use x0x_symphony_core::{Issue, IssueId, IssueSource, IssueState, SessionContext};
+    ///
+    /// let issue = Issue::new(IssueId::new("XSY-0002")?, "XSY-0002", "Title", IssueState::new("todo")?, "now")?;
+    /// let ctx = SessionContext::new(issue, PathBuf::from("/tmp/work"))
+    ///     .with_issue_source(IssueSource::NetworkSourced);
+    /// assert_eq!(ctx.issue_source, IssueSource::NetworkSourced);
+    /// # Ok::<(), x0x_symphony_core::SymphonyError>(())
+    /// ```
+    #[must_use]
+    pub fn with_issue_source(mut self, issue_source: IssueSource) -> Self {
+        self.issue_source = issue_source;
+        self
     }
 
     /// Return a copy with one environment variable allowed.

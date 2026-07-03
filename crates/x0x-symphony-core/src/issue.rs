@@ -288,6 +288,19 @@ impl IssueSource {
             .unwrap_or(Self::Local)
     }
 
+    /// Resolve the source used by execution-time sandbox policy.
+    ///
+    /// Verified or rejected signature provenance is treated as network-sourced
+    /// even if an adapter failed to preserve the metadata marker.
+    #[must_use]
+    pub fn for_execution(issue: &Issue) -> Self {
+        if Self::from_issue(issue) == Self::NetworkSourced || issue.signature_provenance.is_some() {
+            Self::NetworkSourced
+        } else {
+            Self::Local
+        }
+    }
+
     fn from_json_value(value: &Value) -> Option<Self> {
         value.as_str().and_then(Self::from_marker)
     }

@@ -36,6 +36,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal", "sync", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+saorsa-sandbox = { path = "../saorsa-sandbox" }
 x0x-symphony-core = { path = "../x0x-symphony-core" }
 x0x-symphony-orchestrator = { path = "../x0x-symphony-orchestrator" }
 x0x-symphony-runner-shell = { path = "../x0x-symphony-runner-shell" }
