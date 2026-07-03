@@ -34,12 +34,15 @@ M3 is a single-daemon vertical slice backed by x0xd:
 - **Daemon + CLI:** `x0x-symphonyd` serves a loopback-only HTTP API behind a
   bearer token; `x0x-symphony` is the operator CLI.
 
-### Current boundaries (what still does NOT ship — stated, not hidden)
+### Current boundaries (stated, not hidden)
 
 - **x0xd is required.** The daemon reads its agent identity from x0xd's
   `/agent` endpoint and uses `signing.x0xd_url` as the base URL for both
   signing and `TaskList`/`KvStore` tracker operations.
-- **Distributed worker discovery is not shipped yet.** The runner can be
+- **Distributed worker discovery is best-effort observability.** The daemon
+  publishes and consumes signed worker cards when worker discovery is configured;
+  `/symphony/workers` returns the live verified view, or an empty view when a
+  test/local API state has no discovery service attached. The runner can be
   host-sandboxed when `runner.sandbox` is configured; omitting that block
   intentionally preserves unsandboxed local-development behavior. The operator
   vouches for every command in `WORKFLOW.md` (see [`security.md`](./security.md)).
@@ -215,6 +218,51 @@ repository. The directory contains `stdout.log`, `stderr.log`, any
 Proof directory cleanup is not implemented in M2; the retention reaper is an
 M5 follow-up.
 
+## Observability
+
+The daemon HTTP surface is intentionally small and fully documented here. There
+are no undocumented endpoints: every route served by `x0x-symphonyd` is listed
+below. `/health` is unauthenticated; every `/symphony/*` route requires the
+bearer token described in [Security model](#security-model). `/symphony/events`
+also accepts `?token=` for browser `EventSource` clients.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | Liveness probe. |
+| `GET` | `/symphony/tasks` | List visible tasks; accepts `?state=<state>`. |
+| `GET` | `/symphony/tasks/{id}` | Return one full task detail record, including shard, claim, handoff, signature provenance, and approval summary when present. |
+| `GET` | `/symphony/status` | Return agent id, state counts, active claims, and whether an orchestrator handle is attached. |
+| `GET` | `/symphony/workers` | Return the live verified worker view: `workers`, `view_epoch`, and a note when discovery is not configured. |
+| `GET` | `/symphony/events` | Server-Sent Events stream for daemon-local observability. |
+| `GET` | `/symphony/approvals/pending` | List network-sourced tasks currently waiting for per-task consent (ADR-0005). |
+| `POST` | `/symphony/approvals/{id}` | Store a signed approve/deny decision for one task. |
+| `POST` | `/symphony/issues` | Create a symphony-owned issue through the configured tracker. |
+| `POST` | `/symphony/claim/{id}` | Claim one task for the local daemon identity. |
+| `POST` | `/symphony/handoff/{id}` | Record a handoff for a claimed task. |
+| `GET` | `/symphony/proofs` | List top-level proof artefact names. |
+| `GET` | `/symphony/proofs/{issue_id}/{ts}/manifest.json` | Return a proof manifest as `application/json`. |
+| `GET` | `/symphony/proofs/{issue_id}/{ts}/stdout.log` | Return proof stdout as `text/plain`. |
+| `GET` | `/symphony/proofs/{issue_id}/{ts}/stderr.log` | Return proof stderr as `text/plain`. |
+| `GET` | `/symphony/proofs/{*name}` | Back-compatible proof artefact reader for safe relative proof paths. |
+| `GET` | `/symphony/routes` | Return this route catalog in machine-readable form. |
+
+The SSE stream emits `heartbeat` keepalives and `task_changed` notices from
+local API mutations. Approval events added for XSY-0053 are part of the same
+stream and are named `approval_requested`, `approval_granted`,
+`approval_denied`, and `approval_expired`; see
+[ADR-0005](../adr/0005-consent-gated-dispatch.md) for the approval-flow
+semantics.
+
+Operator CLI observability commands mirror this surface:
+
+```bash
+x0x-symphony status              # counts + active claims
+x0x-symphony workers             # live worker card table
+x0x-symphony tasks               # task list
+x0x-symphony tasks --state todo  # filtered task list
+x0x-symphony tasks --id XSY-0001 # single-task detail
+```
+
 ## Security model
 
 - **Loopback only.** The daemon binds `127.0.0.1` (or `::1`) and rejects any
@@ -271,7 +319,9 @@ and `<data-dir>/api-token` by default; override with `--server` / `--token`.
 ```bash
 x0x-symphony tasks                         # list tasks
 x0x-symphony tasks --state review          # filter by state
+x0x-symphony tasks --id XSY-0001           # show one task in detail
 x0x-symphony status                        # active claims + counts
+x0x-symphony workers                       # live worker cards
 x0x-symphony claim XSY-0001                # claim a task by id
 x0x-symphony handoff XSY-0001 --message "done" [--file path]
 x0x-symphony approvals list                # list network tasks awaiting consent
@@ -284,8 +334,8 @@ x0x-symphony config check --config WORKFLOW.md
 x0x-symphony routes                        # list daemon HTTP routes
 ```
 
-Output is deterministic text (no wall-clock timestamps) so it is
-snapshot-testable and scriptable.
+Output is deterministic text except for the wall-clock-relative `workers` age
+field; stable portions remain snapshot-testable and scriptable.
 
 ### Approving network-sourced tasks
 

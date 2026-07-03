@@ -42,6 +42,35 @@ async fn tasks_snapshot() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+async fn task_detail_snapshot() -> Result<(), Box<dyn Error>> {
+    let daemon = spawn_stub_daemon().await?;
+    let stdout = run_cli(&[
+        "x0x-symphony",
+        "--server",
+        &daemon.server,
+        "--token",
+        "stub-token",
+        "tasks",
+        "--id",
+        "XSY-0001",
+    ])
+    .await?;
+    assert_eq!(
+        stdout,
+        concat!(
+            "task:\n",
+            "id: XSY-0001\n",
+            "identifier: XSY-0001\n",
+            "title: Write daemon\n",
+            "state: todo\n",
+            "priority: p2\n",
+            "labels: x0x-symphony\n",
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn status_snapshot() -> Result<(), Box<dyn Error>> {
     let daemon = spawn_stub_daemon().await?;
     let stdout = run_cli(&[
@@ -66,6 +95,24 @@ async fn status_snapshot() -> Result<(), Box<dyn Error>> {
             "- XSY-0001 [in_progress] by worker-a heartbeat 2026-07-02T00:00:00Z\n",
         )
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workers_snapshot() -> Result<(), Box<dyn Error>> {
+    let daemon = spawn_stub_daemon().await?;
+    let stdout = run_cli(&[
+        "x0x-symphony",
+        "--server",
+        &daemon.server,
+        "--token",
+        "stub-token",
+        "workers",
+    ])
+    .await?;
+    assert!(stdout.starts_with(
+        "workers:\n- worker-a caps=rust,tests presets=claude_code load=1/3 platform=linux/x86_64 age="
+    ));
     Ok(())
 }
 
@@ -169,6 +216,20 @@ async fn approvals_conflict_is_operator_friendly() -> Result<(), Box<dyn Error>>
     assert_eq!(
         output.stderr,
         "issue payload changed since you viewed it; re-check and retry\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn workers_help_snapshot() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        render_help(&["workers"])?,
+        concat!(
+            "Show live worker-discovery cards\n\n",
+            "Usage: x0x-symphony workers\n\n",
+            "Options:\n",
+            "  -h, --help  Print help\n",
+        )
     );
     Ok(())
 }
@@ -336,7 +397,9 @@ async fn config_show_snapshot() -> Result<(), Box<dyn Error>> {
 async fn spawn_stub_daemon() -> Result<StubDaemon, Box<dyn Error>> {
     let app = Router::new()
         .route("/symphony/tasks", get(stub_tasks))
+        .route("/symphony/tasks/{id}", get(stub_task_detail))
         .route("/symphony/status", get(stub_status))
+        .route("/symphony/workers", get(stub_workers))
         .route("/symphony/routes", get(stub_routes))
         .route("/symphony/approvals/pending", get(stub_pending_approvals))
         .route("/symphony/approvals/{id}", post(stub_submit_approval))
@@ -398,6 +461,34 @@ async fn stub_tasks() -> Json<serde_json::Value> {
     ]))
 }
 
+async fn stub_task_detail(Path(id): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
+    if id != "XSY-0001" {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("task not found: {id}")})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "schema_version": 1,
+            "id": "XSY-0001",
+            "identifier": "XSY-0001",
+            "title": "Write daemon",
+            "description": "body",
+            "priority": 2,
+            "state": "todo",
+            "branch_name": null,
+            "url": null,
+            "labels": ["x0x-symphony"],
+            "blocked_by": [],
+            "created_at": "2026-07-03T00:00:00Z",
+            "updated_at": "2026-07-03T00:00:00Z",
+            "approval_summary": {"events": 0, "consumed": 0, "has_deny": false}
+        })),
+    )
+}
+
 async fn stub_status() -> Json<serde_json::Value> {
     Json(json!({
         "agent_id": "symphonyd",
@@ -412,6 +503,26 @@ async fn stub_status() -> Json<serde_json::Value> {
             }
         ],
         "orchestrator_attached": true
+    }))
+}
+
+async fn stub_workers() -> Json<serde_json::Value> {
+    Json(json!({
+        "workers": [
+            {
+                "schema_version": 1,
+                "agent_id": "worker-a",
+                "issued_at": "2026-07-03T00:00:00Z",
+                "ttl_seconds": 60,
+                "capabilities": ["rust", "tests"],
+                "sandbox_levels": ["repo-write"],
+                "runner_presets": ["claude_code"],
+                "current_load": 1,
+                "max_load": 3,
+                "platform": {"os": "linux", "arch": "x86_64", "version": "0.1.0"}
+            }
+        ],
+        "view_epoch": 7
     }))
 }
 
