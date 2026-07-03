@@ -268,10 +268,24 @@ pub enum Error {
     },
 }
 
+/// One notice emitted on the daemon's Server-Sent Events bus.
 #[derive(Clone, Debug)]
-struct EventNotice {
-    kind: &'static str,
-    data: String,
+pub struct EventNotice {
+    /// SSE event name.
+    pub kind: &'static str,
+    /// SSE data payload.
+    pub data: String,
+}
+
+impl EventNotice {
+    /// Construct an SSE event notice.
+    #[must_use]
+    pub fn new(kind: &'static str, data: impl Into<String>) -> Self {
+        Self {
+            kind,
+            data: data.into(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,11 +340,39 @@ impl AppState {
         self.proofs_dir.clone()
     }
 
+    /// Return a clone of the application SSE event sender.
+    #[must_use]
+    pub fn events_sender(&self) -> broadcast::Sender<EventNotice> {
+        self.events_tx.clone()
+    }
+
     fn notify_task_changed(&self, id: &str) {
-        let _send_result = self.events_tx.send(EventNotice {
-            kind: "task_changed",
-            data: id.to_owned(),
-        });
+        let _send_result = self
+            .events_tx
+            .send(EventNotice::new("task_changed", id.to_owned()));
+    }
+
+    fn notify_approval(&self, event: &ApprovalEvent) {
+        let notice = match event.verdict {
+            ApprovalVerdict::Approve => EventNotice::new(
+                "approval_granted",
+                json!({
+                    "issue_id": event.issue_id.as_str(),
+                    "approver_agent_id": event.approver_agent_id.as_str(),
+                    "content_hash": event.content_hash.as_str(),
+                })
+                .to_string(),
+            ),
+            ApprovalVerdict::Deny => EventNotice::new(
+                "approval_denied",
+                json!({
+                    "issue_id": event.issue_id.as_str(),
+                    "approver_agent_id": event.approver_agent_id.as_str(),
+                })
+                .to_string(),
+            ),
+        };
+        let _send_result = self.events_tx.send(notice);
     }
 }
 
@@ -618,6 +660,7 @@ async fn submit_approval(
         .store_approval(&signed)
         .await
         .map_err(|error| Error::Tracker(error.to_string()))?;
+    state.notify_approval(&signed);
     state.notify_task_changed(issue_id.as_str());
     Ok(Json(signed))
 }

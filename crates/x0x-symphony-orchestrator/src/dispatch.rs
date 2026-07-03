@@ -34,7 +34,7 @@ use crate::{
     error::{Error, Result},
     proofs::{join_event_writer, ProofRun},
     reconcile::is_fresh_self,
-    Orchestrator,
+    DispatchEvent, Orchestrator,
 };
 
 /// Why a polled candidate may (or may not) be taken by this agent now.
@@ -441,6 +441,18 @@ fn acceptance_validation_command(entry: &str) -> Option<String> {
     None
 }
 
+fn approval_request_signer(issue: &Issue) -> Option<AgentId> {
+    let Some(SignatureProvenance::Verified { signer_agent_id }) = &issue.signature_provenance
+    else {
+        return None;
+    };
+    let trimmed = signer_agent_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    AgentId::new(trimmed.to_owned()).ok()
+}
+
 fn issue_extra_string_list(issue: &Issue, key: &str) -> Vec<String> {
     let Some(value) = issue.extra.get(key) else {
         return Vec::new();
@@ -512,16 +524,13 @@ where
     /// Returns [`Error`] when a tracker/runner/workspace call fails for reasons
     /// other than the run itself failing.
     pub async fn run_claim(&self, claim: x0x_symphony_core::Claim) -> Result<Resolution> {
-        // Guard: owns the budget slot + heartbeat task; releases on EVERY exit.
         let mut guard = HeldClaim::new(self, &claim);
         let issue = self.fetch_claim_issue(&claim).await?;
-        match self
-            .block_if_network_dispatch_refused(&mut guard, &claim, &issue)
+        if let Some(resolution) = self
+            .dispatch_gate_resolution(&mut guard, &claim, &issue)
             .await?
         {
-            DispatchGateOutcome::Proceed => {}
-            DispatchGateOutcome::Blocked => return Ok(Resolution::Blocked),
-            DispatchGateOutcome::PendingApproval => return Ok(Resolution::PendingApproval),
+            return Ok(resolution);
         }
         self.spawn_claim_heartbeat(&mut guard, &claim, &issue);
         let mut proof = ProofRun::start(
@@ -617,6 +626,36 @@ where
                 }
             }
         }
+    }
+
+    async fn dispatch_gate_resolution(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        issue: &Issue,
+    ) -> Result<Option<Resolution>> {
+        Ok(
+            match self
+                .block_if_network_dispatch_refused(guard, claim, issue)
+                .await?
+            {
+                DispatchGateOutcome::Proceed => None,
+                DispatchGateOutcome::Blocked => Some(Resolution::Blocked),
+                DispatchGateOutcome::PendingApproval => {
+                    Some(self.pending_approval_resolution(issue))
+                }
+            },
+        )
+    }
+
+    fn pending_approval_resolution(&self, issue: &Issue) -> Resolution {
+        if let Some(signer_agent_id) = approval_request_signer(issue) {
+            self.emit(DispatchEvent::ApprovalRequested {
+                issue_id: issue.id.clone(),
+                signer_agent_id,
+            });
+        }
+        Resolution::PendingApproval
     }
 
     fn spawn_claim_heartbeat(
@@ -772,15 +811,12 @@ where
         };
 
         let mut kept = Vec::new();
+        let mut emitted_expired = false;
         for event in &state.events {
-            if event.is_valid(
-                issue,
-                signer,
-                &now,
-                self.config.approval_ttl,
-                &state.consumed,
-            ) != ApprovalValidity::Valid
-            {
+            let validity =
+                self.approval_event_validity(event, issue, signer, &now, &state.consumed);
+            self.emit_approval_expired_once(issue, validity, &mut emitted_expired);
+            if validity != ApprovalValidity::Valid {
                 continue;
             }
             match self
@@ -852,6 +888,31 @@ where
                 .await?;
                 Ok(DispatchGateOutcome::PendingApproval)
             }
+        }
+    }
+
+    fn approval_event_validity(
+        &self,
+        event: &ApprovalEvent,
+        issue: &Issue,
+        signer: &AgentId,
+        now: &str,
+        consumed: &[ApprovalConsumed],
+    ) -> ApprovalValidity {
+        event.is_valid(issue, signer, now, self.config.approval_ttl, consumed)
+    }
+
+    fn emit_approval_expired_once(
+        &self,
+        issue: &Issue,
+        validity: ApprovalValidity,
+        emitted_expired: &mut bool,
+    ) {
+        if validity == ApprovalValidity::Expired && !*emitted_expired {
+            self.emit(DispatchEvent::ApprovalExpired {
+                issue_id: issue.id.clone(),
+            });
+            *emitted_expired = true;
         }
     }
 

@@ -3,15 +3,17 @@ use std::{
     error::Error,
     io,
     sync::{Arc, Mutex, PoisonError},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::StatusCode;
 use serde_json::json;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::broadcast, task::JoinHandle};
 use x0x_symphony_bin::api::{
-    build_router, sign_approval_event, AppState, PendingApproval, PendingApprovalProvenance,
+    build_router, sign_approval_event, AppState, EventNotice, PendingApproval,
+    PendingApprovalProvenance,
 };
 use x0x_symphony_core::{
     content_hash, sha256_hex, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState,
@@ -309,6 +311,71 @@ async fn post_deny_stores_denial() -> TestResult {
 }
 
 #[tokio::test]
+async fn post_approve_emits_approval_granted_event() -> TestResult {
+    let issue_id = "XSY-POST-APPROVE-EVENT";
+    let issue = network_issue(issue_id, "Approve event", "todo", "network-signer")?;
+    let expected_hash = content_hash(&issue).to_string();
+    let tracker = Arc::new(InMemoryTracker::new(vec![issue]));
+    let (server, mut events_rx) =
+        spawn_approval_server_with_events(tracker, Some(mock_signing_client())).await?;
+    let client = reqwest::Client::new();
+
+    let response =
+        post_approval(&server, &client, issue_id, &json!({ "verdict": "approve" })).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _event = response.json::<ApprovalEvent>().await?;
+
+    let notice = next_event_with_kind(&mut events_rx, "approval_granted").await?;
+    let data: serde_json::Value = serde_json::from_str(&notice.data)?;
+    assert_eq!(
+        data.get("issue_id").and_then(serde_json::Value::as_str),
+        Some(issue_id)
+    );
+    assert_eq!(
+        data.get("approver_agent_id")
+            .and_then(serde_json::Value::as_str),
+        Some(OPERATOR)
+    );
+    assert_eq!(
+        data.get("content_hash").and_then(serde_json::Value::as_str),
+        Some(expected_hash.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_deny_emits_approval_denied_event() -> TestResult {
+    let issue_id = "XSY-POST-DENY-EVENT";
+    let tracker = Arc::new(InMemoryTracker::new(vec![network_issue(
+        issue_id,
+        "Deny event",
+        "todo",
+        "network-signer",
+    )?]));
+    let (server, mut events_rx) =
+        spawn_approval_server_with_events(tracker, Some(mock_signing_client())).await?;
+    let client = reqwest::Client::new();
+
+    let response = post_approval(&server, &client, issue_id, &json!({ "verdict": "deny" })).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _event = response.json::<ApprovalEvent>().await?;
+
+    let notice = next_event_with_kind(&mut events_rx, "approval_denied").await?;
+    let data: serde_json::Value = serde_json::from_str(&notice.data)?;
+    assert_eq!(
+        data.get("issue_id").and_then(serde_json::Value::as_str),
+        Some(issue_id)
+    );
+    assert_eq!(
+        data.get("approver_agent_id")
+            .and_then(serde_json::Value::as_str),
+        Some(OPERATOR)
+    );
+    assert!(data.get("content_hash").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn stale_content_hash_returns_409() -> TestResult {
     let issue_id = "XSY-STALE-HASH";
     let tracker = Arc::new(InMemoryTracker::new(vec![network_issue(
@@ -475,10 +542,20 @@ async fn spawn_approval_server(
     tracker: Arc<InMemoryTracker>,
     signing_client: Option<Arc<dyn SigningClient>>,
 ) -> TestResult<TestServer> {
+    let (server, _events_rx) = spawn_approval_server_with_events(tracker, signing_client).await?;
+    Ok(server)
+}
+
+async fn spawn_approval_server_with_events(
+    tracker: Arc<InMemoryTracker>,
+    signing_client: Option<Arc<dyn SigningClient>>,
+) -> TestResult<(TestServer, broadcast::Receiver<EventNotice>)> {
     let tracker: Arc<dyn Tracker> = tracker;
     let state = AppState::new(tracker, AgentId::new(OPERATOR)?, API_TOKEN.to_owned(), None)
         .with_signing_client(signing_client);
-    spawn_server(state).await
+    let events_rx = state.events_sender().subscribe();
+    let server = spawn_server(state).await?;
+    Ok((server, events_rx))
 }
 
 async fn spawn_server(state: AppState) -> TestResult<TestServer> {
@@ -493,6 +570,21 @@ async fn spawn_server(state: AppState) -> TestResult<TestServer> {
         base_url: format!("http://{addr}"),
         task,
     })
+}
+
+async fn next_event_with_kind(
+    events_rx: &mut broadcast::Receiver<EventNotice>,
+    kind: &'static str,
+) -> TestResult<EventNotice> {
+    Ok(tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let notice = events_rx.recv().await?;
+            if notice.kind == kind {
+                return Ok::<EventNotice, broadcast::error::RecvError>(notice);
+            }
+        }
+    })
+    .await??)
 }
 
 async fn post_approval(

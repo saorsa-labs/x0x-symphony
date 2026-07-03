@@ -31,6 +31,27 @@ pub mod trust_gate;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use concurrency::Budget;
 pub use dispatch::{claimable_for, Claimable, Resolution};
+
+/// Capacity for best-effort dispatch observability events.
+pub const DISPATCH_EVENT_CHANNEL_CAPACITY: usize = 64;
+
+/// Passive observability events emitted by the dispatch gate.
+#[derive(Clone, Debug)]
+pub enum DispatchEvent {
+    /// A network-sourced dispatch reached `PendingApproval` and needs operator consent.
+    ApprovalRequested {
+        /// Issue awaiting operator approval.
+        issue_id: IssueId,
+        /// Verified network signer whose issue payload is awaiting consent.
+        signer_agent_id: AgentId,
+    },
+    /// A previously-stored approval expired and the issue re-gated.
+    ApprovalExpired {
+        /// Issue whose stored approval expired.
+        issue_id: IssueId,
+    },
+}
+
 pub use error::{Error, Result};
 pub use orphans::{OrphanSweepSummary, QuarantinedOrphan, RefusedOrphan};
 pub use reconcile::{classify, is_fresh_self, parse_heartbeat, ClaimStance, ReconcileSummary};
@@ -47,7 +68,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 use x0x_symphony_core::{
     AgentId, Claim, Issue, IssueId, IssueState, LifecycleHooks, PollContext, ReleaseReason,
     ReleaseReasonCode, Runner, ShardRole, Tracker, Workspace,
@@ -80,6 +101,7 @@ pub struct Orchestrator<T, R, W> {
     trust_client: Arc<dyn TrustClient>,
     signing_client: Option<Arc<dyn SigningClient>>,
     key_resolver: Option<Arc<dyn TrustedKeyResolver>>,
+    events_tx: Option<broadcast::Sender<DispatchEvent>>,
     config: Config,
     state: Mutex<State>,
     shutdown_notify: Notify,
@@ -383,6 +405,7 @@ impl<T, R, W> Orchestrator<T, R, W> {
             trust_client,
             signing_client,
             key_resolver,
+            events_tx: None,
             config,
             state: Mutex::new(State {
                 budget,
@@ -390,6 +413,26 @@ impl<T, R, W> Orchestrator<T, R, W> {
             }),
             shutdown_notify: Notify::new(),
             shutdown_flag: AtomicBool::new(false),
+        }
+    }
+
+    /// Return a copy that emits dispatch observability events on `tx`.
+    #[must_use]
+    pub fn with_event_tx(mut self, tx: broadcast::Sender<DispatchEvent>) -> Self {
+        self.events_tx = Some(tx);
+        self
+    }
+
+    /// Subscribe to dispatch observability events when an event sink is configured.
+    #[must_use]
+    pub fn subscribe(&self) -> Option<broadcast::Receiver<DispatchEvent>> {
+        self.events_tx.as_ref().map(broadcast::Sender::subscribe)
+    }
+
+    /// Best-effort dispatch observability event emission.
+    pub(crate) fn emit(&self, event: DispatchEvent) {
+        if let Some(tx) = &self.events_tx {
+            let _send_result = tx.send(event);
         }
     }
 
