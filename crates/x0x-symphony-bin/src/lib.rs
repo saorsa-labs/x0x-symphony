@@ -11,3 +11,5 @@ pub mod cli;
 pub mod client;
 /// `WORKFLOW.md` frontmatter loading and validation.
 pub mod config;
+/// Worker gossip advertisement and live-view maintenance.
+pub mod workers;

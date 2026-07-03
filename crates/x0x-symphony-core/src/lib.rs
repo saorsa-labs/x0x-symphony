@@ -12,6 +12,7 @@ pub mod runner;
 pub mod shard;
 pub mod signing;
 pub mod tracker;
+pub mod workers;
 pub mod workflow;
 pub mod workspace;
 
@@ -30,6 +31,10 @@ pub use runner::{
 };
 pub use signing::{sha256_hex, SignatureEnvelope, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM};
 pub use tracker::{PollContext, ReleaseReason, ReleaseReasonCode, Tracker};
+pub use workers::{
+    PlatformInfo, WorkerCard, DEFAULT_WORKER_CARD_TTL_SECONDS, WORKER_CARD_CONTEXT,
+    WORKER_CARD_SCHEMA_VERSION,
+};
 pub use workflow::{Hook, HookName, LifecycleHooks, WorkflowDefinition, WorkflowPath};
 pub use workspace::{
     HookEnv, HookOutcome, HookStatus, RefusedWorkspace, Workspace, WorkspaceHandle, WorkspaceScan,
