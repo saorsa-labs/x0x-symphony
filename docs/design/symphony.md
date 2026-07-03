@@ -312,6 +312,15 @@ The TaskList CRDT in x0x already supports OR-Set checkboxes plus an LWW
 register per item; symphony's metadata extensions ride that register. MLS
 encryption on the underlying TaskList gives private project work for free.
 
+When `tracker.group` is set, the x0x CRDT adapter resolves the value through
+x0xd named groups (or joins with `POST /groups/join` when the value is an invite)
+and maps the configured task-list id into the group namespace:
+`x0x.group.<group_id>.symphony.<task_list_id>`. The sidecar KvStore remains
+`symphony-<scoped-list-id>` by the same deterministic mapping used for
+ungrouped lists. Symphony does not handle MLS keys; if x0xd hides or forbids the
+scoped task-list endpoint for a non-member, `fetch_candidates` treats that as
+zero visible tasks.
+
 ADR-0004 records this choice and the convergence path with
 `communitas-kanban` / a future `saorsa-kanban` crate.
 

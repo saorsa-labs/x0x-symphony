@@ -67,6 +67,24 @@ fn network_dispatch_defaults_off() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn tracker_group_is_optional_and_preserved() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_missing("none").replace(
+        "tracker:\n  kind: git_issues\n  path: issues/issues.jsonl\n",
+        concat!(
+            "tracker:\n",
+            "  kind: git_issues\n",
+            "  path: issues/issues.jsonl\n",
+            "  group: private-project\n",
+        ),
+    );
+
+    let config = WorkflowConfig::from_markdown(&workflow)?;
+
+    assert_eq!(config.tracker.group.as_deref(), Some("private-project"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn missing_required_blocks_fail_config_check() -> Result<(), Box<dyn Error>> {
     for block in [
