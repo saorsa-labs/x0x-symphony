@@ -82,9 +82,11 @@ agent:
   max_retry_backoff_ms: 300000
 
 security:
-  # Network-sourced dispatch is default-off for M3. Operators must explicitly
-  # opt in before verified-signature + trust-gated network work can execute.
-  network_dispatch_enabled: false
+  # Network-sourced dispatch is default-off. Use "approve" for per-task
+  # consent, or "auto" only with network_dispatch_auto_ack=true.
+  network_dispatch: "off"
+  approval_ttl: "24h"
+  # approval_webhook_url: "https://approvals.example.test/hook"
   # Network-sourced issues require this x0xd /contacts trust level or higher
   # after ML-DSA-65 signature provenance is verified. `blocked` signers are
   # always refused.

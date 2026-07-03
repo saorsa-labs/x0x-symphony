@@ -12,7 +12,9 @@ use thiserror::Error;
 use x0x_symphony_core::{
     shard, AgentId, IssueState, LifecycleHooks, SymphonyError, WorkflowDefinition,
 };
-use x0x_symphony_orchestrator::{Config as OrchestratorConfig, RetryPolicy, TrustLevel};
+use x0x_symphony_orchestrator::{
+    Config as OrchestratorConfig, NetworkDispatchPolicy, RetryPolicy, TrustLevel,
+};
 use x0x_symphony_runner_shell::RunnerSpec;
 use x0x_symphony_signing::SigningPolicy;
 
@@ -164,12 +166,16 @@ pub struct AgentConfig {
 }
 
 /// Security configuration parsed from the optional `security:` block.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecurityConfig {
     /// Minimum trust level for network-sourced issue dispatch.
     pub required_trust: TrustLevel,
-    /// Whether network-sourced issues may dispatch after signature + trust checks.
-    pub network_dispatch_enabled: bool,
+    /// Policy for network-sourced dispatch after source classification.
+    pub network_dispatch: NetworkDispatchPolicy,
+    /// Time approval records remain valid once the approval lifecycle lands.
+    pub approval_ttl: Duration,
+    /// Optional fire-and-forget webhook for approval requests.
+    pub approval_webhook_url: Option<String>,
 }
 
 /// Signing configuration parsed from the optional `signing:` block.
@@ -310,7 +316,9 @@ impl WorkflowConfig {
             .hooks(self.hooks.to_lifecycle_hooks())
             .validation_commands(self.validation.clone())
             .required_trust(self.security.required_trust)
-            .network_dispatch_enabled(self.security.network_dispatch_enabled)
+            .network_dispatch(self.security.network_dispatch)
+            .approval_ttl(self.security.approval_ttl)
+            .approval_webhook_url(self.security.approval_webhook_url.clone())
             .build())
     }
 }
@@ -452,7 +460,9 @@ fn parse_security(root: &Map<String, Value>, problems: &mut Vec<String>) -> Opti
     let Some(value) = root.get("security") else {
         return Some(SecurityConfig {
             required_trust: TrustLevel::Trusted,
-            network_dispatch_enabled: false,
+            network_dispatch: NetworkDispatchPolicy::Off,
+            approval_ttl: default_approval_ttl(),
+            approval_webhook_url: None,
         });
     };
     let Some(security) = value.as_object() else {
@@ -469,12 +479,112 @@ fn parse_security(root: &Map<String, Value>, problems: &mut Vec<String>) -> Opti
         },
         None => TrustLevel::Trusted,
     };
-    let network_dispatch_enabled =
-        optional_bool(security, "security.network_dispatch_enabled", problems).unwrap_or(false);
+    let network_dispatch = parse_network_dispatch_policy(security, problems)?;
+    if network_dispatch == NetworkDispatchPolicy::Auto
+        && optional_bool(security, "security.network_dispatch_auto_ack", problems) != Some(true)
+    {
+        problems.push(
+            "security.network_dispatch=auto requires network_dispatch_auto_ack=true".to_owned(),
+        );
+        return None;
+    }
+    let approval_ttl = parse_optional_duration(
+        security,
+        "security.approval_ttl",
+        default_approval_ttl(),
+        problems,
+    )?;
+    let approval_webhook_url = optional_string(security, "security.approval_webhook_url", problems);
     Some(SecurityConfig {
         required_trust,
-        network_dispatch_enabled,
+        network_dispatch,
+        approval_ttl,
+        approval_webhook_url,
     })
+}
+
+fn parse_network_dispatch_policy(
+    security: &Map<String, Value>,
+    problems: &mut Vec<String>,
+) -> Option<NetworkDispatchPolicy> {
+    if security.contains_key("network_dispatch") {
+        let raw = optional_string(security, "security.network_dispatch", problems)?;
+        return match raw.parse::<NetworkDispatchPolicy>() {
+            Ok(policy) => Some(policy),
+            Err(error) => {
+                problems.push(format!("security.network_dispatch {error}"));
+                None
+            }
+        };
+    }
+    if security.contains_key("network_dispatch_enabled") {
+        let enabled = optional_bool(security, "security.network_dispatch_enabled", problems)?;
+        if enabled {
+            tracing::warn!(
+                "security.network_dispatch_enabled is deprecated; use security.network_dispatch=approve"
+            );
+            Some(NetworkDispatchPolicy::Approve)
+        } else {
+            Some(NetworkDispatchPolicy::Off)
+        }
+    } else {
+        Some(NetworkDispatchPolicy::Off)
+    }
+}
+
+fn parse_optional_duration(
+    map: &Map<String, Value>,
+    path: &'static str,
+    default: Duration,
+    problems: &mut Vec<String>,
+) -> Option<Duration> {
+    let key = leaf_key(path);
+    if !map.contains_key(key) {
+        return Some(default);
+    }
+    let raw = optional_string(map, path, problems)?;
+    match parse_duration_literal(&raw) {
+        Ok(duration) => Some(duration),
+        Err(message) => {
+            problems.push(format!("{path} {message}"));
+            None
+        }
+    }
+}
+
+fn parse_duration_literal(raw: &str) -> std::result::Result<Duration, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("must not be empty".to_owned());
+    }
+    for (suffix, multiplier_ms) in [
+        ("ms", 1_u64),
+        ("s", 1_000),
+        ("m", 60_000),
+        ("h", 3_600_000),
+        ("d", 86_400_000),
+    ] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
+                return Err("must be a duration string like `24h`".to_owned());
+            }
+            let count = number
+                .parse::<u64>()
+                .map_err(|_error| "must fit in u64".to_owned())?;
+            if count == 0 {
+                return Err("must be greater than zero".to_owned());
+            }
+            let millis = count
+                .checked_mul(multiplier_ms)
+                .ok_or_else(|| "is too large".to_owned())?;
+            return Ok(Duration::from_millis(millis));
+        }
+    }
+    Err("must be a duration string like `24h`".to_owned())
+}
+
+const fn default_approval_ttl() -> Duration {
+    Duration::from_hours(24)
 }
 
 fn parse_signing(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<SigningConfig> {

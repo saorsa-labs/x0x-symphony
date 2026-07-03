@@ -35,7 +35,7 @@ pub use error::{Error, Result};
 pub use orphans::{OrphanSweepSummary, QuarantinedOrphan, RefusedOrphan};
 pub use reconcile::{classify, is_fresh_self, parse_heartbeat, ClaimStance, ReconcileSummary};
 pub use retry::RetryPolicy;
-pub use trust_gate::{TrustClient, TrustLevel, X0xdTrustClient};
+pub use trust_gate::{NetworkDispatchPolicy, TrustClient, TrustLevel, X0xdTrustClient};
 
 use std::{
     collections::BTreeMap,
@@ -110,8 +110,12 @@ pub struct Config {
     pub claim_ttl: chrono::Duration,
     /// Minimum trust level required for network-sourced issue dispatch.
     pub required_trust: TrustLevel,
-    /// Whether network-sourced issues may dispatch after signature + trust checks.
-    pub network_dispatch_enabled: bool,
+    /// Policy for network-sourced dispatch after source classification.
+    pub network_dispatch: NetworkDispatchPolicy,
+    /// Time approval records remain valid once the approval lifecycle lands.
+    pub approval_ttl: Duration,
+    /// Optional fire-and-forget webhook for approval requests.
+    pub approval_webhook_url: Option<String>,
     /// Maximum time to wait for in-flight runs to release on shutdown.
     pub shutdown_grace: Duration,
 }
@@ -136,7 +140,9 @@ impl Config {
             validation_commands: Vec::new(),
             claim_ttl: chrono::Duration::minutes(30),
             required_trust: TrustLevel::Trusted,
-            network_dispatch_enabled: false,
+            network_dispatch: NetworkDispatchPolicy::Off,
+            approval_ttl: Duration::from_hours(24),
+            approval_webhook_url: None,
             shutdown_grace: Duration::from_mins(1),
         }
     }
@@ -175,7 +181,9 @@ pub struct ConfigBuilder {
     validation_commands: Vec<String>,
     claim_ttl: chrono::Duration,
     required_trust: TrustLevel,
-    network_dispatch_enabled: bool,
+    network_dispatch: NetworkDispatchPolicy,
+    approval_ttl: Duration,
+    approval_webhook_url: Option<String>,
     shutdown_grace: Duration,
 }
 
@@ -250,10 +258,22 @@ impl ConfigBuilder {
         self.required_trust = required_trust;
         self
     }
-    /// Enable or disable network-sourced dispatch.
+    /// Override the network-sourced dispatch policy.
     #[must_use]
-    pub fn network_dispatch_enabled(mut self, enabled: bool) -> Self {
-        self.network_dispatch_enabled = enabled;
+    pub fn network_dispatch(mut self, policy: NetworkDispatchPolicy) -> Self {
+        self.network_dispatch = policy;
+        self
+    }
+    /// Override the approval time-to-live used by the approval lifecycle.
+    #[must_use]
+    pub fn approval_ttl(mut self, ttl: Duration) -> Self {
+        self.approval_ttl = ttl;
+        self
+    }
+    /// Override the optional approval request webhook URL.
+    #[must_use]
+    pub fn approval_webhook_url(mut self, url: Option<String>) -> Self {
+        self.approval_webhook_url = url;
         self
     }
     /// Override the shutdown grace period.
@@ -278,7 +298,9 @@ impl ConfigBuilder {
             validation_commands: self.validation_commands,
             claim_ttl: self.claim_ttl,
             required_trust: self.required_trust,
-            network_dispatch_enabled: self.network_dispatch_enabled,
+            network_dispatch: self.network_dispatch,
+            approval_ttl: self.approval_ttl,
+            approval_webhook_url: self.approval_webhook_url,
             shutdown_grace: self.shutdown_grace,
         }
     }

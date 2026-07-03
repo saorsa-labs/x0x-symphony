@@ -92,6 +92,8 @@ pub enum ReleaseReasonCode {
     InsufficientTrust,
     /// Network-sourced dispatch is disabled by configuration.
     NetworkDispatchDisabled,
+    /// Network-sourced dispatch is waiting for explicit task approval.
+    AwaitingApproval,
     /// A network-sourced issue lacked verified signature provenance.
     MissingVerifiedSignature,
     /// A network-sourced issue's signature was present but invalid.
@@ -130,6 +132,7 @@ impl ReleaseReasonCode {
             Self::RetryExhausted => "retry_exhausted",
             Self::InsufficientTrust => "insufficient_trust",
             Self::NetworkDispatchDisabled => "network_dispatch_disabled",
+            Self::AwaitingApproval => "awaiting_approval",
             Self::MissingVerifiedSignature => "missing_verified_signature",
             Self::InvalidSignature => "invalid_signature",
             Self::VerifyTransportError => "verify_transport_error",
