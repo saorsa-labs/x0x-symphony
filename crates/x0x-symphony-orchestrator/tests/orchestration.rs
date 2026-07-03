@@ -26,8 +26,8 @@ use x0x_symphony_core::{
     AgentId, Claim, EventStream, Handoff, Hook, HookEnv, HookOutcome, HookStatus, Issue, IssueId,
     IssueState, LifecycleHooks, PollContext, Prompt, ReleaseReason, ReleaseReasonCode,
     Result as CoreResult, Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext,
-    SessionHandle, SessionId, Shard, TurnOutcome, TurnStatus, UsageReport, ValidationStatus,
-    Workspace, WorkspaceHandle,
+    SessionHandle, SessionId, Shard, SignatureProvenance, TurnOutcome, TurnStatus, UsageReport,
+    ValidationStatus, Workspace, WorkspaceHandle,
 };
 use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
@@ -47,16 +47,25 @@ fn make_issue(id: &str, state: &str) -> Result<Issue, Box<dyn Error>> {
 }
 
 fn network_issue(id: &str, labels: &[&str], signer: &str) -> Result<Issue, Box<dyn Error>> {
+    network_issue_with_provenance(id, labels, Some(SignatureProvenance::verified(signer)))
+}
+
+fn unsigned_network_issue(id: &str, labels: &[&str]) -> Result<Issue, Box<dyn Error>> {
+    network_issue_with_provenance(id, labels, None)
+}
+
+fn network_issue_with_provenance(
+    id: &str,
+    labels: &[&str],
+    provenance: Option<SignatureProvenance>,
+) -> Result<Issue, Box<dyn Error>> {
     let mut issue = make_issue(id, "todo")?;
     issue.labels = labels.iter().map(|label| (*label).to_owned()).collect();
     issue.extra.insert(
         "issue_source".to_owned(),
         serde_json::Value::String("network_sourced".to_owned()),
     );
-    issue.extra.insert(
-        "signer_agent_id".to_owned(),
-        serde_json::Value::String(signer.to_owned()),
-    );
+    issue.signature_provenance = provenance;
     Ok(issue)
 }
 
@@ -242,6 +251,102 @@ impl Runner for StubRunner {
     fn stream_events(&self, _sess: &SessionHandle) -> EventStream {
         Box::pin(stream::empty::<RunnerEvent>())
     }
+    async fn stop_session(&self, _sess: SessionHandle) -> CoreResult<UsageReport> {
+        Ok(UsageReport::new())
+    }
+}
+
+#[derive(Default)]
+struct ExecutionSpy {
+    workspace_create: Mutex<u32>,
+    workspace_hook: Mutex<u32>,
+    runner_start: Mutex<u32>,
+    runner_turn: Mutex<u32>,
+}
+
+impl ExecutionSpy {
+    fn record(counter: &Mutex<u32>) {
+        if let Ok(mut value) = counter.lock() {
+            *value = value.saturating_add(1);
+        }
+    }
+
+    fn counts(&self) -> (u32, u32, u32, u32) {
+        (
+            self.workspace_create.lock().map_or(0, |value| *value),
+            self.workspace_hook.lock().map_or(0, |value| *value),
+            self.runner_start.lock().map_or(0, |value| *value),
+            self.runner_turn.lock().map_or(0, |value| *value),
+        )
+    }
+}
+
+struct SpyWorkspace {
+    root: PathBuf,
+    spy: Arc<ExecutionSpy>,
+}
+
+#[async_trait]
+impl Workspace for SpyWorkspace {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    async fn create(&self, issue: &Issue) -> CoreResult<WorkspaceHandle> {
+        ExecutionSpy::record(&self.spy.workspace_create);
+        let path = self.root.join(issue.identifier.as_str());
+        std::fs::create_dir_all(&path)
+            .map_err(|e| x0x_symphony_core::SymphonyError::Tracker(e.to_string()))?;
+        Ok(WorkspaceHandle::new(issue.id.clone(), path, true))
+    }
+
+    async fn run_hook(&self, _hook: &Hook, _env: &HookEnv) -> CoreResult<HookOutcome> {
+        ExecutionSpy::record(&self.spy.workspace_hook);
+        Ok(HookOutcome::new(HookStatus::Succeeded))
+    }
+
+    async fn destroy(&self, _handle: WorkspaceHandle) -> CoreResult<()> {
+        Ok(())
+    }
+}
+
+struct SpyRunner {
+    spy: Arc<ExecutionSpy>,
+}
+
+#[async_trait]
+impl Runner for SpyRunner {
+    fn name(&self) -> &'static str {
+        "spy"
+    }
+
+    fn capabilities(&self) -> &RunnerCapabilities {
+        static CAPS: std::sync::OnceLock<RunnerCapabilities> = std::sync::OnceLock::new();
+        CAPS.get_or_init(|| RunnerCapabilities::new("spy"))
+    }
+
+    async fn start_session(&self, ctx: SessionContext) -> CoreResult<SessionHandle> {
+        ExecutionSpy::record(&self.spy.runner_start);
+        Ok(SessionHandle::new(
+            SessionId::new("spy-session"),
+            ctx.workspace_path,
+            "now",
+        ))
+    }
+
+    async fn run_turn(
+        &self,
+        _sess: &mut SessionHandle,
+        _prompt: Prompt,
+    ) -> CoreResult<TurnOutcome> {
+        ExecutionSpy::record(&self.spy.runner_turn);
+        Ok(TurnOutcome::new(TurnStatus::Succeeded, UsageReport::new()))
+    }
+
+    fn stream_events(&self, _sess: &SessionHandle) -> EventStream {
+        Box::pin(stream::empty::<RunnerEvent>())
+    }
+
     async fn stop_session(&self, _sess: SessionHandle) -> CoreResult<UsageReport> {
         Ok(UsageReport::new())
     }
@@ -646,12 +751,21 @@ fn config_with_hooks_and_proofs(
 }
 
 fn trust_config(required_trust: TrustLevel, proofs_dir: PathBuf) -> Result<Config, Box<dyn Error>> {
+    network_config(required_trust, true, proofs_dir)
+}
+
+fn network_config(
+    required_trust: TrustLevel,
+    network_dispatch_enabled: bool,
+    proofs_dir: PathBuf,
+) -> Result<Config, Box<dyn Error>> {
     Ok(Config::builder(agent()?)
         .active_states(vec![state("todo")?])
         .terminal_states(vec![state("done")?, state("cancelled")?])
         .global_concurrency(1)
         .retry(fast_retry(1))
         .required_trust(required_trust)
+        .network_dispatch_enabled(network_dispatch_enabled)
         .proofs_dir(proofs_dir)
         .build())
 }
@@ -777,13 +891,244 @@ fn orphan_config() -> Result<Config, Box<dyn Error>> {
     )
 }
 
+async fn run_spy_dispatch(
+    issue: Issue,
+    config: Config,
+    trust: Arc<MockTrustClient>,
+) -> Result<
+    (
+        Option<Resolution>,
+        Arc<ExecutionSpy>,
+        Arc<StubTracker>,
+        Arc<MockTrustClient>,
+    ),
+    Box<dyn Error>,
+> {
+    let tmp = TempDir::new()?;
+    let spy = Arc::new(ExecutionSpy::default());
+    let tracker = Arc::new(StubTracker::with(vec![issue]));
+    let runner = Arc::new(SpyRunner {
+        spy: Arc::clone(&spy),
+    });
+    let workspace = Arc::new(SpyWorkspace {
+        root: tmp.path().join("workspaces"),
+        spy: Arc::clone(&spy),
+    });
+    let trust_client: Arc<dyn TrustClient> = trust.clone();
+    let orc = orc_with_trust(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config,
+        trust_client,
+    );
+
+    let resolution = orc.run_once().await?;
+    Ok((resolution, spy, tracker, trust))
+}
+
+fn assert_no_execution_calls(spy: &ExecutionSpy) {
+    assert_eq!(spy.counts(), (0, 0, 0, 0));
+}
+
+fn assert_blocked_with_code(
+    tracker: &StubTracker,
+    issue_id: &str,
+    code: &ReleaseReasonCode,
+) -> Result<(), Box<dyn Error>> {
+    assert!(guard(&tracker.releases)
+        .iter()
+        .any(|(id, release_code)| id.as_str() == issue_id && release_code == code));
+    let issues = guard(&tracker.issues);
+    let issue = issues
+        .iter()
+        .find(|issue| issue.id.as_str() == issue_id)
+        .ok_or("issue should remain in tracker")?;
+    assert_eq!(issue.state, state("blocked")?);
+    let blocked_code = issue
+        .extra
+        .get("blocked_reason")
+        .and_then(|value| value.get("code"))
+        .and_then(|value| value.as_str())
+        .ok_or("blocked reason code should be recorded")?;
+    assert_eq!(blocked_code, code.as_str());
+    Ok(())
+}
+
 // ---------- tests ----------
 
 #[tokio::test]
+async fn unsigned_network_issue_never_dispatched() -> Result<(), Box<dyn Error>> {
+    let issue = unsigned_network_issue("XSY-GATE-UNSIGNED", &["feature"])?;
+    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let trust = Arc::new(MockTrustClient::default());
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy);
+    assert!(trust.calls().is_empty());
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-GATE-UNSIGNED",
+        &ReleaseReasonCode::MissingVerifiedSignature,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_signature_never_dispatched() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue_with_provenance(
+        "XSY-GATE-INVALID",
+        &["feature"],
+        Some(SignatureProvenance::invalid("signature mismatch")),
+    )?;
+    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let trust = Arc::new(MockTrustClient::default());
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy);
+    assert!(trust.calls().is_empty());
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-GATE-INVALID",
+        &ReleaseReasonCode::InvalidSignature,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn verify_transport_error_refused_not_silently_dropped() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue_with_provenance(
+        "XSY-GATE-TRANSPORT",
+        &["feature"],
+        Some(SignatureProvenance::transport_error("x0xd unavailable")),
+    )?;
+    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let trust = Arc::new(MockTrustClient::default());
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy);
+    assert!(trust.calls().is_empty());
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-GATE-TRANSPORT",
+        &ReleaseReasonCode::VerifyTransportError,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn untrusted_signer_never_dispatched() -> Result<(), Box<dyn Error>> {
+    for (issue_id, signer, level, code) in [
+        (
+            "XSY-GATE-UNKNOWN",
+            "unknown-signer",
+            TrustLevel::Unknown,
+            ReleaseReasonCode::UnknownSigner,
+        ),
+        (
+            "XSY-GATE-KNOWN",
+            "known-signer",
+            TrustLevel::Known,
+            ReleaseReasonCode::UntrustedSigner,
+        ),
+    ] {
+        let issue = network_issue(issue_id, &["feature"], signer)?;
+        let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+        let trust = Arc::new(MockTrustClient::with_levels([(signer, level)]));
+
+        let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+        assert_eq!(resolution, Some(Resolution::Blocked));
+        assert_no_execution_calls(&spy);
+        assert_eq!(trust.calls(), vec![signer.to_owned()]);
+        assert_blocked_with_code(&tracker, issue_id, &code)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocked_signer_never_dispatched() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-GATE-BLOCKED", &["feature"], "blocked-signer")?;
+    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "blocked-signer",
+        TrustLevel::Blocked,
+    )]));
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy);
+    assert_eq!(trust.calls(), vec!["blocked-signer".to_owned()]);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-GATE-BLOCKED",
+        &ReleaseReasonCode::BlockedSigner,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_off_refuses_all_network_dispatch() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-GATE-DEFAULT-OFF", &["feature"], "trusted-signer")?;
+    let config = network_config(TrustLevel::Trusted, false, default_test_proofs_dir())?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy);
+    assert!(trust.calls().is_empty());
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-GATE-DEFAULT-OFF",
+        &ReleaseReasonCode::NetworkDispatchDisabled,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn verified_trusted_enabled_dispatches() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-GATE-POSITIVE", &["feature"], "trusted-signer")?;
+    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Completed));
+    assert_eq!(spy.counts(), (1, 0, 1, 1));
+    assert_eq!(trust.calls(), vec!["trusted-signer".to_owned()]);
+    assert_eq!(guard(&tracker.handoffs).len(), 1);
+    assert!(guard(&tracker.releases).is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn trust_gate_rejects_non_trusted_on_security_sensitive() -> Result<(), Box<dyn Error>> {
-    for (level, suffix) in [
-        (TrustLevel::Unknown, "unknown"),
-        (TrustLevel::Known, "known"),
+    for (level, suffix, expected_code) in [
+        (
+            TrustLevel::Unknown,
+            "unknown",
+            ReleaseReasonCode::UnknownSigner,
+        ),
+        (
+            TrustLevel::Known,
+            "known",
+            ReleaseReasonCode::UntrustedSigner,
+        ),
     ] {
         let tmp = TempDir::new()?;
         let signer = format!("signer-{suffix}");
@@ -817,8 +1162,7 @@ async fn trust_gate_rejects_non_trusted_on_security_sensitive() -> Result<(), Bo
         assert!(guard(&tracker.handoffs).is_empty());
         assert!(guard(&tracker.releases)
             .iter()
-            .any(|(id, code)| id.as_str() == issue_id
-                && code == &ReleaseReasonCode::InsufficientTrust));
+            .any(|(id, code)| id.as_str() == issue_id && code == &expected_code));
         let issues = guard(&tracker.issues);
         let issue = issues
             .iter()
@@ -909,7 +1253,7 @@ async fn trust_gate_skips_local_issues() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn trust_gate_skips_non_sensitive_tasks() -> Result<(), Box<dyn Error>> {
+async fn dispatch_gate_rejects_untrusted_non_sensitive_tasks() -> Result<(), Box<dyn Error>> {
     let tmp = TempDir::new()?;
     let tracker = Arc::new(StubTracker::with(vec![network_issue(
         "XSY-TG-NON-SENSITIVE",
@@ -937,10 +1281,13 @@ async fn trust_gate_skips_non_sensitive_tasks() -> Result<(), Box<dyn Error>> {
 
     let resolution = orc.run_once().await?;
 
-    assert_eq!(resolution, Some(Resolution::Completed));
+    assert_eq!(resolution, Some(Resolution::Blocked));
     assert_eq!(trust.calls(), vec!["unknown-signer".to_owned()]);
-    assert_eq!(guard(&tracker.handoffs).len(), 1);
-    assert!(guard(&tracker.releases).is_empty());
+    assert!(guard(&workspace.created).is_empty());
+    assert!(guard(&tracker.handoffs).is_empty());
+    assert!(guard(&tracker.releases).iter().any(|(id, code)| {
+        id.as_str() == "XSY-TG-NON-SENSITIVE" && code == &ReleaseReasonCode::UnknownSigner
+    }));
     Ok(())
 }
 
@@ -979,7 +1326,7 @@ async fn trust_gate_blocked_always_rejected() -> Result<(), Box<dyn Error>> {
     assert!(guard(&tracker.releases)
         .iter()
         .any(|(id, code)| id.as_str() == "XSY-TG-BLOCKED"
-            && code == &ReleaseReasonCode::InsufficientTrust));
+            && code == &ReleaseReasonCode::BlockedSigner));
     Ok(())
 }
 
@@ -1046,9 +1393,12 @@ async fn trust_gate_mock_client_covers_all_four_levels() -> Result<(), Box<dyn E
     assert_eq!(guard(&workspace.created).len(), 2);
     let releases = guard(&tracker.releases);
     assert_eq!(releases.len(), 2);
-    assert!(releases
-        .iter()
-        .all(|(_id, code)| code == &ReleaseReasonCode::InsufficientTrust));
+    assert!(releases.iter().any(|(id, code)| {
+        id.as_str() == "XSY-TG-MATRIX-BLOCKED" && code == &ReleaseReasonCode::BlockedSigner
+    }));
+    assert!(releases.iter().any(|(id, code)| {
+        id.as_str() == "XSY-TG-MATRIX-UNKNOWN" && code == &ReleaseReasonCode::UnknownSigner
+    }));
     let issues = guard(&tracker.issues);
     for (id, _signer, level) in cases {
         let issue = issues

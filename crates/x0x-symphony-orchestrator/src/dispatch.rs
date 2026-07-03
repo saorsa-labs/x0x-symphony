@@ -12,15 +12,14 @@
 
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 
-use serde_json::Value;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tracing::warn;
 use x0x_symphony_core::{
     Claim, Handoff, HookEnv, HookName, HookOutcome, HookStatus, Issue, IssueId, IssueSource,
-    Prompt, ReleaseReason, ReleaseReasonCode, Runner, SessionContext, Tracker, TurnStatus,
-    ValidationResult, ValidationStatus, Workspace, WorkspaceHandle,
+    Prompt, ReleaseReason, ReleaseReasonCode, Runner, SessionContext, SignatureProvenance, Tracker,
+    TurnStatus, ValidationResult, ValidationStatus, Workspace, WorkspaceHandle,
 };
 
 use crate::TrustLevel;
@@ -422,29 +421,6 @@ fn issue_extra_string_list(issue: &Issue, key: &str) -> Vec<String> {
         .collect()
 }
 
-fn issue_is_security_sensitive(issue: &Issue) -> bool {
-    issue
-        .labels
-        .iter()
-        .any(|label| label.trim().to_ascii_lowercase().replace('_', "-") == "security-sensitive")
-}
-
-fn issue_signer_agent_id(issue: &Issue) -> Option<&str> {
-    ["signer_agent_id", "x0x_signer_agent_id"]
-        .iter()
-        .filter_map(|key| issue.extra.get(*key))
-        .filter_map(Value::as_str)
-        .chain(
-            ["signature", "verified_signature", "x0x_signature"]
-                .iter()
-                .filter_map(|key| issue.extra.get(*key))
-                .filter_map(|value| value.get("signer_agent_id"))
-                .filter_map(Value::as_str),
-        )
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-}
-
 fn follow_ups_from_summary(summary: Option<&str>) -> Vec<String> {
     let Some(summary) = summary else {
         return Vec::new();
@@ -505,7 +481,7 @@ where
         let mut guard = HeldClaim::new(self, &claim);
         let issue = self.fetch_claim_issue(&claim).await?;
         if self
-            .block_if_trust_rejected(&mut guard, &claim, &issue)
+            .block_if_network_dispatch_refused(&mut guard, &claim, &issue)
             .await?
         {
             return Ok(Resolution::Blocked);
@@ -619,7 +595,7 @@ where
         );
     }
 
-    async fn block_if_trust_rejected(
+    async fn block_if_network_dispatch_refused(
         &self,
         guard: &mut HeldClaim<'_, T, R, W>,
         claim: &Claim,
@@ -629,57 +605,110 @@ where
             return Ok(false);
         }
 
-        let sensitive = issue_is_security_sensitive(issue);
-        let Some(signer) = issue_signer_agent_id(issue) else {
-            if sensitive {
-                self.block_for_insufficient_trust(
-                    guard,
-                    claim,
-                    "network-sourced security-sensitive issue has no signer_agent_id".to_owned(),
-                )
-                .await?;
-                return Ok(true);
-            }
-            return Ok(false);
-        };
-
-        let trust_level = self.trust_client.trust_level(signer).await?;
-        if trust_level == TrustLevel::Blocked {
-            self.block_for_insufficient_trust(
+        if !self.config.network_dispatch_enabled {
+            self.block_for_dispatch_refusal(
                 guard,
                 claim,
-                format!("network-sourced issue signer {signer} is blocked in x0xd contacts"),
+                ReleaseReasonCode::NetworkDispatchDisabled,
+                "network-sourced dispatch is disabled by security.network_dispatch_enabled"
+                    .to_owned(),
             )
             .await?;
             return Ok(true);
         }
-        if sensitive && trust_level < self.config.required_trust {
-            self.block_for_insufficient_trust(
-                guard,
-                claim,
+
+        let signer = match &issue.signature_provenance {
+            Some(SignatureProvenance::Verified { signer_agent_id })
+                if !signer_agent_id.trim().is_empty() =>
+            {
+                signer_agent_id.trim()
+            }
+            Some(SignatureProvenance::Verified { .. }) | None => {
+                self.block_for_dispatch_refusal(
+                    guard,
+                    claim,
+                    ReleaseReasonCode::MissingVerifiedSignature,
+                    "network-sourced issue lacks verified ML-DSA-65 signature provenance"
+                        .to_owned(),
+                )
+                .await?;
+                return Ok(true);
+            }
+            Some(SignatureProvenance::Invalid { reason }) => {
+                self.block_for_dispatch_refusal(
+                    guard,
+                    claim,
+                    ReleaseReasonCode::InvalidSignature,
+                    format!("network-sourced issue signature is invalid: {reason}"),
+                )
+                .await?;
+                return Ok(true);
+            }
+            Some(SignatureProvenance::TransportError { reason }) => {
+                self.block_for_dispatch_refusal(
+                    guard,
+                    claim,
+                    ReleaseReasonCode::VerifyTransportError,
+                    format!(
+                        "network-sourced issue signature verification transport failed: {reason}"
+                    ),
+                )
+                .await?;
+                return Ok(true);
+            }
+        };
+
+        let trust_level = self.trust_client.trust_level(signer).await?;
+        let refusal = if trust_level == TrustLevel::Blocked {
+            Some((
+                ReleaseReasonCode::BlockedSigner,
+                format!("network-sourced issue signer {signer} is blocked in x0xd contacts"),
+            ))
+        } else if trust_level == TrustLevel::Unknown {
+            Some((
+                ReleaseReasonCode::UnknownSigner,
+                format!("network-sourced issue signer {signer} is unknown to x0xd contacts"),
+            ))
+        } else if trust_level < self.config.required_trust {
+            Some((
+                ReleaseReasonCode::UntrustedSigner,
                 format!(
-                    "network-sourced security-sensitive issue signer {signer} has trust {trust_level}; required {}",
+                    "network-sourced issue signer {signer} has trust {trust_level}; required {}",
                     self.config.required_trust
                 ),
-            )
-            .await?;
+            ))
+        } else {
+            None
+        };
+
+        if let Some((code, detail)) = refusal {
+            self.block_for_dispatch_refusal(guard, claim, code, detail)
+                .await?;
             return Ok(true);
         }
         Ok(false)
     }
 
-    async fn block_for_insufficient_trust(
+    async fn block_for_dispatch_refusal(
         &self,
         guard: &mut HeldClaim<'_, T, R, W>,
         claim: &Claim,
+        code: ReleaseReasonCode,
         detail: String,
     ) -> Result<()> {
         guard.cancel_heartbeat();
+        let issue_id = match &claim.issue_id {
+            Some(id) => id.to_string(),
+            None => "(no issue)".to_owned(),
+        };
+        warn!(
+            issue_id = issue_id.as_str(),
+            reason_code = code.as_str(),
+            detail = detail.as_str(),
+            "network-sourced issue refused by dispatch gate"
+        );
         self.tracker
-            .block(
-                claim,
-                ReleaseReason::new(ReleaseReasonCode::InsufficientTrust, detail),
-            )
+            .block(claim, ReleaseReason::new(code, detail))
             .await?;
         Ok(())
     }

@@ -108,8 +108,10 @@ pub struct Config {
     pub validation_commands: Vec<String>,
     /// Claim heartbeat TTL; a claim older than this is stale.
     pub claim_ttl: chrono::Duration,
-    /// Minimum trust level required for security-sensitive network-sourced issues.
+    /// Minimum trust level required for network-sourced issue dispatch.
     pub required_trust: TrustLevel,
+    /// Whether network-sourced issues may dispatch after signature + trust checks.
+    pub network_dispatch_enabled: bool,
     /// Maximum time to wait for in-flight runs to release on shutdown.
     pub shutdown_grace: Duration,
 }
@@ -134,6 +136,7 @@ impl Config {
             validation_commands: Vec::new(),
             claim_ttl: chrono::Duration::minutes(30),
             required_trust: TrustLevel::Trusted,
+            network_dispatch_enabled: false,
             shutdown_grace: Duration::from_mins(1),
         }
     }
@@ -172,6 +175,7 @@ pub struct ConfigBuilder {
     validation_commands: Vec<String>,
     claim_ttl: chrono::Duration,
     required_trust: TrustLevel,
+    network_dispatch_enabled: bool,
     shutdown_grace: Duration,
 }
 
@@ -240,10 +244,16 @@ impl ConfigBuilder {
         self.claim_ttl = ttl;
         self
     }
-    /// Override the required trust threshold for sensitive network issues.
+    /// Override the required trust threshold for network-sourced issues.
     #[must_use]
     pub fn required_trust(mut self, required_trust: TrustLevel) -> Self {
         self.required_trust = required_trust;
+        self
+    }
+    /// Enable or disable network-sourced dispatch.
+    #[must_use]
+    pub fn network_dispatch_enabled(mut self, enabled: bool) -> Self {
+        self.network_dispatch_enabled = enabled;
         self
     }
     /// Override the shutdown grace period.
@@ -268,6 +278,7 @@ impl ConfigBuilder {
             validation_commands: self.validation_commands,
             claim_ttl: self.claim_ttl,
             required_trust: self.required_trust,
+            network_dispatch_enabled: self.network_dispatch_enabled,
             shutdown_grace: self.shutdown_grace,
         }
     }

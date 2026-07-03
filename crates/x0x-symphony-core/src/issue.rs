@@ -292,6 +292,67 @@ impl fmt::Display for IssueSource {
     }
 }
 
+/// Non-serialized signature verification provenance for a network issue.
+///
+/// Tracker adapters attach this after verifying the source signature they used
+/// to accept a network-sourced issue into the local view. It is intentionally
+/// skipped by serde so frozen issue schema v1 records do not grow new required
+/// fields and so dispatch never infers verification from serialized source
+/// markers alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SignatureProvenance {
+    /// A signature was verified and binds the issue to this signer.
+    Verified {
+        /// x0x agent id whose ML-DSA-65 signature verified.
+        signer_agent_id: String,
+    },
+    /// A signature was present but failed verification.
+    Invalid {
+        /// Verification failure detail suitable for operator logs.
+        reason: String,
+    },
+    /// Verification could not complete because the verifier transport failed.
+    TransportError {
+        /// Transport failure detail suitable for operator logs.
+        reason: String,
+    },
+}
+
+impl SignatureProvenance {
+    /// Build verified signer provenance.
+    #[must_use]
+    pub fn verified(signer_agent_id: impl Into<String>) -> Self {
+        Self::Verified {
+            signer_agent_id: signer_agent_id.into(),
+        }
+    }
+
+    /// Build invalid-signature provenance.
+    #[must_use]
+    pub fn invalid(reason: impl Into<String>) -> Self {
+        Self::Invalid {
+            reason: reason.into(),
+        }
+    }
+
+    /// Build verify-transport-error provenance.
+    #[must_use]
+    pub fn transport_error(reason: impl Into<String>) -> Self {
+        Self::TransportError {
+            reason: reason.into(),
+        }
+    }
+
+    /// Return the verified signer id when verification succeeded.
+    #[must_use]
+    pub fn verified_signer(&self) -> Option<&str> {
+        match self {
+            Self::Verified { signer_agent_id } => Some(signer_agent_id.as_str()),
+            Self::Invalid { .. } | Self::TransportError { .. } => None,
+        }
+    }
+}
+
 /// Minimal blocker reference embedded inside another issue.
 ///
 /// # Examples
@@ -402,6 +463,9 @@ pub struct Issue {
     /// Optional review handoff metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<crate::Handoff>,
+    /// Non-serialized verified signature provenance attached by network trackers.
+    #[serde(skip)]
+    pub signature_provenance: Option<SignatureProvenance>,
     /// Creation timestamp as ISO-8601 UTC text.
     pub created_at: String,
     /// Last update timestamp as ISO-8601 UTC text.
@@ -536,6 +600,7 @@ impl Issue {
             shard: None,
             claim: None,
             handoff: None,
+            signature_provenance: None,
             created_at: created_at.clone(),
             updated_at: created_at,
             extra: BTreeMap::new(),

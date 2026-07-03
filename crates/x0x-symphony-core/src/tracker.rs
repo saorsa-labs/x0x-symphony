@@ -90,6 +90,20 @@ pub enum ReleaseReasonCode {
     RetryExhausted,
     /// The dispatch trust gate rejected the issue signer.
     InsufficientTrust,
+    /// Network-sourced dispatch is disabled by configuration.
+    NetworkDispatchDisabled,
+    /// A network-sourced issue lacked verified signature provenance.
+    MissingVerifiedSignature,
+    /// A network-sourced issue's signature was present but invalid.
+    InvalidSignature,
+    /// Signature verification could not complete because verifier transport failed.
+    VerifyTransportError,
+    /// The verified signer is unknown to the trust store.
+    UnknownSigner,
+    /// The verified signer is known but below the configured trust threshold.
+    UntrustedSigner,
+    /// The verified signer is explicitly blocked in the trust store.
+    BlockedSigner,
     /// Graceful shutdown released the claim before completion.
     Shutdown,
     /// Other structured reason.
@@ -115,6 +129,13 @@ impl ReleaseReasonCode {
             Self::Conflict => "conflict",
             Self::RetryExhausted => "retry_exhausted",
             Self::InsufficientTrust => "insufficient_trust",
+            Self::NetworkDispatchDisabled => "network_dispatch_disabled",
+            Self::MissingVerifiedSignature => "missing_verified_signature",
+            Self::InvalidSignature => "invalid_signature",
+            Self::VerifyTransportError => "verify_transport_error",
+            Self::UnknownSigner => "unknown_signer",
+            Self::UntrustedSigner => "untrusted_signer",
+            Self::BlockedSigner => "blocked_signer",
             Self::Shutdown => "shutdown",
             Self::Other => "other",
         }
