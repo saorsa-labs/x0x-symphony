@@ -17,7 +17,7 @@ pub mod workspace;
 
 pub use approval::{
     approval_decision, content_hash, ApprovalBindingKey, ApprovalConsumed, ApprovalDecision,
-    ApprovalEvent, ApprovalValidity, ApprovalVerdict, ContentHash, DenialEvent,
+    ApprovalEvent, ApprovalState, ApprovalValidity, ApprovalVerdict, ContentHash, DenialEvent,
     APPROVAL_CONSUMED_CONTEXT, APPROVAL_CONTEXT,
 };
 pub use claim::{Claim, Shard, ShardRole};

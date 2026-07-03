@@ -17,9 +17,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tracing::warn;
 use x0x_symphony_core::{
+    approval_decision, content_hash, sha256_hex, AgentId, ApprovalConsumed, ApprovalDecision,
     Claim, Handoff, HookEnv, HookName, HookOutcome, HookStatus, Issue, IssueId, IssueSource,
-    Prompt, ReleaseReason, ReleaseReasonCode, Runner, SessionContext, SignatureProvenance, Tracker,
-    TurnStatus, ValidationResult, ValidationStatus, Workspace, WorkspaceHandle,
+    Prompt, ReleaseReason, ReleaseReasonCode, Runner, SessionContext, SignatureEnvelope,
+    SignatureProvenance, Tracker, TurnStatus, ValidationResult, ValidationStatus, Workspace,
+    WorkspaceHandle, APPROVAL_CONSUMED_CONTEXT, SIGN_ALGORITHM,
 };
 
 use crate::{NetworkDispatchPolicy, TrustLevel};
@@ -140,9 +142,22 @@ pub enum Resolution {
     Completed,
     /// The retry budget was exhausted and the issue was moved to `blocked`.
     Blocked,
+    /// The claim was released and the issue awaits a signed approval before
+    /// re-dispatch.
+    PendingApproval,
     /// Graceful shutdown cancelled the run; the claim was released with
     /// `shutdown` and the workspace was preserved.
     ShutdownReleased,
+}
+
+/// Dispatch-gate decision before any workspace, hook, or runner work starts.
+enum DispatchGateOutcome {
+    /// Network policy allows the dispatch to proceed.
+    Proceed,
+    /// The gate refused the dispatch permanently for the current issue view.
+    Blocked,
+    /// The gate released the claim while waiting for signed approval.
+    PendingApproval,
 }
 
 /// Carries a runner session through `select!` so shutdown can preempt it.
@@ -480,11 +495,13 @@ where
         // Guard: owns the budget slot + heartbeat task; releases on EVERY exit.
         let mut guard = HeldClaim::new(self, &claim);
         let issue = self.fetch_claim_issue(&claim).await?;
-        if self
+        match self
             .block_if_network_dispatch_refused(&mut guard, &claim, &issue)
             .await?
         {
-            return Ok(Resolution::Blocked);
+            DispatchGateOutcome::Proceed => {}
+            DispatchGateOutcome::Blocked => return Ok(Resolution::Blocked),
+            DispatchGateOutcome::PendingApproval => return Ok(Resolution::PendingApproval),
         }
         self.spawn_claim_heartbeat(&mut guard, &claim, &issue);
         let mut proof = ProofRun::start(
@@ -600,7 +617,7 @@ where
         guard: &mut HeldClaim<'_, T, R, W>,
         claim: &Claim,
         issue: &Issue,
-    ) -> Result<bool> {
+    ) -> Result<DispatchGateOutcome> {
         // Self-enforcing classification: treat the issue as network-sourced when
         // the adapter marked it OR when signature provenance is attached. A
         // provenance-bearing issue must never slip past an absent/Local marker —
@@ -609,40 +626,26 @@ where
         let is_network_sourced = IssueSource::from_issue(issue) == IssueSource::NetworkSourced
             || issue.signature_provenance.is_some();
         if !is_network_sourced {
-            return Ok(false);
+            return Ok(DispatchGateOutcome::Proceed);
         }
 
-        match self.config.network_dispatch {
-            NetworkDispatchPolicy::Off => {
-                self.block_for_dispatch_refusal(
-                    guard,
-                    claim,
-                    ReleaseReasonCode::NetworkDispatchDisabled,
-                    "network-sourced dispatch is disabled by security.network_dispatch_enabled"
-                        .to_owned(),
-                )
-                .await?;
-                return Ok(true);
-            }
-            NetworkDispatchPolicy::Approve => {
-                self.block_for_dispatch_refusal(
-                    guard,
-                    claim,
-                    ReleaseReasonCode::AwaitingApproval,
-                    "network-sourced dispatch requires approval (security.network_dispatch=approve); approval flow lands in XSY-0050"
-                        .to_owned(),
-                )
-                .await?;
-                return Ok(true);
-            }
-            NetworkDispatchPolicy::Auto => {}
+        if self.config.network_dispatch == NetworkDispatchPolicy::Off {
+            self.block_for_dispatch_refusal(
+                guard,
+                claim,
+                ReleaseReasonCode::NetworkDispatchDisabled,
+                "network-sourced dispatch is disabled by security.network_dispatch_enabled"
+                    .to_owned(),
+            )
+            .await?;
+            return Ok(DispatchGateOutcome::Blocked);
         }
 
         let signer = match &issue.signature_provenance {
             Some(SignatureProvenance::Verified { signer_agent_id })
                 if !signer_agent_id.trim().is_empty() =>
             {
-                signer_agent_id.trim()
+                AgentId::new(signer_agent_id.trim().to_owned())?
             }
             Some(SignatureProvenance::Verified { .. }) | None => {
                 self.block_for_dispatch_refusal(
@@ -653,7 +656,7 @@ where
                         .to_owned(),
                 )
                 .await?;
-                return Ok(true);
+                return Ok(DispatchGateOutcome::Blocked);
             }
             Some(SignatureProvenance::Invalid { reason }) => {
                 self.block_for_dispatch_refusal(
@@ -663,7 +666,7 @@ where
                     format!("network-sourced issue signature is invalid: {reason}"),
                 )
                 .await?;
-                return Ok(true);
+                return Ok(DispatchGateOutcome::Blocked);
             }
             Some(SignatureProvenance::TransportError { reason }) => {
                 self.block_for_dispatch_refusal(
@@ -675,11 +678,11 @@ where
                     ),
                 )
                 .await?;
-                return Ok(true);
+                return Ok(DispatchGateOutcome::Blocked);
             }
         };
 
-        let trust_level = self.trust_client.trust_level(signer).await?;
+        let trust_level = self.trust_client.trust_level(signer.as_str()).await?;
         let refusal = if trust_level == TrustLevel::Blocked {
             Some((
                 ReleaseReasonCode::BlockedSigner,
@@ -705,9 +708,116 @@ where
         if let Some((code, detail)) = refusal {
             self.block_for_dispatch_refusal(guard, claim, code, detail)
                 .await?;
-            return Ok(true);
+            return Ok(DispatchGateOutcome::Blocked);
         }
-        Ok(false)
+
+        match self.config.network_dispatch {
+            NetworkDispatchPolicy::Auto => Ok(DispatchGateOutcome::Proceed),
+            NetworkDispatchPolicy::Approve => {
+                self.approval_gate_decision(guard, claim, issue, &signer)
+                    .await
+            }
+            NetworkDispatchPolicy::Off => Ok(DispatchGateOutcome::Blocked),
+        }
+    }
+
+    async fn approval_gate_decision(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        issue: &Issue,
+        signer: &AgentId,
+    ) -> Result<DispatchGateOutcome> {
+        let state = self.tracker.load_approval_state(&issue.id).await?;
+        let now = self
+            .clock
+            .now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        match approval_decision(
+            &state.events,
+            issue,
+            signer,
+            &now,
+            self.config.approval_ttl,
+            &state.consumed,
+        ) {
+            ApprovalDecision::Approved => {
+                let consumed = self.approval_consumed_event(issue, signer, &now)?;
+                self.tracker.store_consumed(&consumed).await?;
+                Ok(DispatchGateOutcome::Proceed)
+            }
+            ApprovalDecision::Denied => {
+                self.block_for_dispatch_refusal(
+                    guard,
+                    claim,
+                    ReleaseReasonCode::AwaitingApproval,
+                    format!(
+                        "network-sourced dispatch was denied for signer {signer} and current payload"
+                    ),
+                )
+                .await?;
+                Ok(DispatchGateOutcome::PendingApproval)
+            }
+            ApprovalDecision::Pending => {
+                self.block_for_dispatch_refusal(
+                    guard,
+                    claim,
+                    ReleaseReasonCode::AwaitingApproval,
+                    format!(
+                        "network-sourced dispatch requires a valid approval for signer {signer} and current payload"
+                    ),
+                )
+                .await?;
+                Ok(DispatchGateOutcome::PendingApproval)
+            }
+        }
+    }
+
+    fn approval_consumed_event(
+        &self,
+        issue: &Issue,
+        signer: &AgentId,
+        consumed_at: &str,
+    ) -> Result<ApprovalConsumed> {
+        let content_hash = content_hash(issue);
+        let nonce_source = format!(
+            "{}:{}:{}:{}:{}",
+            issue.id, content_hash, signer, consumed_at, self.config.agent_id
+        );
+        let nonce = sha256_hex(nonce_source.as_bytes());
+        let placeholder = SignatureEnvelope::new(
+            SIGN_ALGORITHM,
+            APPROVAL_CONSUMED_CONTEXT,
+            "eDB4LXN5bXBob255LWxvY2FsLWF0dGVzdGF0aW9u",
+            "cGVuZGluZy1sb2NhbC1hdHRlc3RhdGlvbg==",
+            "placeholder",
+            self.config.agent_id.to_string(),
+        );
+        let mut consumed = ApprovalConsumed::new(
+            issue.id.clone(),
+            content_hash,
+            signer.clone(),
+            nonce,
+            consumed_at.to_owned(),
+            placeholder,
+        );
+        let payload_sha256 = consumed.signing_payload_sha256()?;
+        let attestation = sha256_hex(
+            format!(
+                "{}:{}:{}",
+                self.config.agent_id, consumed.nonce, payload_sha256
+            )
+            .as_bytes(),
+        );
+        consumed.signature = SignatureEnvelope::new(
+            SIGN_ALGORITHM,
+            APPROVAL_CONSUMED_CONTEXT,
+            "eDB4LXN5bXBob255LWxvY2FsLWF0dGVzdGF0aW9u",
+            attestation,
+            payload_sha256,
+            self.config.agent_id.to_string(),
+        );
+        Ok(consumed)
     }
 
     async fn block_for_dispatch_refusal(
