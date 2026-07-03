@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use x0x_symphony_core::WorkflowDefinition;
 
+use saorsa_sandbox::SandboxSpec;
+
 use crate::{
     error::{Error, Result},
     preset::{self, PresetName},
-    sandbox::SandboxSpec,
 };
 
 const DEFAULT_TURN_TIMEOUT_MS: u64 = 3_600_000;

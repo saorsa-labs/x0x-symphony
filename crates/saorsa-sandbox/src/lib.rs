@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Host sandbox profile planning for the shell runner.
 //!
 //! The sandbox layer prepares a structured [`CommandPlan`] into a [`WrappedCommand`]
@@ -9,19 +10,72 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
+    io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tokio::process::Command;
 use x0x_symphony_core::IssueSource;
 
-use crate::{
-    error::{Error, Result},
-    spec::validate_arg,
-};
+/// Result alias for sandbox operations.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Structured failures produced by sandbox planning and probes.
+#[derive(Debug, Error)]
+pub enum Error {
+    /// Workflow configuration is present but invalid.
+    #[error("invalid runner config {field}: {message}")]
+    InvalidConfig {
+        /// Configuration field that failed validation.
+        field: &'static str,
+        /// Human-readable validation failure.
+        message: String,
+    },
+
+    /// A configured sandbox backend could not be enforced.
+    #[error("sandbox backend {backend} unavailable: {message}")]
+    SandboxUnavailable {
+        /// Effective sandbox backend name.
+        backend: String,
+        /// Human-readable unavailability reason.
+        message: String,
+    },
+
+    /// Sandbox probe filesystem setup or cleanup failed.
+    #[error("sandbox probe I/O error at {path}: {source}")]
+    ProbeIo {
+        /// Path involved in the probe I/O failure.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl Error {
+    /// Construct an invalid-config error.
+    #[must_use]
+    pub fn invalid_config(field: &'static str, message: impl Into<String>) -> Self {
+        Self::InvalidConfig {
+            field,
+            message: message.into(),
+        }
+    }
+}
+
+fn validate_arg(arg: &str) -> Result<()> {
+    if arg.as_bytes().contains(&0) {
+        return Err(Error::invalid_config(
+            "runner.args",
+            "must not contain NUL bytes",
+        ));
+    }
+    Ok(())
+}
 
 const WORKSPACE_MOUNT: &str = "/workspace";
 const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
