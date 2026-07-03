@@ -98,6 +98,10 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// Sandbox planning, wrapping, or probing failed.
+    #[error(transparent)]
+    Sandbox(#[from] saorsa_sandbox::Error),
+
     /// Workflow configuration could not be decoded.
     #[error("failed to decode runner workflow config: {0}")]
     Decode(#[from] serde_json::Error),

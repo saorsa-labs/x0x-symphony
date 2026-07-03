@@ -240,7 +240,7 @@ async fn finish_sandbox_session(
     outcome: Result<TurnOutcome>,
     session: &mut dyn SandboxSession,
 ) -> Result<TurnOutcome> {
-    let shutdown = session.shutdown().await;
+    let shutdown = session.shutdown().await.map_err(Error::from);
     match (outcome, shutdown) {
         (Ok(outcome), Ok(())) => Ok(outcome),
         (Err(error), Ok(())) => Err(error),
@@ -702,7 +702,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Sandbox for RecordingSandbox {
-        async fn prepare(&self, plan: CommandPlan, source: IssueSource) -> Result<PreparedCommand> {
+        async fn prepare(
+            &self,
+            plan: CommandPlan,
+            source: IssueSource,
+        ) -> saorsa_sandbox::Result<PreparedCommand> {
             assert_eq!(source, IssueSource::Local);
             let mut command = WrappedCommand::from(plan);
             if let Some((key, value)) = &self.injected_env {
@@ -713,7 +717,12 @@ mod tests {
             }
             self.prepared_cwds
                 .lock()
-                .map_err(|_| Error::SessionRegistryPoisoned)?
+                .map_err(|_| {
+                    saorsa_sandbox::Error::invalid_config(
+                        "recording_sandbox.prepared_cwds",
+                        "mutex poisoned",
+                    )
+                })?
                 .push(command.cwd.clone());
             Ok(PreparedCommand {
                 command,
@@ -723,7 +732,7 @@ mod tests {
             })
         }
 
-        async fn probe(&self) -> Result<ProbeReport> {
+        async fn probe(&self) -> saorsa_sandbox::Result<ProbeReport> {
             Ok(ProbeReport {
                 backend: self.spec.backend,
                 profile: self.spec.profile,
@@ -742,7 +751,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SandboxSession for RecordingSession {
-        async fn shutdown(&mut self) -> Result<()> {
+        async fn shutdown(&mut self) -> saorsa_sandbox::Result<()> {
             self.shutdowns.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(())
         }
