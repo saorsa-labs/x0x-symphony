@@ -2130,6 +2130,7 @@ name = "x0x-symphony-core"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures-core",
  "futures-util",
  "proptest",

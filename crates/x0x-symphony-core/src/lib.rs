@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod approval;
 pub mod claim;
 pub mod error;
 pub mod handoff;
@@ -14,6 +15,11 @@ pub mod tracker;
 pub mod workflow;
 pub mod workspace;
 
+pub use approval::{
+    approval_decision, content_hash, ApprovalBindingKey, ApprovalConsumed, ApprovalDecision,
+    ApprovalEvent, ApprovalValidity, ApprovalVerdict, ContentHash, DenialEvent,
+    APPROVAL_CONSUMED_CONTEXT, APPROVAL_CONTEXT,
+};
 pub use claim::{Claim, Shard, ShardRole};
 pub use error::{Result, SymphonyError};
 pub use handoff::{Handoff, ValidationResult, ValidationStatus};
