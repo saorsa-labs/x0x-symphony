@@ -215,5 +215,22 @@ The following issues extend or supersede this posture, in milestone order:
 | [XSY-0028](../../issues/issues.jsonl) | M4 | Sensitive-task gates: Pinned identity + human approval step |
 
 The four rules above remain as the baseline contract; configured sandbox
-profiles layer additional defense-in-depth on top. Tier 2 replaces the
-external-tool wrappers with native no-Node backends.
+profiles layer additional defense-in-depth on top.
+
+## Containment status (per ADR-0006)
+
+| Platform | Backend | Status |
+|----------|---------|--------|
+| **Linux** | Native Landlock (access control) + cgroup-v2 (resource bounding), via the internal `saorsa-sandbox-launcher` binary | Native (XSY-0042); no external tool forked |
+| **macOS** | **Tier-1 `sandbox-exec` (external tool)** | External-tool wrapper (XSY-0027). Native macOS Seatbelt is a research follow-up (XSY-0057) — see ADR-0006 (M) for why a native crate is not available today |
+
+**`unsafe` policy:** `saorsa-sandbox` carries `#![forbid(unsafe_code)]`. Symphony
+writes zero `unsafe`; the `unsafe` that enforcement depends on lives only inside
+vetted crates (`landlock`, maintained by the Landlock kernel author; `libc`;
+`tokio`). See ADR-0006 (P).
+
+**Fail-loud-degrade:** if the Linux launcher is missing or a backend `probe()`
+fails, the daemon **refuses network-sourced work** (fail-closed). Degrading to
+unsandboxed execution is acceptable only for **local-sourced** tasks, and only
+with a loud `tracing::warn!`. A network-sourced task with no enforcing backend
+never executes.

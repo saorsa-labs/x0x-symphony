@@ -11,3 +11,4 @@ NNNN**, **Deprecated**.
 | 0003 | No external tracker in v1.0                    | Accepted |
 | 0004 | x0x TaskList CRDT as the symphony backbone     | Accepted |
 | 0005 | Consent-gated network dispatch (per-task approval) | Accepted |
+| 0006 | Native sandbox extraction (`saorsa-sandbox`) with Linux Landlock launcher | Accepted |
