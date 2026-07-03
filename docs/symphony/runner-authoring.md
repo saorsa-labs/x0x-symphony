@@ -1,7 +1,7 @@
 # Runner authoring guide
 
 How to write and configure a runner for x0x-symphony, and how to add a new
-shell preset. This guide targets the **M1** shell runner
+shell preset. This guide targets the current shell runner
 (`x0x-symphony-runner-shell`).
 
 For the trait definition see `x0x_symphony_core::Runner`
@@ -33,7 +33,7 @@ to tear down. A turn resolves to one of:
 | `Succeeded` | handoff → `review` |
 | `Failed` / `TimedOut` / `Cancelled` | retry with backoff, or `blocked` on exhaustion |
 
-## The shell runner contract (M1)
+## The shell runner contract
 
 `ShellRunner` executes a resolved `RunnerSpec` directly as an **argv array**.
 Four invariants matter for runner authors:

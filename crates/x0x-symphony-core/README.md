@@ -4,8 +4,9 @@ Core traits and domain types for x0x-symphony.
 
 This crate contains only the stable abstractions shared by tracker adapters,
 runners, workspace managers, and the orchestrator. It intentionally ships no
-adapter implementations; the bootstrap `git_jsonl` adapter and the permanent
-`x0x_crdt` adapter live in separate crates.
+runtime adapter implementations. The permanent `x0x_crdt` tracker lives in
+`crates/x0x-symphony-tracker-x0x-crdt`; the M1/M2 `git_jsonl` bootstrap adapter
+was deleted at M3.
 
 Read the architecture first:
 

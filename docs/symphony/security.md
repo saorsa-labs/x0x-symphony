@@ -1,19 +1,20 @@
 # x0x-symphony — Security posture and sandbox profiles
 
-This document states x0x-symphony's security posture for the M1–M3
-window and the M2 sandbox-profile layer added by XSY-0027. The original
-interim rules remain the baseline: local operator-controlled work can run
-without a configured sandbox, but network-sourced dispatch is default-off
-through M3 and becomes fail-closed once that source exists. The
-architecture document [`../design/symphony.md`](../design/symphony.md)
+This document states x0x-symphony's current security posture after the M3
+`x0x_crdt` cutover and the M4/M5 consent/sandbox hardening. The original
+interim rules remain useful history: local operator-controlled work can run
+without a configured sandbox, but network-sourced dispatch is fail-closed by
+default and, when enabled, is gated by signature, trust, consent, and sandbox
+availability. The architecture document [`../design/symphony.md`](../design/symphony.md)
 §11 remains the authoritative security model.
 
 ---
 
 ## Threat model summary
 
-During M1–M3, a runner is a **child process with repo-write and network
-access**. There is no sandbox. Containment rests on two controls:
+When `runner.sandbox` is omitted, a runner is still a **child process with
+repo-write and network access**. That unsandboxed mode is intended for local,
+operator-controlled development only. Baseline containment rests on two controls:
 
 1. **Workspace path containment** — the runner executes only inside a
    per-issue workspace directory under the configured `workspace.root`.
@@ -33,29 +34,27 @@ block intentionally preserves the local-development unsandboxed behavior.
 
 ---
 
-## The four interim rules
+## The baseline rules
 
-> Until sandbox profiles land (M4), a runner is a child process with
-> repo-write and network access, contained only by workspace pathing.
-> Therefore: (1) x0x-symphony executes **only** issues from the local
-> git-committed backlog that the operator controls — no network-sourced
-> work is dispatched before M3, and at M3 dispatch is hard-gated on
-> signature verification + trust level (XSY-0039); (2) hook and runner
-> environments are allow-list only, secrets deny-listed by default;
-> (3) the operator vouches for every command configured in WORKFLOW.md
-> — treat it with the same care as CI config; (4) tasks labelled
-> `security-sensitive` are refused outright until XSY-0028.
+> Local unsandboxed work is a child process with repo-write and network access,
+> contained only by workspace pathing and environment controls. Therefore:
+> (1) local work is operator-vouched; network-sourced work is refused unless it
+> passes ML-DSA-65 signature verification, x0xd trust, consent policy, and any
+> required sandbox gate; (2) hook and runner environments are allow-list only,
+> secrets deny-listed by default; (3) the operator vouches for every command
+> configured in WORKFLOW.md — treat it with the same care as CI config;
+> (4) sensitive tasks require the configured trust/approval path before they can
+> execute.
 
 Per-rule controlling issues:
 
-1. **Local-backlog-only execution.** The M1 `git_jsonl` tracker reads only
-   `issues/issues.jsonl` — the local, operator-controlled, git-committed
-   backlog. No code path exists to dispatch work sourced over the network.
-   At M3 the `x0x_crdt` adapter may *list* network-sourced issues, but the
-   orchestrator's execute path is hard-gated on XSY-0020 (ML-DSA-65
-   signature verification) and XSY-0022 (trust level), tracker-enforced
-   by XSY-0039. Until that gate is wired, network issues are listed but
-   never dispatched.
+1. **Network execution is gated.** The removed M1/M2 `git_jsonl` tracker read
+   only the local `issues/issues.jsonl` backlog. Current runtime uses the
+   `x0x_crdt` adapter, so network-sourced issues can be visible, but the
+   orchestrator's execute path is hard-gated on XSY-0020 (ML-DSA-65 signature
+   verification), XSY-0022 (trust level), XSY-0039 (self-enforcing dispatch
+   gate), and ADR-0005 consent policy. Missing approval, verifier errors, or
+   unavailable required sandboxing refuse execution.
 2. **Environment allow-list / deny-list.** Runner and hook environments
    are constructed from empty plus an explicit allow-list; the deny-list
    blocks `*_TOKEN` / `*_KEY` / `*_SECRET` unless overridden. Implemented
@@ -65,10 +64,10 @@ Per-rule controlling issues:
    through a shell, never with issue fields interpolated into argv. The
    operator who commits `WORKFLOW.md` is the trust root, exactly as with
    CI configuration.
-4. **`security-sensitive` label refused.** Any issue carrying the
-   `security-sensitive` label is refused outright by the orchestrator
-   until XSY-0028 lands (Pinned identity + human approval step). There is
-   no partial handling in the interim window.
+4. **Sensitive work uses trust and consent.** Sensitive/network-sourced work is
+   not a label-only bypass. It must satisfy the configured x0xd trust threshold
+   and, under `security.network_dispatch: approve`, a signed payload-bound human
+   or policy approval before execution.
 
 ---
 
@@ -84,25 +83,26 @@ This posture is **not**:
 - **A process boundary.** ML-DSA-65 signatures authenticate tracker metadata;
   they do not isolate the runner process. Process sandboxing is the separate
   `[runner.sandbox]` layer described below.
-- **A network trust anchor.** Signing (XSY-0020, off by default) verifies that
-  claims and handoffs were signed by *this daemon's own* x0xd key only
-  (local-signer-only). Trust in records sourced from network agents arrives at
-  M3 (XSY-0039/0022); no trust-level evaluation is performed before then.
-- **Trust-gated dispatch.** There is no trust-level evaluation before
-  M3. All dispatched work is local and operator-controlled, so the trust
-  gate is not yet exercised.
+- **A substitute for x0xd trust.** ML-DSA-65 signatures authenticate payload
+  provenance; they do not decide whether a signer is allowed to run code.
+  Network dispatch still consults x0xd trust (`required_trust`) and consent
+  policy before execution.
+- **A guarantee that approval alone runs code.** Approval is necessary only in
+  `approve` mode and is never sufficient by itself: signature, trust, payload
+  hash, TTL, consumption, and verifier availability all remain fail-closed
+  checks.
 
-**Network-sourced work is impossible before M3.** The `git_jsonl` tracker
-(XSY-0003) has no network code path; it reads only the local
-operator-controlled repo. At M3 the `x0x_crdt` adapter (XSY-0019)
-introduces network-sourced issues, but dispatch is default-off via
-`security.network_dispatch_enabled: false` and, when explicitly enabled,
-hard-gated on verified signature provenance + trust level (XSY-0039) from
-the moment that path exists.
+**Network-sourced work is visible but fail-closed by default.** The current
+`x0x_crdt` adapter (XSY-0019) can read network-sourced issues from x0xd, but
+dispatch is default-off via `security.network_dispatch: "off"`. In
+`approve` mode, signature provenance + trust must pass before an approval is
+surfaced, and a valid signed approval must be verified before execution. In
+`auto` mode, signer+trust dispatch is allowed only when
+`network_dispatch_auto_ack: true` is deliberately set.
 
 ---
 
-## Sandbox profiles (M2)
+## Sandbox profiles (M2/M4)
 
 The shell runner accepts an optional `[runner.sandbox]` / `runner.sandbox:`
 block. If omitted, behavior is unchanged and local work runs unsandboxed.
@@ -125,23 +125,23 @@ Backend selection:
 
 | Platform | `backend = auto` order | Notes |
 |----------|------------------------|-------|
-| Linux | `srt` → `bwrap` → `landlock-restrict` → `none` | Firejail was deliberately replaced with Bubblewrap. Bubblewrap provides filesystem, PID, and network namespace isolation, but domain-level egress allow-lists require an outer policy engine such as `srt`; when Bubblewrap is the effective backend, egress allow-list entries are advisory metadata rather than DNS firewall rules. |
-| macOS | `srt` → `/usr/bin/sandbox-exec` → `none` | `sandbox-exec` enforces filesystem and coarse network operations from generated SBPL. Domain allow-lists are not DNS-specific. |
+| Linux | `native` (Landlock + cgroup-v2) → `bwrap` → `landlock-restrict` → `none` | Firejail was deliberately replaced with Bubblewrap. The native backend uses the internal `saorsa-sandbox-launcher`; Bubblewrap provides filesystem, PID, and network namespace isolation, but domain-level egress allow-lists require an outer policy engine such as `srt`; when Bubblewrap is the effective backend, egress allow-list entries are advisory metadata rather than DNS firewall rules. |
+| macOS | `srt` → `/usr/bin/sandbox-exec` → `none` | `sandbox-exec` enforces filesystem and coarse network operations from generated SBPL. Domain allow-lists are not DNS-specific; native Seatbelt remains XSY-0057. |
 | Windows | `none` | Tier 1 has no Windows host sandbox; non-local dispatch must fail closed. |
 
 `on_unavailable` controls only local work: `warn` logs and runs the
 unwrapped command, while `fail-closed` refuses to spawn. Network-sourced
 work is always fail-closed regardless of this setting; a resolved
 `backend = none` is not enforceable for `IssueSource::NetworkSourced`.
-This preserves the M2/M3 rule that network dispatch remains default-off
-and, once introduced, cannot use an unavailable sandbox as an escape hatch.
+This preserves the rule that network dispatch remains default-off and cannot
+use an unavailable sandbox as an escape hatch.
 
-Resource limits are Tier-1 best effort. Linux wraps sandboxed commands in
-`systemd-run --user --scope` when CPU or memory limits are configured and
-`systemd-run` is available. macOS uses shell `ulimit` / rlimit inheritance;
-that is a per-process mechanism rather than a cgroup-scoped boundary, so
-forked children are not bounded as strongly as on Linux. Proper native
-resource enforcement is tracked for M4 Tier 2.
+Resource limits depend on the backend. The Linux native backend places the
+launcher/target in a cgroup-v2 leaf when delegation is available; Tier-1 Linux
+wrappers fall back to `systemd-run --user --scope` when possible. macOS uses
+shell `ulimit` / rlimit inheritance; that is a per-process mechanism rather
+than a cgroup-scoped boundary, so forked children are not bounded as strongly as
+on Linux.
 
 Every sandbox exposes a `probe()` self-test that returns a structured
 `ProbeReport` for write-outside-workspace, secret-read, host-PID, and
@@ -154,12 +154,12 @@ always records each check explicitly.
 ## Signed claims and handoffs (XSY-0020)
 
 `signing.policy = required` signs claim and handoff payloads at the async
-Tracker boundary. The sync JSONL helpers still only parse, mutate, and serialize
-records; they never perform HTTP. Required signing uses a prepare → sign → commit
-sequence: build the unsigned payload without writing, call x0xd, re-read and
-re-check ownership/state, then write the signed record once. If the record
-changed during signing, the signature is discarded and no unsigned fallback is
-written.
+Tracker boundary. The removed JSONL adapter never performed HTTP; the current
+x0x CRDT tracker calls x0xd signing/verification through the shared signing
+client. Required signing uses a prepare → sign → commit sequence: build the
+unsigned payload without writing, call x0xd, re-read and re-check
+ownership/state, then write the signed record once. If the record changed
+during signing, the signature is discarded and no unsigned fallback is written.
 
 The stored `signature` envelope contains:
 
@@ -183,13 +183,12 @@ x0xd to verify `DST(context, DST(context, payload))`.
 
 Verification on read checks, in order: envelope algorithm/context, payload
 SHA-256, signer/owner binding, trusted-key belonging, and x0xd's
-`/agent/verify` result. The trusted-key resolver for M2 accepts only the local
-x0xd agent key learned from `/agent/sign` (or a bootstrap sign probe). A record
-is rejected if the envelope public key differs from the resolver's key for the
-signer, even when `/agent/verify` would return true for the supplied key.
-Invalid or unsigned claim/handoff records are dropped from async read results
-with a WARN log in Required mode; Disabled mode skips signing and verification
-for local development.
+`/agent/verify` result. A record is rejected if the envelope public key differs
+from the trusted resolver's key for the signer, even when `/agent/verify` would
+return true for the supplied key. Since XSY-0045, invalid or unsigned **claims**
+are stripped from the issue while the issue remains visible with a verification
+notice; invalid handoffs still cause the issue record to be refused. Disabled
+mode skips signing and verification for local development.
 
 Handoff signatures bind two additive fields into the signed payload:
 `issue_id` and `signer_agent_id`. They are required whenever
@@ -202,20 +201,21 @@ the original signature valid and do not call x0xd.
 
 ---
 
-## Future hardening
+## Hardening milestones
 
-The following issues extend or supersede this posture, in milestone order:
+The following issues extend or supersede the original interim posture:
 
 | Issue | Milestone | What it adds |
 |-------|-----------|--------------|
-| [XSY-0020](../../issues/issues.jsonl) | M2 ✅ landed | ML-DSA-65 signing + verification of claim and handoff payloads (local-signer-only, off by default) |
+| [XSY-0020](../../issues/issues.jsonl) | M2 ✅ landed | ML-DSA-65 signing + verification of claim and handoff payloads |
 | [XSY-0027](../../issues/issues.jsonl) | M2 ✅ landed | Sandbox profiles (Bubblewrap / sandbox-exec) with structured command planning |
-| [XSY-0022](../../issues/issues.jsonl) | M3 | Trust-gated dispatch: rejects non-trusted agents on sensitive tasks |
-| [XSY-0039](../../issues/issues.jsonl) | M3 | Dispatch gate: orchestrator refuses network-sourced issues without verified signature + trust |
-| [XSY-0028](../../issues/issues.jsonl) | M4 | Sensitive-task gates: Pinned identity + human approval step |
+| [XSY-0022](../../issues/issues.jsonl) | M3 ✅ landed | Trust-gated dispatch using x0xd contacts |
+| [XSY-0039](../../issues/issues.jsonl) | M3 ✅ landed | Dispatch gate: orchestrator refuses network-sourced issues without verified signature + trust |
+| [XSY-0048..XSY-0056](../../issues/issues.jsonl) | M4 ✅ landed | Consent-gated dispatch, signed approvals, crypto verification, and None-verifier fail-closed hardening |
+| [XSY-0042](../../issues/issues.jsonl) | M4 ✅ Linux landed | Native Linux sandbox via `saorsa-sandbox`; macOS native split to XSY-0057 |
 
-The four rules above remain as the baseline contract; configured sandbox
-profiles layer additional defense-in-depth on top.
+The baseline rules above remain the contract; configured sandbox profiles layer
+additional defense-in-depth on top.
 
 ## Containment status (per ADR-0006)
 
