@@ -4,8 +4,8 @@
 //! fresh claims owned by this agent are *resumed*, stale ones (heartbeat older
 //! than the claim TTL) are *released* so another worker can pick them up, and
 //! foreign claims are left untouched. Heartbeat timestamps are written by the
-//! tracker adapters in RFC3339 (see `x0x-symphony-tracker-git-jsonl`); an
-//! unparseable timestamp is a hard error rather than an assumption of freshness.
+//! tracker adapters in RFC3339; an unparseable timestamp is a hard error rather
+//! than an assumption of freshness.
 
 use std::{cmp::Ordering, time::Duration as StdDuration};
 

@@ -1,8 +1,11 @@
-//! x0xd-backed signing and verification abstractions for the JSONL tracker.
+//! x0xd-backed signing and verification infrastructure for x0x-symphony.
 //!
-//! The tracker signs at the async trait boundary. Tests inject mock clients and
-//! key resolvers; production uses [`X0xdClient`] to call `/agent/sign` and
+//! Trackers sign at the async trait boundary. Tests inject mock clients and key
+//! resolvers; production uses [`X0xdClient`] to call `/agent/sign` and
 //! `/agent/verify` without linking x0x as a Rust dependency.
+
+#![deny(missing_docs)]
+#![forbid(unsafe_code)]
 
 use std::{env, sync::Mutex};
 

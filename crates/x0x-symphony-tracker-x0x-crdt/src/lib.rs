@@ -31,8 +31,7 @@
 //!   encrypted task-list enforcement. If x0xd hides or forbids the scoped list,
 //!   `fetch_candidates` observes zero visible tasks.
 //!
-//! The crate intentionally is not wired into the daemon binary yet; XSY-0024
-//! switches the active tracker after this adapter is reviewed.
+//! This is the M3 runtime tracker used by `x0x-symphonyd`.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -40,21 +39,23 @@
 pub mod client;
 pub mod mapping;
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use reqwest::StatusCode;
 use thiserror::Error;
-use tokio::sync::Mutex;
 use tracing::warn;
 use x0x_symphony_core::{
     sha256_hex, AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext, ReleaseReason,
     ShardRole, SignatureEnvelope, SymphonyError, Tracker, CLAIM_CONTEXT, HANDOFF_CONTEXT,
     SIGN_ALGORITHM,
 };
-use x0x_symphony_tracker_git_jsonl::signing::{
+use x0x_symphony_signing::{
     SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver, VerifyOutcome,
 };
 
@@ -120,6 +121,13 @@ pub enum TrackerError {
     /// Signing or verification failed.
     #[error("signing error: {0}")]
     Signing(String),
+
+    /// Signature validity is unknown because verification transport failed.
+    #[error("signature verification transport error: {reason}")]
+    VerifyTransport {
+        /// Verification dependency or transport failure.
+        reason: String,
+    },
 }
 
 impl From<TrackerError> for SymphonyError {
@@ -209,6 +217,16 @@ impl SigningRuntime {
             TrackerError::Signing("trusted key resolver is not configured".to_owned())
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct VerifyCacheKey {
+    issue_id: IssueId,
+    context: String,
+    payload_sha256: String,
+    signature_b64: String,
+    public_key_b64: String,
+    signer_agent_id: String,
 }
 
 /// Builder for [`X0xCrdtTracker`].
@@ -324,7 +342,8 @@ pub struct X0xCrdtTracker {
     client: Arc<dyn X0xdApi>,
     signing: SigningRuntime,
     group: Option<String>,
-    resolved_scope: Arc<Mutex<Option<ResourceScope>>>,
+    resolved_scope: Arc<tokio::sync::Mutex<Option<ResourceScope>>>,
+    verify_cache: Arc<Mutex<HashMap<VerifyCacheKey, VerifyOutcome>>>,
 }
 
 impl std::fmt::Debug for X0xCrdtTracker {
@@ -423,7 +442,8 @@ impl X0xCrdtTracker {
             client,
             signing,
             group,
-            resolved_scope: Arc::new(Mutex::new(None)),
+            resolved_scope: Arc::new(tokio::sync::Mutex::new(None)),
+            verify_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -472,7 +492,14 @@ impl X0xCrdtTracker {
         })
     }
 
-    async fn list_issues(&self) -> Result<Vec<Issue>> {
+    /// List all issues visible in the configured x0xd `TaskList`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrackerError`] when x0xd cannot be read, the TaskList/KvStore
+    /// data cannot be mapped, or required signature verification has unknown
+    /// validity because x0xd transport failed.
+    pub async fn list_issues(&self) -> Result<Vec<Issue>> {
         let scope = self.resource_scope().await?;
         let tasks = match self.client.list_tasks(&scope.list_id).await {
             Ok(tasks) => tasks,
@@ -500,7 +527,7 @@ impl X0xCrdtTracker {
                 handoff_blob.as_ref(),
             )?);
         }
-        Ok(self.filter_verified_issues(issues).await)
+        self.filter_verified_issues(issues).await
     }
 
     async fn claim_blob_for_task(&self, task_id: &str) -> Result<Option<ClaimBlob>> {
@@ -637,26 +664,25 @@ impl X0xCrdtTracker {
         Ok(handoff)
     }
 
-    async fn filter_verified_issues(&self, issues: Vec<Issue>) -> Vec<Issue> {
+    async fn filter_verified_issues(&self, issues: Vec<Issue>) -> Result<Vec<Issue>> {
         if self.signing.policy == SigningPolicy::Disabled {
-            return issues;
+            return Ok(issues);
         }
         let mut verified = Vec::with_capacity(issues.len());
         for issue in issues {
-            if self.verify_issue(&issue).await {
-                verified.push(issue);
+            match self.verify_issue_result(&issue).await {
+                Ok(()) => verified.push(issue),
+                Err(TrackerError::VerifyTransport { reason }) => {
+                    return Err(TrackerError::VerifyTransport {
+                        reason: format!("issue {}: {reason}", issue.id),
+                    });
+                }
+                Err(error) => {
+                    warn!(issue_id = %issue.id, error = %error, "dropping issue with invalid signature");
+                }
             }
         }
-        verified
-    }
-
-    async fn verify_issue(&self, issue: &Issue) -> bool {
-        if let Err(error) = self.verify_issue_result(issue).await {
-            warn!(issue_id = %issue.id, error = %error, "dropping issue with invalid signature");
-            false
-        } else {
-            true
-        }
+        Ok(verified)
     }
 
     async fn verify_issue_result(&self, issue: &Issue) -> Result<()> {
@@ -686,7 +712,7 @@ impl X0xCrdtTracker {
             )));
         }
         let payload = claim.signing_payload_bytes().map_err(TrackerError::from)?;
-        self.verify_envelope(envelope, CLAIM_CONTEXT, &payload)
+        self.verify_envelope(&issue.id, envelope, CLAIM_CONTEXT, &payload)
             .await
     }
 
@@ -715,12 +741,13 @@ impl X0xCrdtTracker {
         let payload = handoff
             .signing_payload_bytes()
             .map_err(TrackerError::from)?;
-        self.verify_envelope(envelope, HANDOFF_CONTEXT, &payload)
+        self.verify_envelope(&issue.id, envelope, HANDOFF_CONTEXT, &payload)
             .await
     }
 
     async fn verify_envelope(
         &self,
+        issue_id: &IssueId,
         envelope: &SignatureEnvelope,
         target_context: &str,
         payload: &[u8],
@@ -762,26 +789,59 @@ impl X0xCrdtTracker {
         let signature = BASE64
             .decode(&envelope.signature_b64)
             .map_err(|source| TrackerError::Signing(format!("invalid signature_b64: {source}")))?;
+        let cache_key = VerifyCacheKey {
+            issue_id: issue_id.clone(),
+            context: target_context.to_owned(),
+            payload_sha256: actual_digest,
+            signature_b64: envelope.signature_b64.clone(),
+            public_key_b64: envelope.public_key_b64.clone(),
+            signer_agent_id: envelope.signer_agent_id.clone(),
+        };
+        if let Some(outcome) = self.cached_verify_outcome(&cache_key) {
+            return verify_outcome_to_result(outcome);
+        }
         let outcome = self
             .signing
             .client()?
             .verify(target_context, payload, &signature, &envelope_key)
             .await
             .map_err(signing_error)?;
-        match outcome {
-            VerifyOutcome::Valid => Ok(()),
-            VerifyOutcome::Invalid(reason) => Err(TrackerError::Signing(format!(
-                "x0xd verify rejected signature: {reason}"
-            ))),
-            VerifyOutcome::TransportError(reason) => Err(TrackerError::Signing(format!(
-                "x0xd verify transport error (validity unknown): {reason}"
-            ))),
+        if !matches!(outcome, VerifyOutcome::TransportError(_)) {
+            self.cache_verify_outcome(cache_key, outcome.clone());
         }
+        verify_outcome_to_result(outcome)
+    }
+
+    fn cached_verify_outcome(&self, key: &VerifyCacheKey) -> Option<VerifyOutcome> {
+        let cache = self.verify_cache.lock().ok()?;
+        cache.get(key).cloned()
+    }
+
+    fn cache_verify_outcome(&self, key: VerifyCacheKey, outcome: VerifyOutcome) {
+        if let Ok(mut cache) = self.verify_cache.lock() {
+            cache.insert(key, outcome);
+        }
+    }
+}
+
+fn verify_outcome_to_result(outcome: VerifyOutcome) -> Result<()> {
+    match outcome {
+        VerifyOutcome::Valid => Ok(()),
+        VerifyOutcome::Invalid(reason) => Err(TrackerError::Signing(format!(
+            "x0xd verify rejected signature: {reason}"
+        ))),
+        VerifyOutcome::TransportError(reason) => Err(TrackerError::VerifyTransport { reason }),
     }
 }
 
 #[async_trait]
 impl Tracker for X0xCrdtTracker {
+    async fn list_issues(&self) -> x0x_symphony_core::Result<Vec<Issue>> {
+        X0xCrdtTracker::list_issues(self)
+            .await
+            .map_err(SymphonyError::from)
+    }
+
     async fn fetch_candidates(&self, ctx: &PollContext) -> x0x_symphony_core::Result<Vec<Issue>> {
         let issues = self.list_issues().await.map_err(SymphonyError::from)?;
         let terminal_states: BTreeSet<IssueState> = ctx.terminal_states.iter().cloned().collect();
@@ -1562,6 +1622,95 @@ mod tests {
         assert_eq!(fetched[0].state, IssueState::new("blocked")?);
         assert!(fetched[0].claim.is_none());
         assert!(fetched[0].extra.contains_key("blocked_reason"));
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct MockSigning {
+        verify_outcome: VerifyOutcome,
+        public_key: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl SigningClient for MockSigning {
+        async fn sign(
+            &self,
+            _context: &str,
+            _payload: &[u8],
+        ) -> x0x_symphony_signing::Result<SignResponse> {
+            Err(x0x_symphony_signing::SigningError::InvalidResponse(
+                "mock signer does not sign".to_owned(),
+            ))
+        }
+
+        async fn verify(
+            &self,
+            _context: &str,
+            _payload: &[u8],
+            _signature: &[u8],
+            _public_key: &[u8],
+        ) -> x0x_symphony_signing::Result<VerifyOutcome> {
+            Ok(self.verify_outcome.clone())
+        }
+
+        async fn agent_identity(
+            &self,
+        ) -> x0x_symphony_signing::Result<x0x_symphony_signing::AgentInfo> {
+            Ok(x0x_symphony_signing::AgentInfo {
+                agent_id: AGENT_A.to_owned(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl TrustedKeyResolver for MockSigning {
+        async fn resolve(&self, _agent_id: &str) -> x0x_symphony_signing::Result<Vec<u8>> {
+            Ok(self.public_key.clone())
+        }
+    }
+
+    fn signed_claim_for(task_id: &str, agent: &str, public_key: &[u8]) -> TestResult<Claim> {
+        let mut claim = claim_for(task_id, agent)?;
+        let payload = claim.signing_payload_bytes()?;
+        claim.signature = Some(SignatureEnvelope::new(
+            SIGN_ALGORITHM,
+            CLAIM_CONTEXT,
+            BASE64.encode(public_key),
+            BASE64.encode(b"signature"),
+            sha256_hex(&payload),
+            agent,
+        ));
+        Ok(claim)
+    }
+
+    #[tokio::test]
+    async fn verify_transport_error_surfaces_from_required_signing() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "signed", "claimed:agent-a", 3)]).await;
+        let public_key = b"trusted-key".to_vec();
+        let claim = signed_claim_for(ISSUE_A, AGENT_A, &public_key)?;
+        api.seed_claim(ISSUE_A, claim).await?;
+        let signing = Arc::new(MockSigning {
+            verify_outcome: VerifyOutcome::TransportError("x0xd unavailable".to_owned()),
+            public_key,
+        });
+        let signing_client: Arc<dyn SigningClient> = signing.clone();
+        let resolver: Arc<dyn TrustedKeyResolver> = signing;
+        let tracker = X0xCrdtTracker::builder("mock://x0xd", "list-a", AgentId::new(AGENT_A)?)
+            .client(api)
+            .required_signing(signing_client, resolver)
+            .build()?;
+
+        let result = tracker.fetch_by_ids(&[IssueId::new(ISSUE_A)?]).await;
+        let Err(error) = result else {
+            return Err(std::io::Error::other("verify transport failure must surface").into());
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("signature verification transport error"),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 }

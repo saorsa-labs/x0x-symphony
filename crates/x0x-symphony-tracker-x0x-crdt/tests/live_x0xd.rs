@@ -7,7 +7,7 @@ use std::{
 };
 
 use x0x_symphony_core::{AgentId, Handoff, IssueId, IssueState, PollContext, Tracker};
-use x0x_symphony_tracker_git_jsonl::signing::{SigningClient, X0xdClient as SigningX0xdClient};
+use x0x_symphony_signing::{SigningClient, X0xdClient as SigningX0xdClient};
 use x0x_symphony_tracker_x0x_crdt::{
     client::{AddTaskDraft, X0xdApi, X0xdClient},
     mapping::store_id_for_list,

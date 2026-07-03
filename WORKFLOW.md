@@ -5,8 +5,8 @@
 # WORKFLOW.md when developing x0x-symphony, the same way it reads x0x's
 # WORKFLOW.md when developing x0x.
 tracker:
-  kind: git_issues
-  path: issues/issues.jsonl
+  kind: x0x_crdt
+  list_id: x0x-symphony
   project_slug: x0x-symphony
   active_states:
     - todo
@@ -27,11 +27,10 @@ tracker:
   # MLS keys itself.
   # group: x0x-symphony-private
 
-# SHARDING (M2 STATIC PLACEHOLDER): this optional static worker roster exists
-# only so `x0x-symphony issue new` can freeze shard.primary/backups at issue
-# creation. M4 replaces it with live x0x presence-based trusted-worker
-# discovery. Do not treat this list as dynamic membership; existing shard
-# fields are immutable after creation.
+# SHARDING (M2 STATIC PLACEHOLDER): retained only for historical records and
+# tests that construct sharded issues directly. M4 replaces static worker
+# discovery with live x0x presence. Do not treat this list as dynamic
+# membership; existing shard fields are immutable after creation.
 # sharding:
 #   workers:
 #     - agent-a

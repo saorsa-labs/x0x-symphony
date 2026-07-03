@@ -1,11 +1,14 @@
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
+use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde_json::Value;
 use tokio::{net::TcpListener, task::JoinHandle};
 use x0x_symphony_bin::api::{build_router, AppState};
-use x0x_symphony_core::{AgentId, Issue, IssueId, IssueState};
-use x0x_symphony_tracker_git_jsonl::serialize_issue;
+use x0x_symphony_core::{
+    AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext, ReleaseReason,
+    Result as CoreResult, Tracker,
+};
 
 struct TestServer {
     base_url: String,
@@ -18,12 +21,51 @@ impl Drop for TestServer {
     }
 }
 
+#[derive(Clone)]
+struct StaticTracker {
+    issues: Vec<Issue>,
+}
+
+#[async_trait]
+impl Tracker for StaticTracker {
+    async fn list_issues(&self) -> CoreResult<Vec<Issue>> {
+        Ok(self.issues.clone())
+    }
+
+    async fn fetch_candidates(&self, _ctx: &PollContext) -> CoreResult<Vec<Issue>> {
+        Ok(self.issues.clone())
+    }
+
+    async fn fetch_by_ids(&self, ids: &[IssueId]) -> CoreResult<Vec<Issue>> {
+        Ok(self
+            .issues
+            .iter()
+            .filter(|issue| ids.iter().any(|id| id == &issue.id))
+            .cloned()
+            .collect())
+    }
+
+    async fn claim(&self, _id: &IssueId, _agent_id: &AgentId) -> CoreResult<Claim> {
+        Err(x0x_symphony_core::SymphonyError::Tracker(
+            "static tracker cannot claim".to_owned(),
+        ))
+    }
+
+    async fn heartbeat(&self, _claim: &Claim) -> CoreResult<()> {
+        Ok(())
+    }
+
+    async fn release(&self, _claim: &Claim, _reason: ReleaseReason) -> CoreResult<()> {
+        Ok(())
+    }
+
+    async fn handoff(&self, _claim: &Claim, _handoff: Handoff) -> CoreResult<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn symphony_routes_require_bearer_token() -> Result<(), Box<dyn Error>> {
-    let dir = tempfile::tempdir()?;
-    let issues_dir = dir.path().join("issues");
-    std::fs::create_dir_all(&issues_dir)?;
-    let issues_path = issues_dir.join("issues.jsonl");
     let issue = Issue::new(
         IssueId::new("XSY-0001")?,
         "XSY-0001",
@@ -31,10 +73,12 @@ async fn symphony_routes_require_bearer_token() -> Result<(), Box<dyn Error>> {
         IssueState::new("todo")?,
         "2026-07-02T00:00:00Z",
     )?;
-    std::fs::write(&issues_path, format!("{}\n", serialize_issue(&issue)?))?;
 
+    let tracker: Arc<dyn Tracker> = Arc::new(StaticTracker {
+        issues: vec![issue],
+    });
     let state = AppState::new(
-        issues_path,
+        tracker,
         AgentId::new("symphonyd")?,
         "secret-token".to_owned(),
         None,

@@ -27,7 +27,6 @@ use tokio::{
     time::{self, Duration},
 };
 use x0x_symphony_core::{AgentId, Claim, Handoff, Issue, IssueId, Tracker};
-use x0x_symphony_tracker_git_jsonl::{parse_issue_line, JsonlTracker};
 
 const AUTH_ERROR: &str = "missing or invalid Authorization: Bearer token";
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -41,7 +40,7 @@ impl<T> OrchestratorHandle for T where T: Send + Sync {}
 /// Shared Axum application state.
 #[derive(Clone)]
 pub struct AppState {
-    tracker_path: PathBuf,
+    tracker: Arc<dyn Tracker>,
     proofs_dir: PathBuf,
     agent_id: AgentId,
     orchestrator: Option<Arc<dyn OrchestratorHandle>>,
@@ -170,9 +169,6 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    /// JSONL parsing failed.
-    #[error("issue database parse error: {0}")]
-    IssueParse(String),
     /// A core tracker operation failed.
     #[error("tracker error: {0}")]
     Tracker(String),
@@ -211,16 +207,15 @@ impl AppState {
     /// Construct application state for the daemon API.
     #[must_use]
     pub fn new(
-        tracker_path: PathBuf,
+        tracker: Arc<dyn Tracker>,
         agent_id: AgentId,
         api_token: String,
         orchestrator: Option<Arc<dyn OrchestratorHandle>>,
     ) -> Self {
-        let proofs_dir = repo_root_from_issues_path(&tracker_path).join("proofs");
         let (events_tx, _events_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
-            tracker_path,
-            proofs_dir,
+            tracker,
+            proofs_dir: PathBuf::from("proofs"),
             agent_id,
             orchestrator,
             api_token,
@@ -233,13 +228,6 @@ impl AppState {
     pub fn with_proofs_dir(mut self, proofs_dir: PathBuf) -> Self {
         self.proofs_dir = proofs_dir;
         self
-    }
-
-    fn tracker(&self) -> JsonlTracker {
-        let repo_root = repo_root_from_issues_path(&self.tracker_path);
-        JsonlTracker::builder(repo_root)
-            .issues_path(self.tracker_path.clone())
-            .build()
     }
 
     fn proofs_root(&self) -> PathBuf {
@@ -326,8 +314,11 @@ async fn tasks(
     State(state): State<AppState>,
     Query(query): Query<TasksQuery>,
 ) -> Result<Json<Vec<Task>>, Error> {
-    let mut tasks = issues_from_path(&state.tracker_path)
-        .await?
+    let mut tasks = state
+        .tracker
+        .list_issues()
+        .await
+        .map_err(|error| Error::Tracker(error.to_string()))?
         .into_iter()
         .filter(|issue| {
             query
@@ -342,7 +333,11 @@ async fn tasks(
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, Error> {
-    let issues = issues_from_path(&state.tracker_path).await?;
+    let issues = state
+        .tracker
+        .list_issues()
+        .await
+        .map_err(|error| Error::Tracker(error.to_string()))?;
     Ok(Json(status_from_issues(&state, &issues)))
 }
 
@@ -375,7 +370,7 @@ async fn claim_issue(
     let issue_id =
         IssueId::new(id.clone()).map_err(|error| Error::BadRequest(error.to_string()))?;
     let claim = state
-        .tracker()
+        .tracker
         .claim(&issue_id, &state.agent_id)
         .await
         .map_err(|error| Error::Tracker(error.to_string()))?;
@@ -398,8 +393,8 @@ async fn handoff_issue(
     }
     let issue_id =
         IssueId::new(id.clone()).map_err(|error| Error::BadRequest(error.to_string()))?;
-    let tracker = state.tracker();
-    let issues = tracker
+    let issues = state
+        .tracker
         .fetch_by_ids(std::slice::from_ref(&issue_id))
         .await
         .map_err(|error| Error::Tracker(error.to_string()))?;
@@ -414,7 +409,8 @@ async fn handoff_issue(
     if let Some(file) = request.file {
         handoff = handoff.with_file(file);
     }
-    tracker
+    state
+        .tracker
         .handoff(&claim, handoff)
         .await
         .map_err(|error| Error::Tracker(error.to_string()))?;
@@ -480,9 +476,7 @@ impl IntoResponse for Error {
             Self::BadRequest(_) | Self::InvalidBind { .. } | Self::NonLoopbackBind(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Self::Io { .. } | Self::IssueParse(_) | Self::Tracker(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Io { .. } | Self::Tracker(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = Json(json!({ "error": self.to_string() }));
         (status, body).into_response()
@@ -508,27 +502,6 @@ fn query_token_matches(request: &Request<axum::body::Body>, target: &str) -> boo
             .filter_map(|pair| pair.strip_prefix("token="))
             .any(|token| token == target)
     })
-}
-
-async fn issues_from_path(path: &Path) -> Result<Vec<Issue>, Error> {
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let mut issues = Vec::new();
-    for (index, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let line_number = index.saturating_add(1);
-        let issue = parse_issue_line(line_number, line)
-            .map_err(|error| Error::IssueParse(error.to_string()))?;
-        issues.push(issue);
-    }
-    issues.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(issues)
 }
 
 fn task_from_issue(issue: Issue) -> Task {
@@ -590,18 +563,6 @@ fn route_infos() -> Vec<RouteInfo> {
         path: path.to_owned(),
     })
     .collect()
-}
-
-fn repo_root_from_issues_path(path: &Path) -> PathBuf {
-    let Some(parent) = path.parent() else {
-        return PathBuf::from(".");
-    };
-    if parent.file_name().and_then(|name| name.to_str()) == Some("issues") {
-        if let Some(root) = parent.parent() {
-            return root.to_path_buf();
-        }
-    }
-    parent.to_path_buf()
 }
 
 fn safe_proof_path(root: &Path, name: &str) -> Result<PathBuf, Error> {

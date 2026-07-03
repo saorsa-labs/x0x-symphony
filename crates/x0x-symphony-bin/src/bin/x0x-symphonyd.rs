@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use clap::Parser;
@@ -8,10 +11,8 @@ use x0x_symphony_bin::{api, auth, config};
 use x0x_symphony_core::AgentId;
 use x0x_symphony_orchestrator::{Orchestrator, SystemClock, TrustClient, X0xdTrustClient};
 use x0x_symphony_runner_shell::{RunnerSpec, ShellRunner};
-use x0x_symphony_tracker_git_jsonl::{
-    signing::{SigningClient, SigningPolicy, TrustedKeyResolver, X0xdClient},
-    JsonlTracker,
-};
+use x0x_symphony_signing::{SigningClient, SigningPolicy, TrustedKeyResolver, X0xdClient};
+use x0x_symphony_tracker_x0x_crdt::X0xCrdtTracker;
 use x0x_symphony_workspace::{Config as WorkspaceConfig, Manager};
 
 #[derive(Debug, Parser)]
@@ -39,10 +40,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let bind_addr = api::validate_loopback_bind(&args.bind)?;
     let data_dir = config::expand_tilde_path(&args.data_dir, "data-dir")?;
     let workflow = config::WorkflowConfig::load(&args.config)?;
-    let tracker_paths = workflow.tracker_paths(&args.config)?;
-    let proofs_dir = tracker_paths.repo_root.join("proofs");
+    let workflow_root = workflow_root(&args.config);
+    let proofs_dir = workflow_root.join("proofs");
+    if args.agent_id != "symphonyd" {
+        info!(
+            requested_agent_id = %args.agent_id,
+            "--agent-id is ignored by the M3 x0x_crdt tracker; using x0xd /agent identity"
+        );
+    }
     let api_token = auth::load_or_generate_api_token(&data_dir).await?;
-    let (tracker, agent_id) = build_tracker(&workflow, &tracker_paths, &args).await?;
+    let (tracker, agent_id) = build_tracker(&workflow).await?;
     let runner_spec = RunnerSpec::from_workflow_config(&workflow.definition.config)
         .context("runner configuration did not resolve")?;
     let runner = Arc::new(ShellRunner::new(runner_spec).context("failed to build shell runner")?);
@@ -58,7 +65,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             .context("failed to configure x0xd trust client")?,
     );
     let orchestrator = Arc::new(Orchestrator::new_with_trust_client(
-        tracker,
+        tracker.clone(),
         runner,
         workspace,
         Arc::new(SystemClock),
@@ -79,13 +86,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
 
     let orchestrator_handle: Arc<dyn api::OrchestratorHandle> = orchestrator.clone();
-    let app_state = api::AppState::new(
-        tracker_paths.issues_path.clone(),
-        agent_id,
-        api_token,
-        Some(orchestrator_handle),
-    )
-    .with_proofs_dir(proofs_dir);
+    let api_tracker: Arc<dyn x0x_symphony_core::Tracker> = tracker.clone();
+    let app_state = api::AppState::new(api_tracker, agent_id, api_token, Some(orchestrator_handle))
+        .with_proofs_dir(proofs_dir);
     let app = api::build_router(app_state);
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -98,7 +101,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     info!(
         bind = %actual_addr,
         port_file = %port_file.display(),
-        tracker = %tracker_paths.issues_path.display(),
+        tracker_kind = %workflow.tracker.kind,
+        task_list = %workflow.tracker.list_id,
+        x0xd_url = %workflow.signing.x0xd_url,
         "x0x-symphonyd started"
     );
 
@@ -121,40 +126,42 @@ async fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Construct the JSONL tracker with optional required-signing, returning the
-/// resolved agent identity (from x0xd when signing is required, from CLI otherwise).
+/// Construct the x0x CRDT tracker, returning the x0xd-resolved agent identity.
 async fn build_tracker(
     workflow: &config::WorkflowConfig,
-    tracker_paths: &config::TrackerPaths,
-    args: &Args,
-) -> anyhow::Result<(Arc<JsonlTracker>, AgentId)> {
-    let signing_client = if workflow.signing.policy == SigningPolicy::Required {
-        Some(Arc::new(
-            X0xdClient::new(&workflow.signing.x0xd_url)
-                .context("failed to configure x0xd signing client")?,
-        ))
-    } else {
-        None
-    };
-    let agent_id = if let Some(client) = signing_client.as_ref() {
-        let identity = client
-            .agent_identity()
-            .await
-            .context("failed to read x0xd agent identity for required signing")?;
-        AgentId::new(identity.agent_id)?
-    } else {
-        AgentId::new(args.agent_id.clone())?
-    };
-    let mut tracker_builder = JsonlTracker::builder(tracker_paths.repo_root.clone())
-        .issues_path(tracker_paths.issues_path.clone())
-        .shard_workers(workflow.sharding.workers.clone())
-        .shard_replication_factor(workflow.sharding.replication_factor);
-    if let Some(client) = signing_client {
-        let signing: Arc<dyn SigningClient> = client.clone();
-        let resolver: Arc<dyn TrustedKeyResolver> = client;
+) -> anyhow::Result<(Arc<X0xCrdtTracker>, AgentId)> {
+    let signing_client = Arc::new(
+        X0xdClient::new(&workflow.signing.x0xd_url)
+            .context("failed to configure x0xd signing client")?,
+    );
+    let identity = signing_client
+        .agent_identity()
+        .await
+        .context("failed to read x0xd agent identity")?;
+    let agent_id = AgentId::new(identity.agent_id)?;
+    let mut tracker_builder = X0xCrdtTracker::builder(
+        &workflow.signing.x0xd_url,
+        &workflow.tracker.list_id,
+        agent_id.clone(),
+    );
+    if let Some(group) = &workflow.tracker.group {
+        tracker_builder = tracker_builder.group(group.clone());
+    }
+    if workflow.signing.policy == SigningPolicy::Required {
+        let signing: Arc<dyn SigningClient> = signing_client.clone();
+        let resolver: Arc<dyn TrustedKeyResolver> = signing_client;
         tracker_builder = tracker_builder.required_signing(signing, resolver);
     }
-    Ok((Arc::new(tracker_builder.build()), agent_id))
+    let tracker = tracker_builder
+        .build()
+        .context("failed to configure x0x CRDT tracker")?;
+    Ok((Arc::new(tracker), agent_id))
+}
+
+fn workflow_root(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 fn init_tracing() {
