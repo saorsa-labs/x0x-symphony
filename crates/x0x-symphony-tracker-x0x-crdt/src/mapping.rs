@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use x0x_symphony_core::{Claim, Handoff, Issue, IssueId, IssueState, ReleaseReason, SymphonyError};
+use x0x_symphony_core::{
+    Claim, Handoff, Issue, IssueId, IssueSource, IssueState, ReleaseReason, SymphonyError,
+};
 
 use crate::client::{AddTaskDraft, TaskEntry};
 
@@ -354,6 +356,10 @@ fn extra_for_task(
     extra.insert(
         "x0x_task_state".to_owned(),
         Value::String(task.state.clone()),
+    );
+    extra.insert(
+        "issue_source".to_owned(),
+        Value::String(IssueSource::NetworkSourced.as_str().to_owned()),
     );
     if let Some(reason) = claim_blob.and_then(|blob| {
         (blob.status == ClaimBlobStatus::Blocked)

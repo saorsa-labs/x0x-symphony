@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use x0x_symphony_bin::{api, auth, config};
 use x0x_symphony_core::AgentId;
-use x0x_symphony_orchestrator::{Orchestrator, SystemClock};
+use x0x_symphony_orchestrator::{Orchestrator, SystemClock, TrustClient, X0xdTrustClient};
 use x0x_symphony_runner_shell::{RunnerSpec, ShellRunner};
 use x0x_symphony_tracker_git_jsonl::{
     signing::{SigningClient, SigningPolicy, TrustedKeyResolver, X0xdClient},
@@ -53,12 +53,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let orchestrator_config = workflow
         .to_orchestrator_config(agent_id.clone())?
         .with_proofs_dir(proofs_dir.clone());
-    let orchestrator = Arc::new(Orchestrator::new(
+    let trust_client: Arc<dyn TrustClient> = Arc::new(
+        X0xdTrustClient::new(&workflow.signing.x0xd_url)
+            .context("failed to configure x0xd trust client")?,
+    );
+    let orchestrator = Arc::new(Orchestrator::new_with_trust_client(
         tracker,
         runner,
         workspace,
         Arc::new(SystemClock),
         orchestrator_config,
+        trust_client,
     ));
 
     let _ = orchestrator.reconcile().await;

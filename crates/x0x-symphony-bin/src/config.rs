@@ -12,7 +12,7 @@ use thiserror::Error;
 use x0x_symphony_core::{
     shard, AgentId, IssueState, LifecycleHooks, SymphonyError, WorkflowDefinition,
 };
-use x0x_symphony_orchestrator::{Config as OrchestratorConfig, RetryPolicy};
+use x0x_symphony_orchestrator::{Config as OrchestratorConfig, RetryPolicy, TrustLevel};
 use x0x_symphony_runner_shell::RunnerSpec;
 use x0x_symphony_tracker_git_jsonl::signing::SigningPolicy;
 
@@ -82,6 +82,8 @@ pub struct WorkflowConfig {
     pub validation: Vec<String>,
     /// Agent and orchestrator settings.
     pub agent: AgentConfig,
+    /// Security policy for dispatch gates.
+    pub security: SecurityConfig,
     /// Signing settings for claim and handoff payloads.
     pub signing: SigningConfig,
     /// Static M2 sharding placeholder settings.
@@ -157,6 +159,13 @@ pub struct AgentConfig {
     pub max_turns: u32,
     /// Maximum retry backoff in milliseconds.
     pub max_retry_backoff_ms: u64,
+}
+
+/// Security configuration parsed from the optional `security:` block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecurityConfig {
+    /// Minimum trust level for security-sensitive network-sourced issues.
+    pub required_trust: TrustLevel,
 }
 
 /// Signing configuration parsed from the optional `signing:` block.
@@ -236,6 +245,7 @@ impl WorkflowConfig {
         let hooks = parse_hooks(root, &mut problems);
         let validation = parse_validation(root, &mut problems);
         let agent = parse_agent(root, &mut problems);
+        let security = parse_security(root, &mut problems);
         let signing = parse_signing(root, &mut problems);
         let sharding = parse_sharding(root, &mut problems);
         let runner = parse_runner(root, &raw, &mut problems);
@@ -259,6 +269,7 @@ impl WorkflowConfig {
             hooks: hooks.ok_or_else(internal_validation_gap)?,
             validation: validation.ok_or_else(internal_validation_gap)?,
             agent: agent.ok_or_else(internal_validation_gap)?,
+            security: security.ok_or_else(internal_validation_gap)?,
             signing: signing.ok_or_else(internal_validation_gap)?,
             sharding: sharding.ok_or_else(internal_validation_gap)?,
             runner: runner.ok_or_else(internal_validation_gap)?,
@@ -321,6 +332,7 @@ impl WorkflowConfig {
             .retry(retry)
             .hooks(self.hooks.to_lifecycle_hooks())
             .validation_commands(self.validation.clone())
+            .required_trust(self.security.required_trust)
             .build())
     }
 }
@@ -432,6 +444,29 @@ fn parse_agent(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<
         max_turns,
         max_retry_backoff_ms,
     })
+}
+
+fn parse_security(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<SecurityConfig> {
+    let Some(value) = root.get("security") else {
+        return Some(SecurityConfig {
+            required_trust: TrustLevel::Trusted,
+        });
+    };
+    let Some(security) = value.as_object() else {
+        problems.push("security must be a mapping".to_owned());
+        return None;
+    };
+    let required_trust = match optional_string(security, "security.required_trust", problems) {
+        Some(raw) => match raw.parse::<TrustLevel>() {
+            Ok(level) => level,
+            Err(error) => {
+                problems.push(format!("security.required_trust {error}"));
+                return None;
+            }
+        },
+        None => TrustLevel::Trusted,
+    };
+    Some(SecurityConfig { required_trust })
 }
 
 fn parse_signing(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<SigningConfig> {

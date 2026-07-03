@@ -12,15 +12,18 @@
 
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 
+use serde_json::Value;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tracing::warn;
 use x0x_symphony_core::{
-    Claim, Handoff, HookEnv, HookName, HookOutcome, HookStatus, Issue, IssueId, Prompt,
-    ReleaseReason, ReleaseReasonCode, Runner, SessionContext, Tracker, TurnStatus,
+    Claim, Handoff, HookEnv, HookName, HookOutcome, HookStatus, Issue, IssueId, IssueSource,
+    Prompt, ReleaseReason, ReleaseReasonCode, Runner, SessionContext, Tracker, TurnStatus,
     ValidationResult, ValidationStatus, Workspace, WorkspaceHandle,
 };
+
+use crate::TrustLevel;
 
 use crate::{
     clock::Clock,
@@ -419,6 +422,29 @@ fn issue_extra_string_list(issue: &Issue, key: &str) -> Vec<String> {
         .collect()
 }
 
+fn issue_is_security_sensitive(issue: &Issue) -> bool {
+    issue
+        .labels
+        .iter()
+        .any(|label| label.trim().to_ascii_lowercase().replace('_', "-") == "security-sensitive")
+}
+
+fn issue_signer_agent_id(issue: &Issue) -> Option<&str> {
+    ["signer_agent_id", "x0x_signer_agent_id"]
+        .iter()
+        .filter_map(|key| issue.extra.get(*key))
+        .filter_map(Value::as_str)
+        .chain(
+            ["signature", "verified_signature", "x0x_signature"]
+                .iter()
+                .filter_map(|key| issue.extra.get(*key))
+                .filter_map(|value| value.get("signer_agent_id"))
+                .filter_map(Value::as_str),
+        )
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
 fn follow_ups_from_summary(summary: Option<&str>) -> Vec<String> {
     let Some(summary) = summary else {
         return Vec::new();
@@ -478,11 +504,13 @@ where
         // Guard: owns the budget slot + heartbeat task; releases on EVERY exit.
         let mut guard = HeldClaim::new(self, &claim);
         let issue = self.fetch_claim_issue(&claim).await?;
-        guard.spawn_heartbeat(
-            Arc::clone(&self.tracker),
-            claim.clone(),
-            self.issue_heartbeat_interval(&issue),
-        );
+        if self
+            .block_if_trust_rejected(&mut guard, &claim, &issue)
+            .await?
+        {
+            return Ok(Resolution::Blocked);
+        }
+        self.spawn_claim_heartbeat(&mut guard, &claim, &issue);
         let mut proof = ProofRun::start(
             &self.config.proofs_dir,
             &issue,
@@ -576,6 +604,84 @@ where
                 }
             }
         }
+    }
+
+    fn spawn_claim_heartbeat(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        issue: &Issue,
+    ) {
+        guard.spawn_heartbeat(
+            Arc::clone(&self.tracker),
+            claim.clone(),
+            self.issue_heartbeat_interval(issue),
+        );
+    }
+
+    async fn block_if_trust_rejected(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        issue: &Issue,
+    ) -> Result<bool> {
+        if IssueSource::from_issue(issue) == IssueSource::Local {
+            return Ok(false);
+        }
+
+        let sensitive = issue_is_security_sensitive(issue);
+        let Some(signer) = issue_signer_agent_id(issue) else {
+            if sensitive {
+                self.block_for_insufficient_trust(
+                    guard,
+                    claim,
+                    "network-sourced security-sensitive issue has no signer_agent_id".to_owned(),
+                )
+                .await?;
+                return Ok(true);
+            }
+            return Ok(false);
+        };
+
+        let trust_level = self.trust_client.trust_level(signer).await?;
+        if trust_level == TrustLevel::Blocked {
+            self.block_for_insufficient_trust(
+                guard,
+                claim,
+                format!("network-sourced issue signer {signer} is blocked in x0xd contacts"),
+            )
+            .await?;
+            return Ok(true);
+        }
+        if sensitive && trust_level < self.config.required_trust {
+            self.block_for_insufficient_trust(
+                guard,
+                claim,
+                format!(
+                    "network-sourced security-sensitive issue signer {signer} has trust {trust_level}; required {}",
+                    self.config.required_trust
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn block_for_insufficient_trust(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        detail: String,
+    ) -> Result<()> {
+        guard.cancel_heartbeat();
+        self.tracker
+            .block(
+                claim,
+                ReleaseReason::new(ReleaseReasonCode::InsufficientTrust, detail),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn build_success_handoff(

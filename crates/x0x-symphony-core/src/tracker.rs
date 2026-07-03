@@ -88,6 +88,8 @@ pub enum ReleaseReasonCode {
     Conflict,
     /// Retry budget was exhausted; the orchestrator moved the issue to `blocked`.
     RetryExhausted,
+    /// The dispatch trust gate rejected the issue signer.
+    InsufficientTrust,
     /// Graceful shutdown released the claim before completion.
     Shutdown,
     /// Other structured reason.
@@ -112,6 +114,7 @@ impl ReleaseReasonCode {
             Self::ExpiredHeartbeat => "expired_heartbeat",
             Self::Conflict => "conflict",
             Self::RetryExhausted => "retry_exhausted",
+            Self::InsufficientTrust => "insufficient_trust",
             Self::Shutdown => "shutdown",
             Self::Other => "other",
         }

@@ -2145,6 +2145,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

@@ -26,6 +26,7 @@ pub mod orphans;
 mod proofs;
 pub mod reconcile;
 pub mod retry;
+pub mod trust_gate;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use concurrency::Budget;
@@ -34,6 +35,7 @@ pub use error::{Error, Result};
 pub use orphans::{OrphanSweepSummary, QuarantinedOrphan, RefusedOrphan};
 pub use reconcile::{classify, is_fresh_self, parse_heartbeat, ClaimStance, ReconcileSummary};
 pub use retry::RetryPolicy;
+pub use trust_gate::{TrustClient, TrustLevel, X0xdTrustClient};
 
 use std::{
     collections::BTreeMap,
@@ -50,6 +52,8 @@ use x0x_symphony_core::{
     AgentId, Claim, Issue, IssueId, IssueState, LifecycleHooks, PollContext, ReleaseReason,
     ReleaseReasonCode, Runner, ShardRole, Tracker, Workspace,
 };
+
+use crate::trust_gate::UnknownTrustClient;
 
 use crate::concurrency::Budget as BudgetImpl;
 
@@ -72,6 +76,7 @@ pub struct Orchestrator<T, R, W> {
     runner: Arc<R>,
     workspace: Arc<W>,
     clock: Arc<dyn Clock>,
+    trust_client: Arc<dyn TrustClient>,
     config: Config,
     state: Mutex<State>,
     shutdown_notify: Notify,
@@ -103,6 +108,8 @@ pub struct Config {
     pub validation_commands: Vec<String>,
     /// Claim heartbeat TTL; a claim older than this is stale.
     pub claim_ttl: chrono::Duration,
+    /// Minimum trust level required for security-sensitive network-sourced issues.
+    pub required_trust: TrustLevel,
     /// Maximum time to wait for in-flight runs to release on shutdown.
     pub shutdown_grace: Duration,
 }
@@ -126,6 +133,7 @@ impl Config {
             proofs_dir: PathBuf::from("proofs"),
             validation_commands: Vec::new(),
             claim_ttl: chrono::Duration::minutes(30),
+            required_trust: TrustLevel::Trusted,
             shutdown_grace: Duration::from_mins(1),
         }
     }
@@ -163,6 +171,7 @@ pub struct ConfigBuilder {
     proofs_dir: PathBuf,
     validation_commands: Vec<String>,
     claim_ttl: chrono::Duration,
+    required_trust: TrustLevel,
     shutdown_grace: Duration,
 }
 
@@ -231,6 +240,12 @@ impl ConfigBuilder {
         self.claim_ttl = ttl;
         self
     }
+    /// Override the required trust threshold for sensitive network issues.
+    #[must_use]
+    pub fn required_trust(mut self, required_trust: TrustLevel) -> Self {
+        self.required_trust = required_trust;
+        self
+    }
     /// Override the shutdown grace period.
     #[must_use]
     pub fn shutdown_grace(mut self, grace: Duration) -> Self {
@@ -252,6 +267,7 @@ impl ConfigBuilder {
             proofs_dir: self.proofs_dir,
             validation_commands: self.validation_commands,
             claim_ttl: self.claim_ttl,
+            required_trust: self.required_trust,
             shutdown_grace: self.shutdown_grace,
         }
     }
@@ -267,6 +283,26 @@ impl<T, R, W> Orchestrator<T, R, W> {
         clock: Arc<dyn Clock>,
         config: Config,
     ) -> Self {
+        Self::new_with_trust_client(
+            tracker,
+            runner,
+            workspace,
+            clock,
+            config,
+            Arc::new(UnknownTrustClient),
+        )
+    }
+
+    /// Construct an orchestrator with an explicit trust client.
+    #[must_use]
+    pub fn new_with_trust_client(
+        tracker: Arc<T>,
+        runner: Arc<R>,
+        workspace: Arc<W>,
+        clock: Arc<dyn Clock>,
+        config: Config,
+        trust_client: Arc<dyn TrustClient>,
+    ) -> Self {
         let budget = BudgetImpl::new(
             config.global_concurrency,
             config.per_state_concurrency.clone(),
@@ -276,6 +312,7 @@ impl<T, R, W> Orchestrator<T, R, W> {
             runner,
             workspace,
             clock,
+            trust_client,
             config,
             state: Mutex::new(State {
                 budget,
