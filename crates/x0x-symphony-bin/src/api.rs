@@ -26,8 +26,8 @@ use thiserror::Error;
 use tokio::{sync::broadcast, time};
 use x0x_symphony_core::{
     approval_decision, content_hash, sha256_hex, AgentId, ApprovalDecision, ApprovalEvent,
-    ApprovalState, ApprovalVerdict, Claim, Handoff, Issue, IssueId, IssueSource, SignatureEnvelope,
-    SignatureProvenance, Tracker, APPROVAL_CONTEXT, SIGN_ALGORITHM,
+    ApprovalState, ApprovalVerdict, Claim, Handoff, Issue, IssueDraft, IssueId, IssueSource,
+    SignatureEnvelope, SignatureProvenance, Tracker, APPROVAL_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_signing::SigningClient;
 
@@ -386,6 +386,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/symphony/events", get(events))
         .route("/symphony/approvals/pending", get(approvals_pending))
         .route("/symphony/approvals/{id}", post(submit_approval))
+        .route("/symphony/issues", post(create_issue))
         .route("/symphony/claim/{id}", post(claim_issue))
         .route("/symphony/handoff/{id}", post(handoff_issue))
         .route("/symphony/routes", get(routes))
@@ -497,6 +498,19 @@ async fn events(
         },
     );
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn create_issue(
+    State(state): State<AppState>,
+    Json(draft): Json<IssueDraft>,
+) -> Result<Json<Issue>, Error> {
+    let issue = state
+        .tracker
+        .create_issue(draft)
+        .await
+        .map_err(|error| Error::Tracker(error.to_string()))?;
+    state.notify_task_changed(issue.id.as_str());
+    Ok(Json(issue))
 }
 
 async fn claim_issue(
@@ -961,6 +975,7 @@ fn route_infos() -> Vec<RouteInfo> {
         ("POST", "/symphony/approvals/{id}"),
         ("POST", "/symphony/claim/{id}"),
         ("POST", "/symphony/handoff/{id}"),
+        ("POST", "/symphony/issues"),
     ]
     .into_iter()
     .map(|(method, path)| RouteInfo {

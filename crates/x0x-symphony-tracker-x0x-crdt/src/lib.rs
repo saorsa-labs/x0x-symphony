@@ -51,20 +51,22 @@ use reqwest::StatusCode;
 use thiserror::Error;
 use tracing::warn;
 use x0x_symphony_core::{
-    sha256_hex, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff, Issue,
-    IssueId, IssueState, PollContext, ReleaseReason, ShardRole, SignatureEnvelope, SymphonyError,
-    Tracker, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
+    sha256_hex, shard, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff,
+    Issue, IssueDraft, IssueId, IssueState, PollContext, ReleaseReason, ShardRole,
+    SignatureEnvelope, SymphonyError, Tracker, WorkerCard, CLAIM_CONTEXT, HANDOFF_CONTEXT,
+    SIGN_ALGORITHM, WORKER_CARD_CONTEXT, WORKER_CARD_SCHEMA_VERSION,
 };
 use x0x_symphony_signing::{
     SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver, VerifyOutcome,
 };
 
 use crate::{
-    client::{ClientError, TaskAction, X0xdApi, X0xdClient},
+    client::{AddTaskDraft, ClientError, TaskAction, X0xdApi, X0xdClient},
     mapping::{
         approval_key, claim_key, decode_approval_blob, decode_claim_blob, decode_handoff_blob,
-        encode_approval_blob, encode_claim_blob, encode_handoff_blob, handoff_key, issue_from_task,
-        store_id_for_list, ApprovalBlob, ClaimBlob, ClaimBlobStatus, HandoffBlob,
+        decode_shard_blob, encode_approval_blob, encode_claim_blob, encode_handoff_blob,
+        encode_shard_blob, handoff_key, issue_from_task, shard_key, store_id_for_list,
+        ApprovalBlob, ClaimBlob, ClaimBlobStatus, HandoffBlob, ShardBlob,
         SYMPHONY_JSON_CONTENT_TYPE,
     },
 };
@@ -220,6 +222,28 @@ impl SigningRuntime {
     }
 }
 
+#[derive(Clone)]
+struct IssueCreationRuntime {
+    worker_view: Option<Arc<dyn WorkerViewProvider>>,
+    replication_factor: usize,
+}
+
+impl IssueCreationRuntime {
+    fn new(worker_view: Option<Arc<dyn WorkerViewProvider>>, replication_factor: usize) -> Self {
+        Self {
+            worker_view,
+            replication_factor: replication_factor.max(1),
+        }
+    }
+
+    const fn unsupported() -> Self {
+        Self {
+            worker_view: None,
+            replication_factor: shard::DEFAULT_REPLICATION_FACTOR,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct VerifyCacheKey {
     issue_id: IssueId,
@@ -228,6 +252,22 @@ struct VerifyCacheKey {
     signature_b64: String,
     public_key_b64: String,
     signer_agent_id: String,
+}
+
+/// Atomic live worker-view snapshot used for shard assignment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerViewSnapshot {
+    /// Verified worker cards visible at one point in time.
+    pub cards: Vec<WorkerCard>,
+    /// Monotonic epoch of the worker view that produced `cards`.
+    pub view_epoch: u64,
+}
+
+/// Source of live worker-card snapshots for issue creation.
+#[async_trait]
+pub trait WorkerViewProvider: Send + Sync {
+    /// Return one atomic snapshot of the current live worker view.
+    async fn snapshot(&self) -> WorkerViewSnapshot;
 }
 
 /// Builder for [`X0xCrdtTracker`].
@@ -239,6 +279,8 @@ pub struct X0xCrdtTrackerBuilder {
     client: Option<Arc<dyn X0xdApi>>,
     signing: SigningRuntime,
     group: Option<String>,
+    worker_view: Option<Arc<dyn WorkerViewProvider>>,
+    replication_factor: usize,
 }
 
 impl X0xCrdtTrackerBuilder {
@@ -252,6 +294,8 @@ impl X0xCrdtTrackerBuilder {
             client: None,
             signing: SigningRuntime::disabled(),
             group: None,
+            worker_view: None,
+            replication_factor: shard::DEFAULT_REPLICATION_FACTOR,
         }
     }
 
@@ -272,6 +316,20 @@ impl X0xCrdtTrackerBuilder {
     #[must_use]
     pub fn client(mut self, client: Arc<dyn X0xdApi>) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// Inject the live worker view used for symphony-owned issue creation.
+    #[must_use]
+    pub fn worker_view(mut self, provider: Arc<dyn WorkerViewProvider>) -> Self {
+        self.worker_view = Some(provider);
+        self
+    }
+
+    /// Set the shard owner count for newly created issues.
+    #[must_use]
+    pub fn replication_factor(mut self, replication_factor: usize) -> Self {
+        self.replication_factor = replication_factor.max(1);
         self
     }
 
@@ -316,6 +374,7 @@ impl X0xCrdtTrackerBuilder {
             client,
             self.signing,
             self.group,
+            IssueCreationRuntime::new(self.worker_view, self.replication_factor),
         ))
     }
 }
@@ -329,6 +388,8 @@ impl std::fmt::Debug for X0xCrdtTrackerBuilder {
             .field("has_custom_client", &self.client.is_some())
             .field("signing_policy", &self.signing.policy)
             .field("group", &self.group)
+            .field("has_worker_view", &self.worker_view.is_some())
+            .field("replication_factor", &self.replication_factor)
             .finish_non_exhaustive()
     }
 }
@@ -343,6 +404,7 @@ pub struct X0xCrdtTracker {
     client: Arc<dyn X0xdApi>,
     signing: SigningRuntime,
     group: Option<String>,
+    creation: IssueCreationRuntime,
     resolved_scope: Arc<tokio::sync::Mutex<Option<ResourceScope>>>,
     verify_cache: Arc<Mutex<HashMap<VerifyCacheKey, VerifyOutcome>>>,
 }
@@ -356,6 +418,8 @@ impl std::fmt::Debug for X0xCrdtTracker {
             .field("agent_id", &self.agent_id)
             .field("signing_policy", &self.signing.policy)
             .field("group", &self.group)
+            .field("has_worker_view", &self.creation.worker_view.is_some())
+            .field("replication_factor", &self.creation.replication_factor)
             .finish_non_exhaustive()
     }
 }
@@ -399,6 +463,7 @@ impl X0xCrdtTracker {
             client,
             SigningRuntime::disabled(),
             None,
+            IssueCreationRuntime::unsupported(),
         )
     }
 
@@ -433,6 +498,7 @@ impl X0xCrdtTracker {
         client: Arc<dyn X0xdApi>,
         signing: SigningRuntime,
         group: Option<String>,
+        creation: IssueCreationRuntime,
     ) -> Self {
         let store_id = store_id_for_list(&list_id);
         Self {
@@ -443,6 +509,7 @@ impl X0xCrdtTracker {
             client,
             signing,
             group,
+            creation,
             resolved_scope: Arc::new(tokio::sync::Mutex::new(None)),
             verify_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -522,10 +589,12 @@ impl X0xCrdtTracker {
         for task in tasks {
             let claim_blob = self.claim_blob_for_task(&task.id).await?;
             let handoff_blob = self.handoff_blob_for_task(&task.id).await?;
+            let shard_blob = self.shard_blob_for_task(&task.id).await?;
             issues.push(issue_from_task(
                 &task,
                 claim_blob.as_ref(),
                 handoff_blob.as_ref(),
+                shard_blob.as_ref(),
             )?);
         }
         self.filter_verified_issues(issues).await
@@ -548,6 +617,16 @@ impl X0xCrdtTracker {
             .get_kv(&scope.store_id, &key)
             .await?
             .map(|value| decode_handoff_blob(&value.value).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn shard_blob_for_task(&self, task_id: &str) -> Result<Option<ShardBlob>> {
+        let scope = self.resource_scope().await?;
+        let key = shard_key(task_id);
+        self.client
+            .get_kv(&scope.store_id, &key)
+            .await?
+            .map(|value| decode_shard_blob(&value.value).map_err(Into::into))
             .transpose()
     }
 
@@ -591,12 +670,67 @@ impl X0xCrdtTracker {
         Ok(())
     }
 
+    async fn put_shard_blob(&self, task_id: &str, blob: &ShardBlob) -> Result<()> {
+        let scope = self.resource_scope().await?;
+        let key = shard_key(task_id);
+        let encoded = encode_shard_blob(blob)?;
+        self.client
+            .put_kv(&scope.store_id, &key, &encoded, SYMPHONY_JSON_CONTENT_TYPE)
+            .await?;
+        Ok(())
+    }
+
     async fn fetch_issue(&self, id: &IssueId) -> Result<Issue> {
         self.list_issues()
             .await?
             .into_iter()
             .find(|issue| &issue.id == id)
             .ok_or_else(|| TrackerError::IssueNotFound { id: id.clone() })
+    }
+
+    async fn create_issue_with_shard(&self, draft: IssueDraft) -> Result<Issue> {
+        if draft.title.trim().is_empty() {
+            return Err(SymphonyError::validation("issue.title", "must not be empty").into());
+        }
+        let _ = draft_priority_as_u8(draft.priority)?;
+        let provider = self.creation.worker_view.as_ref().ok_or_else(|| {
+            SymphonyError::unsupported("this tracker does not own issue creation")
+        })?;
+        let snapshot = provider.snapshot().await;
+        let now = now_utc();
+        let workers = live_verified_worker_ids(&snapshot.cards, &now);
+        if workers.is_empty() {
+            return Err(SymphonyError::unsupported(
+                "cannot assign shard: live worker view is empty; start at least one trusted worker",
+            )
+            .into());
+        }
+
+        let mut add_task = AddTaskDraft::new(draft.title.clone());
+        if let Some(description) = draft.description.filter(|value| !value.trim().is_empty()) {
+            add_task = add_task.with_description(description);
+        }
+        let scope = self.resource_scope().await?;
+        let task_id = self.client.add_task(&scope.list_id, add_task).await?;
+        let issue_id = IssueId::new(task_id.clone())?;
+        let shard = shard::assign_with_metadata(
+            &issue_id,
+            &workers,
+            self.creation.replication_factor,
+            shard::DEFAULT_CLAIM_TTL_MS,
+            snapshot.view_epoch,
+        )
+        .ok_or_else(|| {
+            SymphonyError::unsupported(
+                "cannot assign shard: live worker view is empty; start at least one trusted worker",
+            )
+        })?;
+        self.put_shard_blob(
+            &task_id,
+            &ShardBlob::new(shard, snapshot.view_epoch, now_utc()),
+        )
+        .await?;
+        self.fetch_issue(&issue_id).await
     }
 
     fn ensure_agent_matches(&self, id: &IssueId, agent_id: &AgentId) -> Result<()> {
@@ -859,6 +993,12 @@ fn verify_outcome_to_result(outcome: VerifyOutcome) -> Result<()> {
 impl Tracker for X0xCrdtTracker {
     async fn list_issues(&self) -> x0x_symphony_core::Result<Vec<Issue>> {
         X0xCrdtTracker::list_issues(self)
+            .await
+            .map_err(SymphonyError::from)
+    }
+
+    async fn create_issue(&self, draft: IssueDraft) -> x0x_symphony_core::Result<Issue> {
+        self.create_issue_with_shard(draft)
             .await
             .map_err(SymphonyError::from)
     }
@@ -1130,6 +1270,37 @@ fn signing_error(error: impl std::fmt::Display) -> TrackerError {
     TrackerError::Signing(error.to_string())
 }
 
+fn draft_priority_as_u8(priority: Option<i32>) -> Result<Option<u8>> {
+    priority
+        .map(|value| {
+            u8::try_from(value).map_err(|_error| {
+                SymphonyError::validation("issue.priority", "must be between 0 and 255").into()
+            })
+        })
+        .transpose()
+}
+
+fn live_verified_worker_ids(cards: &[WorkerCard], now: &str) -> Vec<AgentId> {
+    cards
+        .iter()
+        .filter(|card| card.schema_version == WORKER_CARD_SCHEMA_VERSION)
+        .filter(|card| !card.is_expired(now))
+        .filter(|card| worker_card_has_verified_signature_marker(card))
+        .map(|card| card.agent_id.clone())
+        .collect()
+}
+
+fn worker_card_has_verified_signature_marker(card: &WorkerCard) -> bool {
+    card.signature.as_ref().is_some_and(|signature| {
+        signature.algorithm == SIGN_ALGORITHM
+            && signature.context == WORKER_CARD_CONTEXT
+            && signature.signer_agent_id == card.agent_id.as_str()
+            && card
+                .signing_payload_sha256()
+                .is_ok_and(|digest| digest == signature.payload_sha256)
+    })
+}
+
 fn now_utc() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
@@ -1145,10 +1316,10 @@ mod tests {
     use super::*;
     use crate::{
         client::{
-            AddTaskDraft, EventStream, JoinedGroup, KvKeyEntry, KvValue, NamedGroupDetails,
-            NamedGroupEntry, NamedGroupMember, TaskEntry, TaskListEntry, X0xdEvent,
+            EventStream, JoinedGroup, KvKeyEntry, KvValue, NamedGroupDetails, NamedGroupEntry,
+            NamedGroupMember, TaskEntry, TaskListEntry, X0xdEvent,
         },
-        mapping::{decode_claim_blob, decode_handoff_blob},
+        mapping::{decode_claim_blob, decode_handoff_blob, decode_shard_blob, SHARD_BLOB_KIND},
     };
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -1247,6 +1418,24 @@ mod tests {
                 .get(&key)
                 .ok_or_else(|| std::io::Error::other("missing handoff blob"))?;
             Ok(decode_handoff_blob(bytes)?)
+        }
+
+        async fn shard_blob(&self, task_id: &str) -> TestResult<ShardBlob> {
+            let key = (store_id_for_list("list-a"), shard_key(task_id));
+            let state = self.state.lock().await;
+            let bytes = state
+                .kv
+                .get(&key)
+                .ok_or_else(|| std::io::Error::other("missing shard blob"))?;
+            Ok(decode_shard_blob(bytes)?)
+        }
+
+        async fn task_count(&self) -> usize {
+            self.state.lock().await.tasks.len()
+        }
+
+        async fn put_count(&self) -> usize {
+            self.state.lock().await.puts.len()
         }
     }
 
@@ -1437,6 +1626,43 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MockWorkerView {
+        snapshots: Mutex<Vec<WorkerViewSnapshot>>,
+        calls: Mutex<usize>,
+    }
+
+    impl MockWorkerView {
+        fn new(snapshots: Vec<WorkerViewSnapshot>) -> Arc<Self> {
+            Arc::new(Self {
+                snapshots: Mutex::new(snapshots),
+                calls: Mutex::new(0),
+            })
+        }
+
+        async fn calls(&self) -> usize {
+            *self.calls.lock().await
+        }
+    }
+
+    #[async_trait]
+    impl WorkerViewProvider for MockWorkerView {
+        async fn snapshot(&self) -> WorkerViewSnapshot {
+            let mut calls = self.calls.lock().await;
+            *calls = calls.saturating_add(1);
+            drop(calls);
+            let mut snapshots = self.snapshots.lock().await;
+            if snapshots.is_empty() {
+                WorkerViewSnapshot {
+                    cards: Vec::new(),
+                    view_epoch: 0,
+                }
+            } else {
+                snapshots.remove(0)
+            }
+        }
+    }
+
     fn task(id: &str, title: &str, state: &str, priority: u8) -> TaskEntry {
         TaskEntry {
             id: id.to_owned(),
@@ -1466,6 +1692,19 @@ mod tests {
         )
     }
 
+    fn tracker_with_worker_view(
+        api: Arc<MockApi>,
+        provider: Arc<dyn WorkerViewProvider>,
+    ) -> TestResult<X0xCrdtTracker> {
+        Ok(
+            X0xCrdtTracker::builder("mock://x0xd", "list-a", AgentId::new(AGENT_A)?)
+                .client(api)
+                .worker_view(provider)
+                .replication_factor(shard::DEFAULT_REPLICATION_FACTOR)
+                .build()?,
+        )
+    }
+
     fn claim_for(task_id: &str, agent: &str) -> TestResult<Claim> {
         Ok(Claim::new(
             Some(IssueId::new(task_id)?),
@@ -1473,6 +1712,56 @@ mod tests {
             "2026-07-03T01:00:00Z",
             ShardRole::ManualM1,
         ))
+    }
+
+    fn worker_card(agent: &str) -> TestResult<WorkerCard> {
+        let agent_id = AgentId::new(agent)?;
+        let mut card = WorkerCard {
+            schema_version: WORKER_CARD_SCHEMA_VERSION,
+            agent_id: agent_id.clone(),
+            issued_at: "2099-07-03T12:00:00Z".to_owned(),
+            ttl_seconds: 60,
+            capabilities: vec!["rust".to_owned()],
+            sandbox_levels: vec!["repo-write".to_owned()],
+            runner_presets: vec!["shell".to_owned()],
+            current_load: 0,
+            max_load: 2,
+            platform: x0x_symphony_core::PlatformInfo {
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                version: "0.0.0".to_owned(),
+            },
+            signature: None,
+        };
+        let payload_sha256 = card.signing_payload_sha256()?;
+        card.signature = Some(SignatureEnvelope::new(
+            SIGN_ALGORITHM,
+            WORKER_CARD_CONTEXT,
+            BASE64.encode(format!("{agent}-public-key")),
+            BASE64.encode(format!("{agent}-signature")),
+            payload_sha256,
+            agent_id.to_string(),
+        ));
+        Ok(card)
+    }
+
+    fn worker_snapshot(agents: &[&str], view_epoch: u64) -> TestResult<WorkerViewSnapshot> {
+        Ok(WorkerViewSnapshot {
+            cards: agents
+                .iter()
+                .map(|agent| worker_card(agent))
+                .collect::<TestResult<Vec<_>>>()?,
+            view_epoch,
+        })
+    }
+
+    fn issue_draft(title: &str) -> IssueDraft {
+        IssueDraft {
+            title: title.to_owned(),
+            description: Some("created by test".to_owned()),
+            priority: Some(2),
+            labels: vec!["x0x-symphony".to_owned()],
+        }
     }
 
     #[tokio::test]
@@ -1511,6 +1800,100 @@ mod tests {
 
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].id, IssueId::new(ISSUE_B)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_issue_assigns_live_worker_shard_and_writes_sidecar() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        let provider = MockWorkerView::new(vec![worker_snapshot(
+            &["agent-a", "agent-b", "agent-c", "agent-d"],
+            42,
+        )?]);
+        let tracker = tracker_with_worker_view(api.clone(), provider)?;
+
+        let issue = tracker.create_issue(issue_draft("Live shard")).await?;
+
+        let workers = ["agent-a", "agent-b", "agent-c", "agent-d"]
+            .iter()
+            .map(|agent| AgentId::new(*agent))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let expected = shard::assign_with_metadata(
+            &IssueId::new(ISSUE_A)?,
+            &workers,
+            shard::DEFAULT_REPLICATION_FACTOR,
+            shard::DEFAULT_CLAIM_TTL_MS,
+            42,
+        )
+        .ok_or_else(|| std::io::Error::other("expected non-empty worker assignment"))?;
+        assert_eq!(issue.id, IssueId::new(ISSUE_A)?);
+        assert_eq!(issue.shard.as_ref(), Some(&expected));
+        let blob = api.shard_blob(ISSUE_A).await?;
+        assert_eq!(blob.kind, SHARD_BLOB_KIND);
+        assert_eq!(blob.created_view_epoch, 42);
+        assert_eq!(blob.shard, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_issue_empty_worker_view_fails_without_creating_task() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        let provider = MockWorkerView::new(vec![WorkerViewSnapshot {
+            cards: Vec::new(),
+            view_epoch: 7,
+        }]);
+        let tracker = tracker_with_worker_view(api.clone(), provider)?;
+
+        let result = tracker.create_issue(issue_draft("No workers")).await;
+
+        let Err(error) = result else {
+            return Err(std::io::Error::other("empty view should fail").into());
+        };
+        assert!(error.to_string().contains("live worker view is empty"));
+        assert_eq!(api.task_count().await, 0);
+        assert_eq!(api.put_count().await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_issue_uses_one_worker_snapshot_during_view_churn() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        let provider = MockWorkerView::new(vec![
+            worker_snapshot(&["agent-a", "agent-b", "agent-c"], 11)?,
+            worker_snapshot(&["agent-d", "agent-e", "agent-f"], 12)?,
+        ]);
+        let tracker = tracker_with_worker_view(api.clone(), provider.clone())?;
+
+        let issue = tracker.create_issue(issue_draft("Stable snapshot")).await?;
+
+        assert_eq!(provider.calls().await, 1);
+        assert_eq!(
+            issue.shard.as_ref().map(|shard| shard.created_view_epoch),
+            Some(11)
+        );
+        let blob = api.shard_blob(ISSUE_A).await?;
+        assert_eq!(blob.created_view_epoch, 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_candidates_does_not_assign_missing_shards_on_read_path() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "unsharded", "empty", 3)]).await;
+        let provider = MockWorkerView::new(vec![worker_snapshot(
+            &["agent-a", "agent-b", "agent-c"],
+            99,
+        )?]);
+        let tracker = tracker_with_worker_view(api.clone(), provider)?;
+        let ctx = PollContext::new(
+            vec![IssueState::new("todo")?],
+            vec![IssueState::new("done")?],
+        );
+
+        let candidates = tracker.fetch_candidates(&ctx).await?;
+
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].shard.is_none());
+        assert_eq!(api.put_count().await, 0);
         Ok(())
     }
 

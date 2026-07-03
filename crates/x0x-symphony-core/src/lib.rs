@@ -24,7 +24,9 @@ pub use approval::{
 pub use claim::{Claim, Shard, ShardRole};
 pub use error::{Result, SymphonyError};
 pub use handoff::{Handoff, ValidationResult, ValidationStatus};
-pub use issue::{AgentId, Issue, IssueId, IssueRef, IssueSource, IssueState, SignatureProvenance};
+pub use issue::{
+    AgentId, Issue, IssueDraft, IssueId, IssueRef, IssueSource, IssueState, SignatureProvenance,
+};
 pub use runner::{
     EventStream, Prompt, Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext,
     SessionHandle, SessionId, TurnOutcome, TurnStatus, UsageReport,

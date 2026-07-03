@@ -7,7 +7,7 @@ use serde_json::Value;
 use thiserror::Error;
 use x0x_symphony_core::{
     ApprovalConsumed, ApprovalEvent, Claim, Handoff, Issue, IssueId, IssueSource, IssueState,
-    ReleaseReason, SymphonyError,
+    ReleaseReason, Shard, SymphonyError,
 };
 
 use crate::client::{AddTaskDraft, TaskEntry};
@@ -23,6 +23,9 @@ pub const HANDOFF_BLOB_KIND: &str = "x0x-symphony-handoff-v1";
 
 /// Approval blob kind marker.
 pub const APPROVAL_BLOB_KIND: &str = "x0x-symphony-approval-v1";
+
+/// Shard blob kind marker.
+pub const SHARD_BLOB_KIND: &str = "shard";
 
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
@@ -215,6 +218,35 @@ impl ApprovalBlob {
     }
 }
 
+/// Shard metadata stored under `shard-<task-id>` in `symphony-<list-id>`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShardBlob {
+    /// Blob schema version.
+    pub schema_version: u32,
+    /// Blob kind marker.
+    pub kind: String,
+    /// Frozen shard slate assigned at issue creation.
+    pub shard: Shard,
+    /// Worker-view epoch used to assign the slate.
+    pub created_view_epoch: u64,
+    /// Last time this blob was written, as ISO-8601 UTC text.
+    pub written_at: String,
+}
+
+impl ShardBlob {
+    /// Build a shard blob for a newly created issue.
+    #[must_use]
+    pub fn new(shard: Shard, created_view_epoch: u64, written_at: impl Into<String>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            kind: SHARD_BLOB_KIND.to_owned(),
+            shard,
+            created_view_epoch,
+            written_at: written_at.into(),
+        }
+    }
+}
+
 /// Return the `KvStore` id used for Symphony metadata for a `TaskList`.
 #[must_use]
 pub fn store_id_for_list(list_id: &str) -> String {
@@ -231,6 +263,12 @@ pub fn claim_key(task_id: &str) -> String {
 #[must_use]
 pub fn handoff_key(task_id: &str) -> String {
     format!("handoff-{task_id}")
+}
+
+/// Return the `KvStore` key for a task's shard blob.
+#[must_use]
+pub fn shard_key(task_id: &str) -> String {
+    format!("shard-{task_id}")
 }
 
 /// Return the `KvStore` key for a task's approval blob.
@@ -278,6 +316,24 @@ pub fn encode_handoff_blob(blob: &HandoffBlob) -> Result<Vec<u8>> {
 ///
 /// Returns [`MappingError::Json`] if the blob cannot be decoded.
 pub fn decode_handoff_blob(bytes: &[u8]) -> Result<HandoffBlob> {
+    serde_json::from_slice(bytes).map_err(|source| MappingError::Json { source })
+}
+
+/// Encode a shard blob as JSON bytes for x0xd `KvStore`.
+///
+/// # Errors
+///
+/// Returns [`MappingError::Json`] if the blob cannot be serialized.
+pub fn encode_shard_blob(blob: &ShardBlob) -> Result<Vec<u8>> {
+    serde_json::to_vec(blob).map_err(|source| MappingError::Json { source })
+}
+
+/// Decode a shard blob from x0xd `KvStore` JSON bytes.
+///
+/// # Errors
+///
+/// Returns [`MappingError::Json`] if the blob cannot be decoded.
+pub fn decode_shard_blob(bytes: &[u8]) -> Result<ShardBlob> {
     serde_json::from_slice(bytes).map_err(|source| MappingError::Json { source })
 }
 
@@ -332,13 +388,14 @@ pub fn issue_from_task(
     task: &TaskEntry,
     claim_blob: Option<&ClaimBlob>,
     handoff_blob: Option<&HandoffBlob>,
+    shard_blob: Option<&ShardBlob>,
 ) -> Result<Issue> {
     validate_claim_blob(task, claim_blob)?;
     validate_handoff_blob(task, handoff_blob)?;
 
     let id = IssueId::new(task.id.clone())?;
     let created_at = DEFAULT_TIMESTAMP.to_owned();
-    let updated_at = updated_at_for_blobs(claim_blob, handoff_blob);
+    let updated_at = updated_at_for_blobs(claim_blob, handoff_blob, shard_blob);
     let mut issue = Issue::new(
         id,
         task.id.clone(),
@@ -351,6 +408,7 @@ pub fn issue_from_task(
     issue.updated_at = updated_at;
     issue.claim = active_claim_for_issue(claim_blob, handoff_blob);
     issue.handoff = handoff_blob.map(|blob| blob.handoff.clone());
+    issue.shard = shard_blob.map(|blob| blob.shard.clone());
     issue.extra = extra_for_task(task, claim_blob)?;
     Ok(issue)
 }
@@ -419,11 +477,17 @@ fn active_claim_for_issue(
 fn updated_at_for_blobs(
     claim_blob: Option<&ClaimBlob>,
     handoff_blob: Option<&HandoffBlob>,
+    shard_blob: Option<&ShardBlob>,
 ) -> String {
     handoff_blob.map_or_else(
         || {
             claim_blob.map_or_else(
-                || DEFAULT_TIMESTAMP.to_owned(),
+                || {
+                    shard_blob.map_or_else(
+                        || DEFAULT_TIMESTAMP.to_owned(),
+                        |blob| blob.written_at.clone(),
+                    )
+                },
                 |blob| blob.updated_at.clone(),
             )
         },
@@ -522,7 +586,7 @@ mod tests {
 
         let task = task_entry_from_issue(&issue);
         let claim_blob = ClaimBlob::active(claim, "2026-07-03T01:00:00Z");
-        let round_trip = issue_from_task(&task, Some(&claim_blob), None)?;
+        let round_trip = issue_from_task(&task, Some(&claim_blob), None, None)?;
 
         assert_eq!(round_trip.id, issue.id);
         assert_eq!(round_trip.title, issue.title);
@@ -549,7 +613,7 @@ mod tests {
             .with_validation(ValidationResult::new("just test", ValidationStatus::Passed));
 
         let handoff_blob = HandoffBlob::new(handoff, "2026-07-03T02:00:00Z");
-        let issue = issue_from_task(&task, None, Some(&handoff_blob))?;
+        let issue = issue_from_task(&task, None, Some(&handoff_blob), None)?;
 
         assert_eq!(issue.state, IssueState::new("review")?);
         assert!(issue.claim.is_none());
@@ -580,7 +644,7 @@ mod tests {
         };
 
         let claim_blob = ClaimBlob::blocked(claim, reason, "2026-07-03T02:00:00Z");
-        let issue = issue_from_task(&task, Some(&claim_blob), None)?;
+        let issue = issue_from_task(&task, Some(&claim_blob), None, None)?;
 
         assert_eq!(issue.state, IssueState::new("blocked")?);
         assert!(issue.claim.is_none());

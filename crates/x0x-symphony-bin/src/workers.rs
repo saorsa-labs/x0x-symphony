@@ -2,8 +2,8 @@
 //!
 //! The daemon publishes signed [`WorkerCard`] advertisements to x0xd's gossip
 //! pub/sub HTTP surface and maintains a TTL-reaped live view of cards received
-//! from peers. The view is passive for XSY-0025; dispatch keeps using the
-//! existing static sharding placeholder until XSY-0026 consumes this view.
+//! from peers. The x0x CRDT tracker snapshots this live view when it creates
+//! symphony-owned issues and freezes their shard slate.
 
 use std::{
     collections::BTreeMap,
@@ -26,6 +26,7 @@ use x0x_symphony_core::{
     WORKER_CARD_CONTEXT, WORKER_CARD_SCHEMA_VERSION,
 };
 use x0x_symphony_signing::{SigningClient, TrustedKeyResolver, VerifyOutcome};
+use x0x_symphony_tracker_x0x_crdt::{WorkerViewProvider, WorkerViewSnapshot};
 
 /// Gossip topic carrying signed worker advertisements.
 pub const WORKER_TOPIC: &str = "x0x/symphony/workers/v1";
@@ -209,10 +210,15 @@ impl WorkerDiscovery {
 
     /// Return the current non-expired worker cards, reaping expired entries.
     pub async fn snapshot(&self) -> Vec<WorkerCard> {
+        self.snapshot_view().await.cards.into_values().collect()
+    }
+
+    /// Return the current non-expired worker view and its epoch.
+    pub async fn snapshot_view(&self) -> WorkerView {
         let now = now_rfc3339();
         let mut view = self.view.write().await;
         reap_expired_at(&mut view, &now);
-        view.cards.values().cloned().collect()
+        view.clone()
     }
 
     async fn run_loop(&self) {
@@ -273,6 +279,17 @@ impl WorkerDiscovery {
         }
         .process_sse_data_at(data, now)
         .await
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkerViewProvider for WorkerDiscovery {
+    async fn snapshot(&self) -> WorkerViewSnapshot {
+        let view = self.snapshot_view().await;
+        WorkerViewSnapshot {
+            cards: view.cards.into_values().collect(),
+            view_epoch: view.view_epoch,
+        }
     }
 }
 

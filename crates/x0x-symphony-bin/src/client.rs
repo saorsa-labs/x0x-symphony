@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use x0x_symphony_core::{ApprovalEvent, ApprovalVerdict};
+use x0x_symphony_core::{ApprovalEvent, ApprovalVerdict, Issue, IssueDraft};
 
 use crate::{
     api::{
@@ -222,6 +222,15 @@ impl SymphonyClient {
             expected_signer_agent_id,
         )
         .await
+    }
+
+    /// Create a symphony-owned issue through the daemon tracker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`enum@Error`] for transport, status, or decoding failures.
+    pub async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue> {
+        self.post_json("/symphony/issues", draft).await
     }
 
     /// Claim an issue.

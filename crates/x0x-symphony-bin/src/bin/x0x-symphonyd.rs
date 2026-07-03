@@ -18,7 +18,7 @@ use x0x_symphony_orchestrator::{
 };
 use x0x_symphony_runner_shell::{RunnerSpec, ShellRunner};
 use x0x_symphony_signing::{SigningClient, SigningPolicy, TrustedKeyResolver, X0xdClient};
-use x0x_symphony_tracker_x0x_crdt::X0xCrdtTracker;
+use x0x_symphony_tracker_x0x_crdt::{WorkerViewProvider, X0xCrdtTracker};
 use x0x_symphony_workspace::{Config as WorkspaceConfig, Manager};
 
 #[derive(Debug, Parser)]
@@ -55,10 +55,23 @@ async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let api_token = auth::load_or_generate_api_token(&data_dir).await?;
-    let (tracker, agent_id, signing_client) = build_tracker(&workflow).await?;
+    let (agent_id, signing_client) = build_signing_identity(&workflow).await?;
     let runner_spec = RunnerSpec::from_workflow_config(&workflow.definition.config)
         .context("runner configuration did not resolve")?;
     let local_worker_card = local_worker_card_template(&workflow, &runner_spec, agent_id.clone());
+    let worker_discovery = build_worker_discovery(
+        &workflow,
+        agent_id.clone(),
+        signing_client.clone(),
+        local_worker_card,
+    )?;
+    let worker_view_provider: Arc<dyn WorkerViewProvider> = worker_discovery.clone();
+    let tracker = build_tracker(
+        &workflow,
+        agent_id.clone(),
+        signing_client.clone(),
+        worker_view_provider,
+    )?;
     let runner =
         Arc::new(ShellRunner::new(runner_spec.clone()).context("failed to build shell runner")?);
     let workspace = Arc::new(
@@ -74,7 +87,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
     let api_signing_client: Arc<dyn SigningClient> = signing_client.clone();
     let approval_signing_client: Arc<dyn SigningClient> = signing_client.clone();
-    let worker_signing_client = signing_client.clone();
     let approval_key_resolver: Arc<dyn TrustedKeyResolver> = signing_client;
     let (dispatch_events_tx, _) = broadcast::channel(DISPATCH_EVENT_CHANNEL_CAPACITY);
     let orchestrator = Arc::new(
@@ -90,38 +102,24 @@ async fn run(args: Args) -> anyhow::Result<()> {
         )
         .with_event_tx(dispatch_events_tx),
     );
-    let _worker_discovery_handle = spawn_worker_discovery(
-        &workflow,
-        agent_id.clone(),
-        worker_signing_client,
-        local_worker_card,
-        orchestrator.clone(),
-    )
-    .await?;
+    spawn_worker_load_updater(worker_discovery.clone(), orchestrator.clone());
+    let _worker_discovery_handle = worker_discovery.run().await;
 
     run_startup_maintenance(&orchestrator).await?;
 
-    let orchestrator_handle: Arc<dyn api::OrchestratorHandle> = orchestrator.clone();
-    let api_tracker: Arc<dyn x0x_symphony_core::Tracker> = tracker.clone();
-    let app_state = api::AppState::new(api_tracker, agent_id, api_token, Some(orchestrator_handle))
-        .with_proofs_dir(proofs_dir)
-        .with_signing_client(Some(api_signing_client))
-        .with_approval_ttl(workflow.security.approval_ttl);
-    if let Some(dispatch_events_rx) = orchestrator.subscribe() {
-        spawn_dispatch_event_forwarder(dispatch_events_rx, app_state.events_sender());
-    }
-    let app = api::build_router(app_state);
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("failed to bind {bind_addr}"))?;
-    let actual_addr = listener.local_addr().context("failed to read local addr")?;
-    let port_file = data_dir.join("daemon.port");
-    tokio::fs::write(&port_file, format!("{}\n", actual_addr.port()))
-        .await
-        .with_context(|| format!("failed to write {}", port_file.display()))?;
+    let app = build_app(
+        tracker,
+        &orchestrator,
+        agent_id,
+        api_token,
+        proofs_dir,
+        api_signing_client,
+        workflow.security.approval_ttl,
+    );
+    let bound = bind_http(bind_addr, &data_dir).await?;
     info!(
-        bind = %actual_addr,
-        port_file = %port_file.display(),
+        bind = %bound.actual_addr,
+        port_file = %bound.port_file.display(),
         tracker_kind = %workflow.tracker.kind,
         task_list = %workflow.tracker.list_id,
         x0xd_url = %workflow.signing.x0xd_url,
@@ -134,7 +132,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let signaled = shutdown_orchestrator.shutdown().await;
         info!(signaled, "orchestrator shutdown requested");
     };
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown);
+    let server = axum::serve(bound.listener, app).with_graceful_shutdown(shutdown);
 
     tokio::select! {
         result = orchestrator.run() => {
@@ -147,10 +145,55 @@ async fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Construct the x0x CRDT tracker, returning the x0xd-resolved agent identity.
-async fn build_tracker(
+struct BoundHttp {
+    listener: TcpListener,
+    actual_addr: std::net::SocketAddr,
+    port_file: PathBuf,
+}
+
+async fn bind_http(bind_addr: std::net::SocketAddr, data_dir: &Path) -> anyhow::Result<BoundHttp> {
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("failed to bind {bind_addr}"))?;
+    let actual_addr = listener.local_addr().context("failed to read local addr")?;
+    let port_file = data_dir.join("daemon.port");
+    tokio::fs::write(&port_file, format!("{}\n", actual_addr.port()))
+        .await
+        .with_context(|| format!("failed to write {}", port_file.display()))?;
+    Ok(BoundHttp {
+        listener,
+        actual_addr,
+        port_file,
+    })
+}
+
+fn build_app(
+    tracker: Arc<X0xCrdtTracker>,
+    orchestrator: &Arc<Orchestrator<X0xCrdtTracker, ShellRunner, Manager>>,
+    agent_id: AgentId,
+    api_token: String,
+    proofs_dir: PathBuf,
+    signing_client: Arc<dyn SigningClient>,
+    approval_ttl: Duration,
+) -> axum::Router {
+    let concrete_orchestrator: Arc<Orchestrator<X0xCrdtTracker, ShellRunner, Manager>> =
+        Arc::clone(orchestrator);
+    let orchestrator_handle: Arc<dyn api::OrchestratorHandle> = concrete_orchestrator;
+    let api_tracker: Arc<dyn x0x_symphony_core::Tracker> = tracker;
+    let app_state = api::AppState::new(api_tracker, agent_id, api_token, Some(orchestrator_handle))
+        .with_proofs_dir(proofs_dir)
+        .with_signing_client(Some(signing_client))
+        .with_approval_ttl(approval_ttl);
+    if let Some(dispatch_events_rx) = orchestrator.subscribe() {
+        spawn_dispatch_event_forwarder(dispatch_events_rx, app_state.events_sender());
+    }
+    api::build_router(app_state)
+}
+
+/// Resolve the x0xd signing client and local agent identity.
+async fn build_signing_identity(
     workflow: &config::WorkflowConfig,
-) -> anyhow::Result<(Arc<X0xCrdtTracker>, AgentId, Arc<X0xdClient>)> {
+) -> anyhow::Result<(AgentId, Arc<X0xdClient>)> {
     let signing_client = Arc::new(
         X0xdClient::new(&workflow.signing.x0xd_url)
             .context("failed to configure x0xd signing client")?,
@@ -160,23 +203,34 @@ async fn build_tracker(
         .await
         .context("failed to read x0xd agent identity")?;
     let agent_id = AgentId::new(identity.agent_id)?;
+    Ok((agent_id, signing_client))
+}
+
+fn build_tracker(
+    workflow: &config::WorkflowConfig,
+    agent_id: AgentId,
+    signing_client: Arc<X0xdClient>,
+    worker_view: Arc<dyn WorkerViewProvider>,
+) -> anyhow::Result<Arc<X0xCrdtTracker>> {
     let mut tracker_builder = X0xCrdtTracker::builder(
         &workflow.signing.x0xd_url,
         &workflow.tracker.list_id,
-        agent_id.clone(),
-    );
+        agent_id,
+    )
+    .worker_view(worker_view)
+    .replication_factor(workflow.sharding.replication_factor);
     if let Some(group) = &workflow.tracker.group {
         tracker_builder = tracker_builder.group(group.clone());
     }
     if workflow.signing.policy == SigningPolicy::Required {
         let signing: Arc<dyn SigningClient> = signing_client.clone();
-        let resolver: Arc<dyn TrustedKeyResolver> = signing_client.clone();
+        let resolver: Arc<dyn TrustedKeyResolver> = signing_client;
         tracker_builder = tracker_builder.required_signing(signing, resolver);
     }
     let tracker = tracker_builder
         .build()
         .context("failed to configure x0x CRDT tracker")?;
-    Ok((Arc::new(tracker), agent_id, signing_client))
+    Ok(Arc::new(tracker))
 }
 
 async fn run_startup_maintenance(
@@ -196,13 +250,12 @@ async fn run_startup_maintenance(
     Ok(())
 }
 
-async fn spawn_worker_discovery(
+fn build_worker_discovery(
     workflow: &config::WorkflowConfig,
     agent_id: AgentId,
     signing_client: Arc<X0xdClient>,
     local_worker_card: x0x_symphony_core::WorkerCard,
-    orchestrator: Arc<Orchestrator<X0xCrdtTracker, ShellRunner, Manager>>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+) -> anyhow::Result<Arc<workers::WorkerDiscovery>> {
     let worker_signing_client: Arc<dyn SigningClient> = signing_client.clone();
     let worker_key_resolver: Arc<dyn TrustedKeyResolver> = signing_client;
     let worker_discovery = Arc::new(
@@ -217,8 +270,7 @@ async fn spawn_worker_discovery(
         )
         .context("failed to configure worker gossip discovery")?,
     );
-    spawn_worker_load_updater(Arc::clone(&worker_discovery), orchestrator);
-    Ok(worker_discovery.run().await)
+    Ok(worker_discovery)
 }
 
 fn spawn_worker_load_updater(

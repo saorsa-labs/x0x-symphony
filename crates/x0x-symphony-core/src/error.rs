@@ -44,6 +44,10 @@ pub enum SymphonyError {
     #[error("tracker error: {0}")]
     Tracker(String),
 
+    /// Operation is not supported by this implementation.
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+
     /// Runner adapter failure.
     #[error("runner error: {0}")]
     Runner(String),
@@ -87,5 +91,20 @@ impl SymphonyError {
             field,
             message: message.into(),
         }
+    }
+
+    /// Build an unsupported-operation error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use x0x_symphony_core::SymphonyError;
+    ///
+    /// let err = SymphonyError::unsupported("not implemented by this tracker");
+    /// assert!(matches!(err, SymphonyError::Unsupported(_)));
+    /// ```
+    #[must_use]
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::Unsupported(message.into())
     }
 }

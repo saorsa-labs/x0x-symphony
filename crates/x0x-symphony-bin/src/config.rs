@@ -88,7 +88,7 @@ pub struct WorkflowConfig {
     pub security: SecurityConfig,
     /// Signing settings for claim and handoff payloads.
     pub signing: SigningConfig,
-    /// Static M2 sharding placeholder settings.
+    /// Shard assignment settings.
     pub sharding: ShardingConfig,
     /// Worker gossip advertisement settings.
     pub workers: WorkersConfig,
@@ -189,14 +189,13 @@ pub struct SigningConfig {
     pub x0xd_url: String,
 }
 
-/// Static M2 sharding configuration parsed from the optional `sharding:` block.
+/// Sharding configuration parsed from the optional `sharding:` block.
 ///
-/// This is deliberately a placeholder. M2 reads a static `workers:` list from
-/// `WORKFLOW.md` only so issue creation can freeze shard slates now; M4 replaces
-/// this with live x0x presence-based trusted-worker discovery.
+/// `workers` remains parsed for backward compatibility but is deprecated; live
+/// `WorkerView` snapshots are the source of truth for new shard assignment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardingConfig {
-    /// Static trusted-worker roster used for XOR-distance shard assignment.
+    /// Deprecated static trusted-worker roster.
     pub workers: Vec<AgentId>,
     /// Total shard owner count: one primary plus `replication_factor - 1` backups.
     pub replication_factor: usize,
@@ -651,6 +650,11 @@ fn parse_sharding(root: &Map<String, Value>, problems: &mut Vec<String>) -> Opti
         return None;
     };
     let workers = optional_agent_list(sharding, "sharding.workers", problems)?;
+    if !workers.is_empty() {
+        tracing::warn!(
+            "sharding.workers is deprecated and no longer used for shard assignment; live WorkerView is the source of truth"
+        );
+    }
     let replication_factor = optional_usize(sharding, "sharding.replication_factor", problems, 1)
         .unwrap_or(shard::DEFAULT_REPLICATION_FACTOR);
     Some(ShardingConfig {

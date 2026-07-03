@@ -1,8 +1,8 @@
 //! Deterministic shard assignment for issue ownership.
 //!
-//! M2 uses a static worker roster supplied by the daemon configuration. This
-//! module deliberately keeps the assignment pure so M4 can swap the roster
-//! source to live x0x presence without changing the frozen issue schema.
+//! Tracker adapters pass a live worker roster snapshot at issue creation time.
+//! This module deliberately keeps the assignment pure so the frozen issue schema
+//! does not depend on how that roster was discovered.
 
 use std::collections::BTreeSet;
 
@@ -16,11 +16,10 @@ pub const DEFAULT_REPLICATION_FACTOR: usize = 3;
 /// Default claim TTL stored on newly assigned shards: one hour.
 pub const DEFAULT_CLAIM_TTL_MS: u64 = 3_600_000;
 
-/// Static M2 worker-list view epoch.
+/// Legacy static worker-list view epoch used only by [`assign`].
 ///
-/// This remains `1` while the worker roster is configured statically. M4 live
-/// presence discovery is responsible for incrementing epochs when the trusted
-/// worker view changes.
+/// Live issue creation should call [`assign_with_metadata`] with the `WorkerView`
+/// epoch captured for that creation.
 pub const STATIC_WORKER_VIEW_EPOCH: u64 = 1;
 
 const NODE_ID_BYTES: usize = 32;

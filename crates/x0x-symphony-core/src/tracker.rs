@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff, Issue, IssueId,
-    IssueState, Result,
+    AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff, Issue, IssueDraft,
+    IssueId, IssueState, Result,
 };
 
 /// Context supplied when polling a tracker for dispatch candidates.
@@ -223,6 +223,18 @@ pub trait Tracker: Send + Sync {
     async fn list_issues(&self) -> Result<Vec<Issue>> {
         Err(crate::SymphonyError::Tracker(
             "tracker does not support listing all issues".into(),
+        ))
+    }
+
+    /// Create a new symphony-owned issue and assign its shard slate.
+    ///
+    /// Trackers that do not own issue creation keep the default unsupported
+    /// response so read-only mocks and mirror adapters do not need a stub
+    /// implementation.
+    async fn create_issue(&self, draft: IssueDraft) -> Result<Issue> {
+        let _ = draft;
+        Err(crate::SymphonyError::unsupported(
+            "this tracker does not own issue creation",
         ))
     }
 

@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::{net::TcpListener, task::JoinHandle};
 use x0x_symphony_bin::api::{build_router, AppState};
 use x0x_symphony_core::{
-    AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext, ReleaseReason,
+    AgentId, Claim, Handoff, Issue, IssueDraft, IssueId, IssueState, PollContext, ReleaseReason,
     Result as CoreResult, Tracker,
 };
 
@@ -64,6 +64,55 @@ impl Tracker for StaticTracker {
     }
 }
 
+#[derive(Default)]
+struct CreateTracker;
+
+#[async_trait]
+impl Tracker for CreateTracker {
+    async fn list_issues(&self) -> CoreResult<Vec<Issue>> {
+        Ok(Vec::new())
+    }
+
+    async fn create_issue(&self, draft: IssueDraft) -> CoreResult<Issue> {
+        let mut issue = Issue::new(
+            IssueId::new("TASK-1")?,
+            "TASK-1",
+            draft.title,
+            IssueState::new("todo")?,
+            "2026-07-03T00:00:00Z",
+        )?;
+        issue.description = draft.description.unwrap_or_default();
+        issue.labels = draft.labels;
+        Ok(issue)
+    }
+
+    async fn fetch_candidates(&self, _ctx: &PollContext) -> CoreResult<Vec<Issue>> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_by_ids(&self, _ids: &[IssueId]) -> CoreResult<Vec<Issue>> {
+        Ok(Vec::new())
+    }
+
+    async fn claim(&self, _id: &IssueId, _agent_id: &AgentId) -> CoreResult<Claim> {
+        Err(x0x_symphony_core::SymphonyError::Tracker(
+            "create tracker cannot claim".to_owned(),
+        ))
+    }
+
+    async fn heartbeat(&self, _claim: &Claim) -> CoreResult<()> {
+        Ok(())
+    }
+
+    async fn release(&self, _claim: &Claim, _reason: ReleaseReason) -> CoreResult<()> {
+        Ok(())
+    }
+
+    async fn handoff(&self, _claim: &Claim, _handoff: Handoff) -> CoreResult<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn symphony_routes_require_bearer_token() -> Result<(), Box<dyn Error>> {
     let issue = Issue::new(
@@ -103,6 +152,37 @@ async fn symphony_routes_require_bearer_token() -> Result<(), Box<dyn Error>> {
         .send()
         .await?;
     assert_eq!(ok.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_symphony_issues_calls_tracker_create_issue() -> Result<(), Box<dyn Error>> {
+    let tracker: Arc<dyn Tracker> = Arc::new(CreateTracker);
+    let state = AppState::new(
+        tracker,
+        AgentId::new("symphonyd")?,
+        "secret-token".to_owned(),
+        None,
+    );
+    let server = spawn_server(state).await?;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/symphony/issues", server.base_url))
+        .bearer_auth("secret-token")
+        .json(&serde_json::json!({
+            "title": "Created through API",
+            "description": "body",
+            "labels": ["x0x-symphony"]
+        }))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<Value>().await?;
+    assert_eq!(body["id"], "TASK-1");
+    assert_eq!(body["title"], "Created through API");
+    assert_eq!(body["description"], "body");
     Ok(())
 }
 
