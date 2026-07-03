@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use reqwest::StatusCode;
 use thiserror::Error;
 
 use crate::{client, config::WorkflowConfig};
@@ -60,6 +61,12 @@ pub enum Commands {
     },
     /// Show daemon status.
     Status,
+    /// Inspect and act on network-sourced task approvals.
+    Approvals {
+        /// Approval subcommand.
+        #[command(subcommand)]
+        command: ApprovalsCommand,
+    },
     /// Inspect proof artefacts.
     Proofs {
         /// Proof subcommand.
@@ -80,6 +87,35 @@ pub enum Commands {
     },
     /// List daemon HTTP routes.
     Routes,
+}
+
+/// Approval-related subcommands.
+#[derive(Clone, Debug, Subcommand)]
+pub enum ApprovalsCommand {
+    /// List network-sourced issues awaiting an approval decision.
+    List,
+    /// Approve a network-sourced issue for execution.
+    Approve {
+        /// Issue id to approve.
+        id: String,
+        /// Optional expected content hash; POST fails with 409 if it no longer matches (stale-UI protection).
+        #[arg(long)]
+        expected_hash: Option<String>,
+        /// Optional expected network signer agent id; POST fails with 409 on mismatch.
+        #[arg(long)]
+        expected_signer: Option<String>,
+    },
+    /// Deny a network-sourced issue (terminal until payload changes).
+    Deny {
+        /// Issue id to deny.
+        id: String,
+        /// Optional expected content hash; POST fails with 409 if it no longer matches (stale-UI protection).
+        #[arg(long)]
+        expected_hash: Option<String>,
+        /// Optional expected network signer agent id; POST fails with 409 on mismatch.
+        #[arg(long)]
+        expected_signer: Option<String>,
+    },
 }
 
 /// Proof-related subcommands.
@@ -218,6 +254,34 @@ async fn run_daemon_command(command_line: &CommandLine, command: &Commands) -> R
             let status = client.status().await?;
             Ok(Output::success(format_status(&status)))
         }
+        Commands::Approvals { command } => match command {
+            ApprovalsCommand::List => {
+                let pending = client.approvals_pending().await?;
+                Ok(Output::success(format_pending_approvals(&pending)))
+            }
+            ApprovalsCommand::Approve {
+                id,
+                expected_hash,
+                expected_signer,
+            } => match client
+                .approve(id, expected_hash.as_deref(), expected_signer.as_deref())
+                .await
+            {
+                Ok(event) => Ok(Output::success(format!("{} approved\n", event.issue_id))),
+                Err(error) => approval_error_output(error),
+            },
+            ApprovalsCommand::Deny {
+                id,
+                expected_hash,
+                expected_signer,
+            } => match client
+                .deny(id, expected_hash.as_deref(), expected_signer.as_deref())
+                .await
+            {
+                Ok(event) => Ok(Output::success(format!("{} denied\n", event.issue_id))),
+                Err(error) => approval_error_output(error),
+            },
+        },
         Commands::Proofs { command } => match command {
             ProofsCommand::List => {
                 let proofs = client.proofs().await?;
@@ -235,6 +299,15 @@ async fn run_daemon_command(command_line: &CommandLine, command: &Commands) -> R
         Commands::Config { .. } | Commands::Issue { .. } => Ok(Output::failure(
             "internal error: local command reached daemon dispatch\n",
         )),
+    }
+}
+
+fn approval_error_output(error: client::Error) -> Result<Output> {
+    match error {
+        client::Error::Http { status, body } if status == StatusCode::CONFLICT => {
+            Ok(Output::failure(format_approval_conflict(&body)))
+        }
+        other => Err(other.into()),
     }
 }
 
@@ -287,6 +360,30 @@ fn format_tasks(tasks: &[crate::api::Task]) -> String {
         ));
     }
     join_lines(&lines)
+}
+
+fn format_pending_approvals(pending: &[crate::api::PendingApproval]) -> String {
+    let mut lines = Vec::with_capacity(pending.len().saturating_add(1));
+    lines.push("approvals:".to_owned());
+    if pending.is_empty() {
+        lines.push("- none".to_owned());
+    } else {
+        for approval in pending {
+            lines.push(format!(
+                "- {} [{}] signer {} hash {} {}",
+                approval.issue_id,
+                approval.state,
+                approval.signer_agent_id,
+                short_hash(&approval.content_hash),
+                approval.title
+            ));
+        }
+    }
+    join_lines(&lines)
+}
+
+fn short_hash(content_hash: &str) -> String {
+    content_hash.chars().take(12).collect()
 }
 
 fn format_status(status: &crate::api::Status) -> String {
@@ -345,6 +442,33 @@ fn format_validation_errors(problems: &[String]) -> String {
         .map(|problem| format!("error: {problem}"))
         .collect::<Vec<_>>();
     join_lines(&lines)
+}
+
+fn format_approval_conflict(body: &str) -> String {
+    let detail = match daemon_error_detail(body) {
+        Some(detail) => detail,
+        None => body.trim().to_owned(),
+    };
+    let is_stale_view =
+        detail.contains("issue payload changed") || detail.contains("issue signer changed");
+    if is_stale_view || detail.is_empty() {
+        "issue payload changed since you viewed it; re-check and retry\n".to_owned()
+    } else if let Some(stripped) = detail.strip_prefix("conflict: ") {
+        format!("approval conflict: {stripped}\n")
+    } else {
+        format!("approval conflict: {detail}\n")
+    }
+}
+
+fn daemon_error_detail(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.as_str())
+                .map(str::to_owned)
+        })
 }
 
 fn join_lines(lines: &[String]) -> String {
