@@ -601,7 +601,14 @@ where
         claim: &Claim,
         issue: &Issue,
     ) -> Result<bool> {
-        if IssueSource::from_issue(issue) == IssueSource::Local {
+        // Self-enforcing classification: treat the issue as network-sourced when
+        // the adapter marked it OR when signature provenance is attached. A
+        // provenance-bearing issue must never slip past an absent/Local marker —
+        // the gate cannot rely on every present-and-future adapter remembering
+        // to stamp the source field (fail-closed against delegation gaps).
+        let is_network_sourced = IssueSource::from_issue(issue) == IssueSource::NetworkSourced
+            || issue.signature_provenance.is_some();
+        if !is_network_sourced {
             return Ok(false);
         }
 
