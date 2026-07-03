@@ -31,7 +31,7 @@ use x0x_symphony_core::{
 };
 use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
-    Orchestrator, SystemClock, TrustClient, TrustLevel,
+    NetworkDispatchPolicy, Orchestrator, SystemClock, TrustClient, TrustLevel,
 };
 use x0x_symphony_workspace::{Config as WorkspaceConfig, Manager};
 
@@ -769,12 +769,12 @@ fn config_with_hooks_and_proofs(
 }
 
 fn trust_config(required_trust: TrustLevel, proofs_dir: PathBuf) -> Result<Config, Box<dyn Error>> {
-    network_config(required_trust, true, proofs_dir)
+    network_config(required_trust, NetworkDispatchPolicy::Auto, proofs_dir)
 }
 
 fn network_config(
     required_trust: TrustLevel,
-    network_dispatch_enabled: bool,
+    policy: NetworkDispatchPolicy,
     proofs_dir: PathBuf,
 ) -> Result<Config, Box<dyn Error>> {
     Ok(Config::builder(agent()?)
@@ -783,7 +783,7 @@ fn network_config(
         .global_concurrency(1)
         .retry(fast_retry(1))
         .required_trust(required_trust)
-        .network_dispatch_enabled(network_dispatch_enabled)
+        .network_dispatch(policy)
         .proofs_dir(proofs_dir)
         .build())
 }
@@ -979,7 +979,11 @@ fn assert_blocked_with_code(
 #[tokio::test]
 async fn unsigned_network_issue_never_dispatched() -> Result<(), Box<dyn Error>> {
     let issue = unsigned_network_issue("XSY-GATE-UNSIGNED", &["feature"])?;
-    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Auto,
+        default_test_proofs_dir(),
+    )?;
     let trust = Arc::new(MockTrustClient::default());
 
     let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
@@ -1002,7 +1006,11 @@ async fn invalid_signature_never_dispatched() -> Result<(), Box<dyn Error>> {
         &["feature"],
         Some(SignatureProvenance::invalid("signature mismatch")),
     )?;
-    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Auto,
+        default_test_proofs_dir(),
+    )?;
     let trust = Arc::new(MockTrustClient::default());
 
     let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
@@ -1025,7 +1033,11 @@ async fn verify_transport_error_refused_not_silently_dropped() -> Result<(), Box
         &["feature"],
         Some(SignatureProvenance::transport_error("x0xd unavailable")),
     )?;
-    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Auto,
+        default_test_proofs_dir(),
+    )?;
     let trust = Arc::new(MockTrustClient::default());
 
     let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
@@ -1058,7 +1070,11 @@ async fn untrusted_signer_never_dispatched() -> Result<(), Box<dyn Error>> {
         ),
     ] {
         let issue = network_issue(issue_id, &["feature"], signer)?;
-        let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+        let config = network_config(
+            TrustLevel::Trusted,
+            NetworkDispatchPolicy::Auto,
+            default_test_proofs_dir(),
+        )?;
         let trust = Arc::new(MockTrustClient::with_levels([(signer, level)]));
 
         let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
@@ -1074,7 +1090,11 @@ async fn untrusted_signer_never_dispatched() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 async fn blocked_signer_never_dispatched() -> Result<(), Box<dyn Error>> {
     let issue = network_issue("XSY-GATE-BLOCKED", &["feature"], "blocked-signer")?;
-    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Auto,
+        default_test_proofs_dir(),
+    )?;
     let trust = Arc::new(MockTrustClient::with_levels([(
         "blocked-signer",
         TrustLevel::Blocked,
@@ -1096,7 +1116,11 @@ async fn blocked_signer_never_dispatched() -> Result<(), Box<dyn Error>> {
 #[tokio::test]
 async fn default_off_refuses_all_network_dispatch() -> Result<(), Box<dyn Error>> {
     let issue = network_issue("XSY-GATE-DEFAULT-OFF", &["feature"], "trusted-signer")?;
-    let config = network_config(TrustLevel::Trusted, false, default_test_proofs_dir())?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Off,
+        default_test_proofs_dir(),
+    )?;
     let trust = Arc::new(MockTrustClient::with_levels([(
         "trusted-signer",
         TrustLevel::Trusted,
@@ -1116,9 +1140,39 @@ async fn default_off_refuses_all_network_dispatch() -> Result<(), Box<dyn Error>
 }
 
 #[tokio::test]
+async fn approve_mode_refuses_without_execution() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-GATE-APPROVE", &["feature"], "trusted-signer")?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy);
+    assert!(trust.calls().is_empty());
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-GATE-APPROVE",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn verified_trusted_enabled_dispatches() -> Result<(), Box<dyn Error>> {
     let issue = network_issue("XSY-GATE-POSITIVE", &["feature"], "trusted-signer")?;
-    let config = network_config(TrustLevel::Trusted, true, default_test_proofs_dir())?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Auto,
+        default_test_proofs_dir(),
+    )?;
     let trust = Arc::new(MockTrustClient::with_levels([(
         "trusted-signer",
         TrustLevel::Trusted,
@@ -1146,7 +1200,11 @@ async fn provenance_with_local_marker_still_gated() -> Result<(), Box<dyn Error>
         &["feature"],
         Some(SignatureProvenance::verified("agent-tamper")),
     )?;
-    let config = network_config(TrustLevel::Trusted, false, default_test_proofs_dir())?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Off,
+        default_test_proofs_dir(),
+    )?;
     let trust = Arc::new(MockTrustClient::default());
 
     let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
@@ -1207,7 +1265,11 @@ async fn resumed_network_claim_is_re_gated_not_trusted_from_prior_state(
 }
 
 fn network_config_trusted_enabled() -> Result<Config, Box<dyn Error>> {
-    network_config(TrustLevel::Trusted, true, default_test_proofs_dir())
+    network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Auto,
+        default_test_proofs_dir(),
+    )
 }
 
 #[tokio::test]

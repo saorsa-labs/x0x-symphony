@@ -22,7 +22,7 @@ use x0x_symphony_core::{
     TurnStatus, ValidationResult, ValidationStatus, Workspace, WorkspaceHandle,
 };
 
-use crate::TrustLevel;
+use crate::{NetworkDispatchPolicy, TrustLevel};
 
 use crate::{
     clock::Clock,
@@ -612,16 +612,30 @@ where
             return Ok(false);
         }
 
-        if !self.config.network_dispatch_enabled {
-            self.block_for_dispatch_refusal(
-                guard,
-                claim,
-                ReleaseReasonCode::NetworkDispatchDisabled,
-                "network-sourced dispatch is disabled by security.network_dispatch_enabled"
-                    .to_owned(),
-            )
-            .await?;
-            return Ok(true);
+        match self.config.network_dispatch {
+            NetworkDispatchPolicy::Off => {
+                self.block_for_dispatch_refusal(
+                    guard,
+                    claim,
+                    ReleaseReasonCode::NetworkDispatchDisabled,
+                    "network-sourced dispatch is disabled by security.network_dispatch_enabled"
+                        .to_owned(),
+                )
+                .await?;
+                return Ok(true);
+            }
+            NetworkDispatchPolicy::Approve => {
+                self.block_for_dispatch_refusal(
+                    guard,
+                    claim,
+                    ReleaseReasonCode::AwaitingApproval,
+                    "network-sourced dispatch requires approval (security.network_dispatch=approve); approval flow lands in XSY-0050"
+                        .to_owned(),
+                )
+                .await?;
+                return Ok(true);
+            }
+            NetworkDispatchPolicy::Auto => {}
         }
 
         let signer = match &issue.signature_provenance {

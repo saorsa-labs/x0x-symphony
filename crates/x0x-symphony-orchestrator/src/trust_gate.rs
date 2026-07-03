@@ -63,6 +63,57 @@ pub struct TrustLevelParseError {
     value: String,
 }
 
+/// Network-sourced dispatch behavior selected by workflow configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkDispatchPolicy {
+    /// Refuse every network-sourced dispatch attempt.
+    Off,
+    /// Refuse execution until the approval lifecycle grants this task.
+    Approve,
+    /// Execute after the existing verified-signature and trust checks pass.
+    Auto,
+}
+
+impl NetworkDispatchPolicy {
+    /// Stable workflow configuration string representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Approve => "approve",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl fmt::Display for NetworkDispatchPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for NetworkDispatchPolicy {
+    type Err = NetworkDispatchPolicyParseError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "approve" => Ok(Self::Approve),
+            "auto" => Ok(Self::Auto),
+            _ => Err(NetworkDispatchPolicyParseError {
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Error returned when a network dispatch policy string is not recognized.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("unknown network dispatch policy {value:?}; expected off, approve, or auto")]
+pub struct NetworkDispatchPolicyParseError {
+    value: String,
+}
+
 /// Trust lookup abstraction used by the orchestrator dispatch gate.
 #[async_trait]
 pub trait TrustClient: Send + Sync {
