@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![forbid(unsafe_code)]
 
 /// HTTP API routes, DTOs, and authentication middleware.
 pub mod api;

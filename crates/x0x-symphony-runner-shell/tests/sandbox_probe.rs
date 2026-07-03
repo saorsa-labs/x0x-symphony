@@ -22,15 +22,19 @@ async fn sandbox_probe_reports_all_current_platform_checks(
         .map(|check| check.name.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        names,
-        [
-            "write-outside-workspace",
-            "secret-read",
-            "host-pid-invisible",
-            "non-allowlisted-network",
-        ]
-    );
+    if report.backend == Backend::Native {
+        assert_eq!(names, ["landlock-abi", "cgroup-v2-delegation"]);
+    } else {
+        assert_eq!(
+            names,
+            [
+                "write-outside-workspace",
+                "secret-read",
+                "host-pid-invisible",
+                "non-allowlisted-network",
+            ]
+        );
+    }
     assert_eq!(report.profile, SandboxProfile::NoNetwork);
     assert_current_platform_backend(report.backend);
 
@@ -48,7 +52,11 @@ fn assert_current_platform_backend(backend: Backend) {
 fn assert_current_platform_backend(backend: Backend) {
     assert!(matches!(
         backend,
-        Backend::SandboxRuntime | Backend::Bubblewrap | Backend::Landlock | Backend::None
+        Backend::Native
+            | Backend::SandboxRuntime
+            | Backend::Bubblewrap
+            | Backend::Landlock
+            | Backend::None
     ));
 }
 

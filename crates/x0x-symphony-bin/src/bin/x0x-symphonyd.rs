@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{
     collections::BTreeSet,
     env,
@@ -39,6 +41,13 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    #[cfg(target_os = "linux")]
+    {
+        let argv = env::args_os().collect::<Vec<_>>();
+        if saorsa_sandbox::linux::is_launcher_invocation(&argv) {
+            return saorsa_sandbox::linux::launcher_main(argv).map_err(anyhow::Error::from);
+        }
+    }
     let args = Args::parse();
     run(args).await
 }
