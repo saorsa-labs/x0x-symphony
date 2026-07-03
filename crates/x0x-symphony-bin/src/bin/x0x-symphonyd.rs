@@ -1,6 +1,8 @@
 use std::{
+    env,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -8,7 +10,7 @@ use clap::Parser;
 use serde_json::json;
 use tokio::{net::TcpListener, sync::broadcast};
 use tracing::{error, info, warn};
-use x0x_symphony_bin::{api, auth, config};
+use x0x_symphony_bin::{api, auth, config, workers};
 use x0x_symphony_core::AgentId;
 use x0x_symphony_orchestrator::{
     DispatchEvent, Orchestrator, SystemClock, TrustClient, X0xdTrustClient,
@@ -56,7 +58,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let (tracker, agent_id, signing_client) = build_tracker(&workflow).await?;
     let runner_spec = RunnerSpec::from_workflow_config(&workflow.definition.config)
         .context("runner configuration did not resolve")?;
-    let runner = Arc::new(ShellRunner::new(runner_spec).context("failed to build shell runner")?);
+    let local_worker_card = local_worker_card_template(&workflow, &runner_spec, agent_id.clone());
+    let runner =
+        Arc::new(ShellRunner::new(runner_spec.clone()).context("failed to build shell runner")?);
     let workspace = Arc::new(
         Manager::new(WorkspaceConfig::new(workflow.workspace.root.clone()))
             .context("failed to initialize workspace manager")?,
@@ -70,6 +74,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
     let api_signing_client: Arc<dyn SigningClient> = signing_client.clone();
     let approval_signing_client: Arc<dyn SigningClient> = signing_client.clone();
+    let worker_signing_client = signing_client.clone();
     let approval_key_resolver: Arc<dyn TrustedKeyResolver> = signing_client;
     let (dispatch_events_tx, _) = broadcast::channel(DISPATCH_EVENT_CHANNEL_CAPACITY);
     let orchestrator = Arc::new(
@@ -85,18 +90,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
         )
         .with_event_tx(dispatch_events_tx),
     );
+    let _worker_discovery_handle = spawn_worker_discovery(
+        &workflow,
+        agent_id.clone(),
+        worker_signing_client,
+        local_worker_card,
+        orchestrator.clone(),
+    )
+    .await?;
 
-    let _ = orchestrator.reconcile().await;
-    let sweep = orchestrator
-        .sweep_orphans()
-        .await
-        .context("orphan workspace sweep failed")?;
-    info!(
-        preserved = sweep.preserved_count(),
-        quarantined = sweep.quarantined_count(),
-        refused = sweep.refused_count(),
-        "orphan workspace sweep finished before poll loop"
-    );
+    run_startup_maintenance(&orchestrator).await?;
 
     let orchestrator_handle: Arc<dyn api::OrchestratorHandle> = orchestrator.clone();
     let api_tracker: Arc<dyn x0x_symphony_core::Tracker> = tracker.clone();
@@ -174,6 +177,131 @@ async fn build_tracker(
         .build()
         .context("failed to configure x0x CRDT tracker")?;
     Ok((Arc::new(tracker), agent_id, signing_client))
+}
+
+async fn run_startup_maintenance(
+    orchestrator: &Orchestrator<X0xCrdtTracker, ShellRunner, Manager>,
+) -> anyhow::Result<()> {
+    let _ = orchestrator.reconcile().await;
+    let sweep = orchestrator
+        .sweep_orphans()
+        .await
+        .context("orphan workspace sweep failed")?;
+    info!(
+        preserved = sweep.preserved_count(),
+        quarantined = sweep.quarantined_count(),
+        refused = sweep.refused_count(),
+        "orphan workspace sweep finished before poll loop"
+    );
+    Ok(())
+}
+
+async fn spawn_worker_discovery(
+    workflow: &config::WorkflowConfig,
+    agent_id: AgentId,
+    signing_client: Arc<X0xdClient>,
+    local_worker_card: x0x_symphony_core::WorkerCard,
+    orchestrator: Arc<Orchestrator<X0xCrdtTracker, ShellRunner, Manager>>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let worker_signing_client: Arc<dyn SigningClient> = signing_client.clone();
+    let worker_key_resolver: Arc<dyn TrustedKeyResolver> = signing_client;
+    let worker_discovery = Arc::new(
+        workers::WorkerDiscovery::new(
+            agent_id,
+            worker_signing_client,
+            worker_key_resolver,
+            workflow.signing.x0xd_url.clone(),
+            x0xd_api_token(),
+            local_worker_card,
+            workflow.workers.publish_enabled,
+        )
+        .context("failed to configure worker gossip discovery")?,
+    );
+    spawn_worker_load_updater(Arc::clone(&worker_discovery), orchestrator);
+    Ok(worker_discovery.run().await)
+}
+
+fn spawn_worker_load_updater(
+    worker_discovery: Arc<workers::WorkerDiscovery>,
+    orchestrator: Arc<Orchestrator<X0xCrdtTracker, ShellRunner, Manager>>,
+) {
+    let _load_updater = tokio::spawn(async move {
+        loop {
+            worker_discovery.set_current_load(orchestrator.current_load());
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn local_worker_card_template(
+    workflow: &config::WorkflowConfig,
+    runner_spec: &RunnerSpec,
+    agent_id: AgentId,
+) -> x0x_symphony_core::WorkerCard {
+    let capabilities = configured_or_default_capabilities(workflow, runner_spec);
+    let sandbox_levels = configured_or_default_sandbox_levels(workflow, runner_spec);
+    let runner_presets = configured_or_default_runner_presets(workflow, runner_spec);
+    let max_load = u32::try_from(workflow.agent.max_concurrent_agents).unwrap_or(u32::MAX);
+    workers::local_worker_card_template(
+        agent_id,
+        workflow.workers.ttl_seconds,
+        capabilities,
+        sandbox_levels,
+        runner_presets,
+        max_load,
+    )
+}
+
+fn configured_or_default_capabilities(
+    workflow: &config::WorkflowConfig,
+    runner_spec: &RunnerSpec,
+) -> Vec<String> {
+    if !workflow.workers.capabilities.is_empty() {
+        return workflow.workers.capabilities.clone();
+    }
+    let mut capabilities = vec!["shell".to_owned()];
+    if let Some(preset) = runner_spec.preset {
+        push_unique(&mut capabilities, preset.as_str());
+    }
+    capabilities
+}
+
+fn configured_or_default_sandbox_levels(
+    workflow: &config::WorkflowConfig,
+    runner_spec: &RunnerSpec,
+) -> Vec<String> {
+    if !workflow.workers.sandbox_levels.is_empty() {
+        return workflow.workers.sandbox_levels.clone();
+    }
+    runner_spec.sandbox.as_ref().map_or_else(
+        || vec!["unsandboxed".to_owned()],
+        |sandbox| vec![sandbox.profile.as_kebab().to_owned()],
+    )
+}
+
+fn configured_or_default_runner_presets(
+    workflow: &config::WorkflowConfig,
+    runner_spec: &RunnerSpec,
+) -> Vec<String> {
+    if !workflow.workers.runner_presets.is_empty() {
+        return workflow.workers.runner_presets.clone();
+    }
+    runner_spec.preset.map_or_else(
+        || vec!["shell".to_owned()],
+        |preset| vec![preset.as_str().to_owned()],
+    )
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_owned());
+    }
+}
+
+fn x0xd_api_token() -> Option<String> {
+    env::var("X0X_API_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn workflow_root(config_path: &Path) -> PathBuf {

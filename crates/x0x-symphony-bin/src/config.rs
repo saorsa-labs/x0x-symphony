@@ -90,6 +90,8 @@ pub struct WorkflowConfig {
     pub signing: SigningConfig,
     /// Static M2 sharding placeholder settings.
     pub sharding: ShardingConfig,
+    /// Worker gossip advertisement settings.
+    pub workers: WorkersConfig,
     /// Raw runner block used by `RunnerSpec`.
     pub runner: Value,
 }
@@ -200,6 +202,21 @@ pub struct ShardingConfig {
     pub replication_factor: usize,
 }
 
+/// Worker gossip advertisement configuration parsed from the optional `workers:` block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkersConfig {
+    /// Whether this daemon publishes its own signed worker card.
+    pub publish_enabled: bool,
+    /// Worker-card TTL in seconds.
+    pub ttl_seconds: u64,
+    /// Free-form worker capability tags to advertise.
+    pub capabilities: Vec<String>,
+    /// Sandbox levels or profiles this worker can run.
+    pub sandbox_levels: Vec<String>,
+    /// Runner preset names this worker advertises.
+    pub runner_presets: Vec<String>,
+}
+
 impl WorkflowConfig {
     /// Load and validate a workflow file from disk.
     ///
@@ -249,6 +266,7 @@ impl WorkflowConfig {
         let security = parse_security(root, &mut problems);
         let signing = parse_signing(root, &mut problems);
         let sharding = parse_sharding(root, &mut problems);
+        let workers = parse_workers(root, &mut problems);
         let runner = parse_runner(root, &raw, &mut problems);
 
         if problems.is_empty() {
@@ -273,6 +291,7 @@ impl WorkflowConfig {
             security: security.ok_or_else(internal_validation_gap)?,
             signing: signing.ok_or_else(internal_validation_gap)?,
             sharding: sharding.ok_or_else(internal_validation_gap)?,
+            workers: workers.ok_or_else(internal_validation_gap)?,
             runner: runner.ok_or_else(internal_validation_gap)?,
         })
     }
@@ -640,6 +659,35 @@ fn parse_sharding(root: &Map<String, Value>, problems: &mut Vec<String>) -> Opti
     })
 }
 
+fn parse_workers(root: &Map<String, Value>, problems: &mut Vec<String>) -> Option<WorkersConfig> {
+    let Some(value) = root.get("workers") else {
+        return Some(WorkersConfig {
+            publish_enabled: true,
+            ttl_seconds: 60,
+            capabilities: Vec::new(),
+            sandbox_levels: Vec::new(),
+            runner_presets: Vec::new(),
+        });
+    };
+    let Some(workers) = value.as_object() else {
+        problems.push("workers must be a mapping".to_owned());
+        return None;
+    };
+    let publish_enabled =
+        optional_bool(workers, "workers.publish_enabled", problems).unwrap_or(true);
+    let ttl_seconds = optional_u64(workers, "workers.ttl_seconds", problems, 1).unwrap_or(60);
+    let capabilities = optional_string_list_checked(workers, "workers.capabilities", problems)?;
+    let sandbox_levels = optional_string_list_checked(workers, "workers.sandbox_levels", problems)?;
+    let runner_presets = optional_string_list_checked(workers, "workers.runner_presets", problems)?;
+    Some(WorkersConfig {
+        publish_enabled,
+        ttl_seconds,
+        capabilities,
+        sandbox_levels,
+        runner_presets,
+    })
+}
+
 fn parse_runner(
     root: &Map<String, Value>,
     raw: &Value,
@@ -851,6 +899,35 @@ fn optional_string_list(map: &Map<String, Value>, path: &'static str) -> Option<
     }
 }
 
+fn optional_string_list_checked(
+    map: &Map<String, Value>,
+    path: &'static str,
+    problems: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    let key = leaf_key(path);
+    let Some(value) = map.get(key) else {
+        return Some(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        problems.push(format!("{path} must be a list of strings"));
+        return None;
+    };
+    let mut strings = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(raw) = value.as_str() else {
+            problems.push(format!("{path}[{index}] must be a string"));
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            problems.push(format!("{path}[{index}] must not be empty"));
+        } else {
+            strings.push(trimmed.to_owned());
+        }
+    }
+    Some(strings)
+}
+
 fn optional_root_string_list(
     root: &Map<String, Value>,
     path: &'static str,
@@ -904,6 +981,27 @@ fn optional_agent_list(
         }
     }
     Some(agents)
+}
+
+fn optional_u64(
+    map: &Map<String, Value>,
+    path: &'static str,
+    problems: &mut Vec<String>,
+    min: u64,
+) -> Option<u64> {
+    let key = leaf_key(path);
+    match map.get(key).and_then(Value::as_u64) {
+        Some(value) if value >= min => Some(value),
+        Some(_) => {
+            problems.push(format!("{path} must be >= {min}"));
+            None
+        }
+        None if map.contains_key(key) => {
+            problems.push(format!("{path} must be an unsigned integer"));
+            None
+        }
+        None => None,
+    }
 }
 
 fn optional_usize(

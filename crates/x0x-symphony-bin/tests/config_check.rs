@@ -89,6 +89,62 @@ fn network_dispatch_defaults_off() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn workers_config_defaults_to_publish_enabled_with_sixty_second_ttl() -> Result<(), Box<dyn Error>>
+{
+    let workflow = workflow_missing("none");
+
+    let config = WorkflowConfig::from_markdown(&workflow)?;
+
+    assert!(config.workers.publish_enabled);
+    assert_eq!(config.workers.ttl_seconds, 60);
+    assert!(config.workers.capabilities.is_empty());
+    assert!(config.workers.sandbox_levels.is_empty());
+    assert!(config.workers.runner_presets.is_empty());
+    Ok(())
+}
+
+#[test]
+fn workers_config_overrides_parse() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_missing("none").replace(
+        "agent:\n",
+        concat!(
+            "workers:\n",
+            "  publish_enabled: false\n",
+            "  ttl_seconds: 120\n",
+            "  capabilities: [\"rust\", \"docs\"]\n",
+            "  sandbox_levels: [\"repo-write\"]\n",
+            "  runner_presets: [\"claude_code\"]\n\n",
+            "agent:\n",
+        ),
+    );
+
+    let config = WorkflowConfig::from_markdown(&workflow)?;
+
+    assert!(!config.workers.publish_enabled);
+    assert_eq!(config.workers.ttl_seconds, 120);
+    assert_eq!(config.workers.capabilities, ["rust", "docs"]);
+    assert_eq!(config.workers.sandbox_levels, ["repo-write"]);
+    assert_eq!(config.workers.runner_presets, ["claude_code"]);
+    Ok(())
+}
+
+#[test]
+fn workers_ttl_must_be_positive() -> Result<(), Box<dyn Error>> {
+    let workflow =
+        workflow_missing("none").replace("agent:\n", "workers:\n  ttl_seconds: 0\n\nagent:\n");
+
+    let problems = invalid_workflow_problems(&workflow)?;
+
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem == "workers.ttl_seconds must be >= 1"),
+        "problems were: {problems:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn network_dispatch_policy_values_parse() -> Result<(), Box<dyn Error>> {
     for (raw, expected) in [
         ("off", NetworkDispatchPolicy::Off),

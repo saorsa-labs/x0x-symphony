@@ -451,6 +451,15 @@ impl<T, R, W> Orchestrator<T, R, W> {
         reconcile::issue_heartbeat_interval(issue, self.ttl())
     }
 
+    /// Return the current number of in-flight dispatches.
+    #[must_use]
+    pub fn current_load(&self) -> u32 {
+        let Ok(state) = self.state.lock() else {
+            return 0;
+        };
+        u32::try_from(state.in_flight.len()).unwrap_or(u32::MAX)
+    }
+
     /// `true` once shutdown has been requested.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown_flag.load(Ordering::Acquire)
