@@ -54,13 +54,35 @@ must never degrade to `auto` or `approve`).
 **Backward compatibility:** the legacy boolean `network_dispatch_enabled` maps
 `true → approve` (never `auto`) with a deprecation warning, and `false → off`.
 
-### Approval mechanics
+### Approval mechanics — binding key (operator decision 2026-07-03)
 
-An `ApprovalEvent` is signed (x0x-symphony-signing / x0xd identity) and bound to:
-**issue id + claim id + content hash** of the issue payload (title/body/commands)
-at approval time. If the payload changes after approval, the approval is **void**
-and the task returns to `PendingApproval`. Denial is a signed event too, and is
-terminal for that claim. Approvals expire at `approval_ttl`; expiry = re-gate.
+**An ApprovalEvent is keyed by `issue_id` + canonical content-hash + signer**, NOT
+by `claim_id`. Rationale: the dispatch model releases a network-sourced claim when
+it enters `PendingApproval` (`block_for_dispatch_refusal` → `tracker.block`), and a
+re-poll after approval mints a fresh `claim_id`. Binding to `claim_id` would be
+incoherent — the approval would reference a dead claim. The `claim_id` is
+**recorded in the event for audit only** (which claim was pending at approval
+time); it is not the binding key and is not consulted on re-dispatch.
+
+The ApprovalEvent is signed (x0x-symphony-signing / x0xd identity) and bound to:
+- **issue id** — the work item being approved;
+- **canonical content-hash** — hash of the canonical issue payload
+  (title/body/commands) at approval time. If the payload changes after approval,
+  the approval is **void** and the task returns to `PendingApproval`;
+- **signer** — the network agent whose signed issue was approved (binds the
+  approval to a specific trusted source, not any future signer of the same id).
+
+**Single-execution consumption.** An approval, once valid, authorizes exactly
+**one** dispatch execution. Consumption is recorded as a signed
+`ApprovalConsumed` event (bound to the same issue_id + content-hash + signer + a
+nonce). The gate treats an approval whose `ApprovalConsumed` event exists as
+invalid — a re-dispatch of the same payload after execution must be re-approved.
+This closes the reuse-across-claims property of the issue_id key: yes an
+approval is reusable across claims, but only until it is consumed once.
+
+Denial is a signed event too, and is terminal for the issue's network dispatch
+until the payload changes (a new payload = a new content-hash = re-eligible for
+approval). Approvals expire at `approval_ttl`; expiry = re-gate.
 
 The consent check lives **inside the existing dispatch gate** in
 `dispatch.rs::run_claim`, before any workspace/hook/runner work. The
@@ -71,8 +93,9 @@ consumers must never be asked to approve a task that fails those checks;
 those refuse outright.
 
 On restart, approvals are re-verified from the CRDT record: a resumed network
-claim with a valid stored approval executes; with an expired or
-payload-mismatched approval it does not.
+claim with a valid (unexpired, payload-matching, unconsumed, signature-verified)
+stored approval executes; with an expired, payload-mismatched, consumed, or
+missing approval it returns to `PendingApproval`.
 
 ### Consumer surface
 
