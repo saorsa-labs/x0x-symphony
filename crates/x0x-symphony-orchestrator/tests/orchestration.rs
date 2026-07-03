@@ -23,11 +23,13 @@ use chrono::{DateTime, Utc};
 use futures_util::stream;
 use tempfile::TempDir;
 use x0x_symphony_core::{
-    AgentId, Claim, EventStream, Handoff, Hook, HookEnv, HookOutcome, HookStatus, Issue, IssueId,
-    IssueState, LifecycleHooks, PollContext, Prompt, ReleaseReason, ReleaseReasonCode,
-    Result as CoreResult, Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext,
-    SessionHandle, SessionId, Shard, SignatureProvenance, TurnOutcome, TurnStatus, UsageReport,
-    ValidationStatus, Workspace, WorkspaceHandle,
+    content_hash, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, ApprovalVerdict, Claim,
+    EventStream, Handoff, Hook, HookEnv, HookOutcome, HookStatus, Issue, IssueId, IssueState,
+    LifecycleHooks, PollContext, Prompt, ReleaseReason, ReleaseReasonCode, Result as CoreResult,
+    Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext, SessionHandle,
+    SessionId, Shard, SignatureEnvelope, SignatureProvenance, Tracker, TurnOutcome, TurnStatus,
+    UsageReport, ValidationStatus, Workspace, WorkspaceHandle, APPROVAL_CONSUMED_CONTEXT,
+    APPROVAL_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_orchestrator::{
     dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
@@ -526,6 +528,7 @@ struct StubTracker {
     issues: Mutex<Vec<Issue>>,
     releases: Mutex<Vec<(IssueId, ReleaseReasonCode)>>,
     handoffs: Mutex<Vec<Handoff>>,
+    approvals: Mutex<ApprovalState>,
     abandons: Mutex<Vec<(IssueId, AgentId)>>,
     /// Number of times `heartbeat` was called (proves the periodic task fires).
     heartbeats: Mutex<u32>,
@@ -715,6 +718,34 @@ impl x0x_symphony_core::Tracker for StubTracker {
             }
             lock(&self.releases)?.push((id.clone(), reason.code));
         }
+        Ok(())
+    }
+
+    async fn load_approval_state(&self, issue_id: &IssueId) -> CoreResult<ApprovalState> {
+        let approvals = lock(&self.approvals)?;
+        Ok(ApprovalState {
+            events: approvals
+                .events
+                .iter()
+                .filter(|event| &event.issue_id == issue_id)
+                .cloned()
+                .collect(),
+            consumed: approvals
+                .consumed
+                .iter()
+                .filter(|event| &event.issue_id == issue_id)
+                .cloned()
+                .collect(),
+        })
+    }
+
+    async fn store_approval(&self, event: &ApprovalEvent) -> CoreResult<()> {
+        lock(&self.approvals)?.events.push(event.clone());
+        Ok(())
+    }
+
+    async fn store_consumed(&self, event: &ApprovalConsumed) -> CoreResult<()> {
+        lock(&self.approvals)?.consumed.push(event.clone());
         Ok(())
     }
 }
@@ -922,9 +953,43 @@ async fn run_spy_dispatch(
     ),
     Box<dyn Error>,
 > {
+    run_spy_dispatch_with_approval_state(issue, config, trust, ApprovalState::default()).await
+}
+
+async fn run_spy_dispatch_with_approval_state(
+    issue: Issue,
+    config: Config,
+    trust: Arc<MockTrustClient>,
+    approval_state: ApprovalState,
+) -> Result<
+    (
+        Option<Resolution>,
+        Arc<ExecutionSpy>,
+        Arc<StubTracker>,
+        Arc<MockTrustClient>,
+    ),
+    Box<dyn Error>,
+> {
+    let tracker = Arc::new(StubTracker::with(vec![issue]));
+    *lock(&tracker.approvals)? = approval_state;
+    run_spy_dispatch_with_tracker(tracker, config, trust).await
+}
+
+async fn run_spy_dispatch_with_tracker(
+    tracker: Arc<StubTracker>,
+    config: Config,
+    trust: Arc<MockTrustClient>,
+) -> Result<
+    (
+        Option<Resolution>,
+        Arc<ExecutionSpy>,
+        Arc<StubTracker>,
+        Arc<MockTrustClient>,
+    ),
+    Box<dyn Error>,
+> {
     let tmp = TempDir::new()?;
     let spy = Arc::new(ExecutionSpy::default());
-    let tracker = Arc::new(StubTracker::with(vec![issue]));
     let runner = Arc::new(SpyRunner {
         spy: Arc::clone(&spy),
     });
@@ -972,6 +1037,92 @@ fn assert_blocked_with_code(
         .ok_or("blocked reason code should be recorded")?;
     assert_eq!(blocked_code, code.as_str());
     Ok(())
+}
+
+fn signed_approval_event(
+    issue: &Issue,
+    signer: &str,
+    verdict: ApprovalVerdict,
+    approved_at: &str,
+) -> Result<ApprovalEvent, Box<dyn Error>> {
+    let signer = AgentId::new(signer)?;
+    let mut event = match verdict {
+        ApprovalVerdict::Approve => ApprovalEvent::approve(
+            issue.id.clone(),
+            content_hash(issue),
+            signer,
+            approved_at,
+            AgentId::new("approver")?,
+            Some("claim-for-audit".to_owned()),
+        ),
+        ApprovalVerdict::Deny => ApprovalEvent::deny(
+            issue.id.clone(),
+            content_hash(issue),
+            signer,
+            approved_at,
+            AgentId::new("approver")?,
+            Some("claim-for-audit".to_owned()),
+        ),
+    };
+    let payload_sha256 = event.signing_payload_sha256()?;
+    event.signature = Some(SignatureEnvelope::new(
+        SIGN_ALGORITHM,
+        APPROVAL_CONTEXT,
+        "public-key",
+        "signature",
+        payload_sha256,
+        event.approver_agent_id.to_string(),
+    ));
+    Ok(event)
+}
+
+fn signed_consumed_event(
+    event: &ApprovalEvent,
+    nonce: &str,
+    consumed_at: &str,
+) -> Result<ApprovalConsumed, Box<dyn Error>> {
+    let placeholder = SignatureEnvelope::new(
+        SIGN_ALGORITHM,
+        APPROVAL_CONSUMED_CONTEXT,
+        "public-key",
+        "signature",
+        "placeholder",
+        "consumer",
+    );
+    let mut consumed = ApprovalConsumed::new(
+        event.issue_id.clone(),
+        event.content_hash.clone(),
+        event.signer_agent_id.clone(),
+        nonce,
+        consumed_at,
+        placeholder,
+    );
+    let payload_sha256 = consumed.signing_payload_sha256()?;
+    consumed.signature = SignatureEnvelope::new(
+        SIGN_ALGORITHM,
+        APPROVAL_CONSUMED_CONTEXT,
+        "public-key",
+        "signature",
+        payload_sha256,
+        "consumer",
+    );
+    Ok(consumed)
+}
+
+async fn store_approval(
+    tracker: &StubTracker,
+    event: &ApprovalEvent,
+) -> Result<(), Box<dyn Error>> {
+    Tracker::store_approval(tracker, event).await?;
+    Ok(())
+}
+
+fn assert_consumed_count(tracker: &StubTracker, expected: usize) {
+    let approvals = guard(&tracker.approvals);
+    assert_eq!(approvals.consumed.len(), expected);
+    for consumed in &approvals.consumed {
+        assert!(consumed.signature_envelope_is_consistent());
+    }
 }
 
 // ---------- tests ----------
@@ -1154,12 +1305,327 @@ async fn approve_mode_refuses_without_execution() -> Result<(), Box<dyn Error>> 
 
     let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
 
-    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
     assert_no_execution_calls(&spy);
-    assert!(trust.calls().is_empty());
+    assert_eq!(trust.calls(), vec!["trusted-signer".to_owned()]);
     assert_blocked_with_code(
         &tracker,
         "XSY-GATE-APPROVE",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn approve_with_valid_approval_dispatches() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-APPROVE-VALID", &["feature"], "trusted-signer")?;
+    let approval = signed_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+    )?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch_with_approval_state(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval],
+            consumed: Vec::new(),
+        },
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::Completed));
+    assert_eq!(spy.counts(), (1, 0, 1, 1));
+    assert_eq!(trust.calls(), vec!["trusted-signer".to_owned()]);
+    assert_eq!(guard(&tracker.handoffs).len(), 1);
+    assert_consumed_count(&tracker, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn approve_missing_approval_enters_pending() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-APPROVE-MISSING", &["feature"], "trusted-signer")?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_eq!(trust.calls(), vec!["trusted-signer".to_owned()]);
+    assert_consumed_count(&tracker, 0);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-APPROVE-MISSING",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn approve_expired_approval_re_pending() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-APPROVE-EXPIRED", &["feature"], "trusted-signer")?;
+    let approval = signed_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        "2000-01-01T00:00:00Z",
+    )?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, _trust) = run_spy_dispatch_with_approval_state(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval],
+            consumed: Vec::new(),
+        },
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_consumed_count(&tracker, 0);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-APPROVE-EXPIRED",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn approve_consumed_approval_re_pending() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-APPROVE-CONSUMED", &["feature"], "trusted-signer")?;
+    let approval = signed_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+    )?;
+    let consumed = signed_consumed_event(&approval, "nonce-1", &now_iso())?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, _trust) = run_spy_dispatch_with_approval_state(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval],
+            consumed: vec![consumed],
+        },
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_consumed_count(&tracker, 1);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-APPROVE-CONSUMED",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn approve_payload_mismatch_re_pending() -> Result<(), Box<dyn Error>> {
+    let original = network_issue("XSY-APPROVE-MISMATCH", &["feature"], "trusted-signer")?;
+    let approval = signed_approval_event(
+        &original,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+    )?;
+    let mut changed = original;
+    changed.description = "changed payload after approval".to_owned();
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, _trust) = run_spy_dispatch_with_approval_state(
+        changed,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval],
+            consumed: Vec::new(),
+        },
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_consumed_count(&tracker, 0);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-APPROVE-MISMATCH",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn approve_denial_blocks_dispatch() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-APPROVE-DENIED", &["feature"], "trusted-signer")?;
+    let approval = signed_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+    )?;
+    let denial =
+        signed_approval_event(&issue, "trusted-signer", ApprovalVerdict::Deny, &now_iso())?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, _trust) = run_spy_dispatch_with_approval_state(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval, denial],
+            consumed: Vec::new(),
+        },
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_consumed_count(&tracker, 0);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-APPROVE-DENIED",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn approve_sig_failure_refuses_not_pending() -> Result<(), Box<dyn Error>> {
+    let issue = unsigned_network_issue("XSY-APPROVE-SIGFAIL", &["feature"])?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::default());
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy);
+    assert!(trust.calls().is_empty());
+    assert_consumed_count(&tracker, 0);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-APPROVE-SIGFAIL",
+        &ReleaseReasonCode::MissingVerifiedSignature,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_claim_with_valid_approval_executes() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-APPROVE-RESUME", &["feature"], "trusted-signer")?;
+    let approval = signed_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+    )?;
+    let tracker = Arc::new(StubTracker::with(vec![issue.clone()]));
+    store_approval(&tracker, &approval).await?;
+
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust1 = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+    let (res1, spy1, tracker, _trust1) =
+        run_spy_dispatch_with_tracker(Arc::clone(&tracker), config.clone(), trust1).await?;
+
+    assert_eq!(res1, Some(Resolution::Completed));
+    assert_eq!(spy1.counts(), (1, 0, 1, 1));
+    assert_consumed_count(&tracker, 1);
+
+    {
+        let mut issues = lock(&tracker.issues)?;
+        let issue = issues
+            .iter_mut()
+            .find(|candidate| candidate.id.as_str() == "XSY-APPROVE-RESUME")
+            .ok_or("issue should remain in tracker")?;
+        issue.claim = None;
+        issue.handoff = None;
+        set_state(&mut *issue, "todo")?;
+    }
+
+    let trust2 = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+    let (res2, spy2, tracker, _trust2) =
+        run_spy_dispatch_with_tracker(Arc::clone(&tracker), config, trust2).await?;
+
+    assert_eq!(res2, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy2);
+    assert_consumed_count(&tracker, 1);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-APPROVE-RESUME",
         &ReleaseReasonCode::AwaitingApproval,
     )?;
     Ok(())

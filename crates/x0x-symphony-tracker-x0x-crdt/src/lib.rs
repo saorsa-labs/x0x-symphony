@@ -51,9 +51,9 @@ use reqwest::StatusCode;
 use thiserror::Error;
 use tracing::warn;
 use x0x_symphony_core::{
-    sha256_hex, AgentId, Claim, Handoff, Issue, IssueId, IssueState, PollContext, ReleaseReason,
-    ShardRole, SignatureEnvelope, SymphonyError, Tracker, CLAIM_CONTEXT, HANDOFF_CONTEXT,
-    SIGN_ALGORITHM,
+    sha256_hex, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff, Issue,
+    IssueId, IssueState, PollContext, ReleaseReason, ShardRole, SignatureEnvelope, SymphonyError,
+    Tracker, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_signing::{
     SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver, VerifyOutcome,
@@ -62,8 +62,9 @@ use x0x_symphony_signing::{
 use crate::{
     client::{ClientError, TaskAction, X0xdApi, X0xdClient},
     mapping::{
-        claim_key, decode_claim_blob, decode_handoff_blob, encode_claim_blob, encode_handoff_blob,
-        handoff_key, issue_from_task, store_id_for_list, ClaimBlob, ClaimBlobStatus, HandoffBlob,
+        approval_key, claim_key, decode_approval_blob, decode_claim_blob, decode_handoff_blob,
+        encode_approval_blob, encode_claim_blob, encode_handoff_blob, handoff_key, issue_from_task,
+        store_id_for_list, ApprovalBlob, ClaimBlob, ClaimBlobStatus, HandoffBlob,
         SYMPHONY_JSON_CONTENT_TYPE,
     },
 };
@@ -550,6 +551,26 @@ impl X0xCrdtTracker {
             .transpose()
     }
 
+    async fn approval_blob_for_issue(&self, issue_id: &IssueId) -> Result<Option<ApprovalBlob>> {
+        let scope = self.resource_scope().await?;
+        let key = approval_key(issue_id);
+        self.client
+            .get_kv(&scope.store_id, &key)
+            .await?
+            .map(|value| decode_approval_blob(&value.value).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn put_approval_blob(&self, issue_id: &IssueId, blob: &ApprovalBlob) -> Result<()> {
+        let scope = self.resource_scope().await?;
+        let key = approval_key(issue_id);
+        let encoded = encode_approval_blob(blob)?;
+        self.client
+            .put_kv(&scope.store_id, &key, &encoded, SYMPHONY_JSON_CONTENT_TYPE)
+            .await?;
+        Ok(())
+    }
+
     async fn put_claim_blob(&self, task_id: &str, blob: &ClaimBlob) -> Result<()> {
         let scope = self.resource_scope().await?;
         let key = claim_key(task_id);
@@ -980,6 +1001,55 @@ impl Tracker for X0xCrdtTracker {
         )
         .await
         .map_err(SymphonyError::from)
+    }
+
+    async fn load_approval_state(
+        &self,
+        issue_id: &IssueId,
+    ) -> x0x_symphony_core::Result<ApprovalState> {
+        let Some(blob) = self
+            .approval_blob_for_issue(issue_id)
+            .await
+            .map_err(SymphonyError::from)?
+        else {
+            return Ok(ApprovalState::default());
+        };
+        Ok(ApprovalState {
+            events: blob.events,
+            consumed: blob.consumed,
+        })
+    }
+
+    async fn store_approval(&self, event: &ApprovalEvent) -> x0x_symphony_core::Result<()> {
+        let mut blob = match self
+            .approval_blob_for_issue(&event.issue_id)
+            .await
+            .map_err(SymphonyError::from)?
+        {
+            Some(blob) => blob,
+            None => ApprovalBlob::new(event.issue_id.clone(), now_utc()),
+        };
+        blob.events.push(event.clone());
+        blob.updated_at = now_utc();
+        self.put_approval_blob(&event.issue_id, &blob)
+            .await
+            .map_err(SymphonyError::from)
+    }
+
+    async fn store_consumed(&self, event: &ApprovalConsumed) -> x0x_symphony_core::Result<()> {
+        let mut blob = match self
+            .approval_blob_for_issue(&event.issue_id)
+            .await
+            .map_err(SymphonyError::from)?
+        {
+            Some(blob) => blob,
+            None => ApprovalBlob::new(event.issue_id.clone(), now_utc()),
+        };
+        blob.consumed.push(event.clone());
+        blob.updated_at = now_utc();
+        self.put_approval_blob(&event.issue_id, &blob)
+            .await
+            .map_err(SymphonyError::from)
     }
 }
 

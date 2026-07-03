@@ -3,7 +3,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, Claim, Handoff, Issue, IssueId, IssueState, Result};
+use crate::{
+    AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff, Issue, IssueId,
+    IssueState, Result,
+};
 
 /// Context supplied when polling a tracker for dispatch candidates.
 ///
@@ -257,6 +260,27 @@ pub trait Tracker: Send + Sync {
     async fn block(&self, _claim: &Claim, _reason: ReleaseReason) -> Result<()> {
         Err(crate::SymphonyError::Tracker(
             "tracker does not support blocking issues".into(),
+        ))
+    }
+
+    /// Load stored approval, denial, and consumption events for `issue_id`.
+    async fn load_approval_state(&self, _issue_id: &IssueId) -> Result<ApprovalState> {
+        Err(crate::SymphonyError::Tracker(
+            "tracker does not support approval state".into(),
+        ))
+    }
+
+    /// Store a signed approval or denial event.
+    async fn store_approval(&self, _event: &ApprovalEvent) -> Result<()> {
+        Err(crate::SymphonyError::Tracker(
+            "tracker does not support storing approvals".into(),
+        ))
+    }
+
+    /// Store a signed approval-consumption event.
+    async fn store_consumed(&self, _event: &ApprovalConsumed) -> Result<()> {
+        Err(crate::SymphonyError::Tracker(
+            "tracker does not support storing consumption".into(),
         ))
     }
 }

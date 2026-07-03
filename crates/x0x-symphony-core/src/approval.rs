@@ -148,6 +148,18 @@ pub struct ApprovalEvent {
 /// A denial event is an [`ApprovalEvent`] with [`ApprovalVerdict::Deny`].
 pub type DenialEvent = ApprovalEvent;
 
+/// Stored approval data for one issue.
+///
+/// `events` contains signed approval and denial decisions. `consumed` contains
+/// signed consumption records that spend approvals for exactly one dispatch.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalState {
+    /// Approval and denial events retained for the issue.
+    pub events: Vec<ApprovalEvent>,
+    /// Consumption events that have spent matching approvals.
+    pub consumed: Vec<ApprovalConsumed>,
+}
+
 impl ApprovalEvent {
     /// Construct an approval event without a signature envelope.
     #[must_use]
