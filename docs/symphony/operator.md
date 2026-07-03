@@ -8,7 +8,9 @@ This guide describes the current M3 behaviour of `x0x-symphonyd` and the
 where a boundary exists it is stated explicitly rather than papered over.
 
 For the interim security posture see [`security.md`](./security.md); for the
-architecture see [`../design/symphony.md`](../design/symphony.md).
+architecture see [`../design/symphony.md`](../design/symphony.md). The ignored
+multi-daemon partition reunion harness is documented in
+[`partition-stress.md`](./partition-stress.md).
 
 ## Current scope (what ships)
 
