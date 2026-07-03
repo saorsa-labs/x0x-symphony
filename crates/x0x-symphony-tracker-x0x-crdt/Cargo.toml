@@ -1,6 +1,8 @@
 [package]
 name = "x0x-symphony-tracker-x0x-crdt"
 description = "x0xd TaskList CRDT Tracker adapter for x0x-symphony."
+categories = ["development-tools", "network-programming", "data-structures"]
+keywords = ["crdt", "tracker", "p2p", "x0x", "task-tracking"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,8 +23,8 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
-x0x-symphony-core = { path = "../x0x-symphony-core" }
-x0x-symphony-signing = { path = "../x0x-symphony-signing" }
+x0x-symphony-core = { path = "../x0x-symphony-core", version = "0.1.0" }
+x0x-symphony-signing = { path = "../x0x-symphony-signing", version = "0.1.0" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
