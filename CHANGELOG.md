@@ -7,8 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Deprecated
+### Removed
 
-- Deprecated the legacy top-level `codex:` WORKFLOW.md block; use
-  `runner: {kind: shell, preset: codex}` instead. A deprecation warning is
-  emitted on load. Removal is tracked in XSY-0031 (M5).
+- **BREAKING (XSY-0031):** Removed support for the legacy top-level `codex:`
+  WORKFLOW.md block; loading now fails with a structured error. Use
+  `runner: {kind: shell, preset: codex}` instead.

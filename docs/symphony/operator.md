@@ -138,14 +138,15 @@ sandbox remains the enforcement boundary.
 
 ### Migrating from the legacy `codex:` block
 
-Older `WORKFLOW.md` files may still carry a top-level Codex block:
+Older `WORKFLOW.md` files may still carry this unsupported top-level Codex
+block:
 
 ```yaml
 codex:
   app_server: true
 ```
 
-Current configs should express Codex through the shell runner preset instead:
+Current configs must express Codex through the shell runner preset instead:
 
 ```yaml
 runner:
@@ -153,9 +154,10 @@ runner:
   preset: codex
 ```
 
-The legacy `codex:` top-level block now emits a WARN during config load and
-`config check`; it becomes a hard error in M5 (XSY-0031). See
-[`runner-authoring.md`](runner-authoring.md#adding-a-preset) for preset details.
+The legacy `codex:` top-level block was removed in XSY-0031. Config load and
+`config check` now fail with a structured error pointing to this migration path.
+See [`runner-authoring.md`](runner-authoring.md#adding-a-preset) for preset
+details.
 
 Validate without starting the daemon:
 

@@ -353,9 +353,9 @@ Required keys:
   runner-specific config blocks: `runner.shell.{...}`, `runner.codex.{...}`,
   `runner.claude_code.{...}`.
 
-The Codex-specific `codex:` block in the current x0x WORKFLOW.md is
-preserved as a `runner.codex` namespace for backward compatibility, then
-deprecated in M4.
+The legacy top-level `codex:` block was removed in M5. Configs must express
+Codex through the shell runner preset with
+`runner: {kind: shell, preset: codex}`.
 
 ## 9. Lifecycle (locked at M0)
 

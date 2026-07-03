@@ -221,27 +221,31 @@ fn sharding_workers_emit_deprecation_warn() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn legacy_codex_block_emits_deprecation_warn_without_failing_load() -> Result<(), Box<dyn Error>> {
+fn legacy_codex_block_fails_config_load_with_structured_error() -> Result<(), Box<dyn Error>> {
     let workflow = workflow_with_legacy_codex_block();
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(writer.clone())
-        .without_time()
-        .finish();
 
-    let config =
-        tracing::subscriber::with_default(subscriber, || WorkflowConfig::from_markdown(&workflow))?;
+    let problems = invalid_workflow_problems(&workflow)?;
 
-    assert!(config.warnings.iter().any(|warning| warning
-        .contains("`codex:` top-level block is deprecated and will be removed in M5 (XSY-0031)")));
-    assert!(logs_from_writer(&writer)?
-        .contains("`codex:` top-level block is deprecated and will be removed in M5 (XSY-0031)"));
+    assert_eq!(problems.len(), 1, "problems were: {problems:?}");
+    let problem = &problems[0];
+    assert!(
+        problem.contains("`codex:` top-level block was removed in XSY-0031"),
+        "problem was: {problem}"
+    );
+    assert!(
+        problem.contains("`runner: {kind: shell, preset: codex}`"),
+        "problem was: {problem}"
+    );
+    assert!(
+        problem.contains("docs/symphony/operator.md#migrating-from-the-legacy-codex-block"),
+        "problem was: {problem}"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn legacy_codex_block_config_check_warns_but_succeeds() -> Result<(), Box<dyn Error>> {
+async fn legacy_codex_block_config_check_fails_with_structured_error() -> Result<(), Box<dyn Error>>
+{
     let dir = tempfile::tempdir()?;
     let workflow_path = dir.path().join("WORKFLOW.md");
     std::fs::write(&workflow_path, workflow_with_legacy_codex_block())?;
@@ -249,18 +253,31 @@ async fn legacy_codex_block_config_check_warns_but_succeeds() -> Result<(), Box<
 
     let output = run_cli(&["x0x-symphony", "config", "check", "--config", &workflow_arg]).await?;
 
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.stdout, "config ok\n");
-    assert!(output
-        .stderr
-        .contains("warning: `codex:` top-level block is deprecated"));
-    assert!(output.stderr.contains("will be removed in M5 (XSY-0031)"));
-    assert!(output
-        .stderr
-        .contains("`runner: {kind: shell, preset: codex}`"));
-    assert!(output
-        .stderr
-        .contains("docs/symphony/operator.md#migrating-from-the-legacy-codex-block"));
+    assert_eq!(output.exit_code, 1);
+    assert_eq!(output.stdout, "");
+    assert!(
+        output
+            .stderr
+            .contains("error: `codex:` top-level block was removed in XSY-0031"),
+        "stderr was: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("`runner: {kind: shell, preset: codex}`"),
+        "stderr was: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("docs/symphony/operator.md#migrating-from-the-legacy-codex-block"),
+        "stderr was: {}",
+        output.stderr
+    );
+    assert!(!output.stderr.contains("warning:"));
+    assert!(!output.stderr.contains("deprecated"));
     Ok(())
 }
 
