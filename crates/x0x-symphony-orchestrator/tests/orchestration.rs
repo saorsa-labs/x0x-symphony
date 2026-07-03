@@ -33,8 +33,9 @@ use x0x_symphony_core::{
     APPROVAL_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_orchestrator::{
-    dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, ManualClock,
-    NetworkDispatchPolicy, Orchestrator, SystemClock, TrustClient, TrustLevel,
+    dispatch::Resolution, is_fresh_self, retry::RetryPolicy, Clock, Config, DispatchEvent,
+    ManualClock, NetworkDispatchPolicy, Orchestrator, SystemClock, TrustClient, TrustLevel,
+    DISPATCH_EVENT_CHANNEL_CAPACITY,
 };
 use x0x_symphony_signing::{
     AgentInfo, SignResponse, SigningClient, SigningError, TrustedKeyResolver, VerifyOutcome,
@@ -1174,6 +1175,12 @@ async fn run_spy_dispatch_with_tracker_and_signing(
     Ok((resolution, spy, tracker, trust))
 }
 
+async fn next_dispatch_event(
+    events_rx: &mut tokio::sync::broadcast::Receiver<DispatchEvent>,
+) -> Result<DispatchEvent, Box<dyn Error>> {
+    Ok(tokio::time::timeout(std::time::Duration::from_secs(1), events_rx.recv()).await??)
+}
+
 fn assert_no_execution_calls(spy: &ExecutionSpy) {
     assert_eq!(spy.counts(), (0, 0, 0, 0));
 }
@@ -1924,6 +1931,64 @@ async fn approve_missing_approval_enters_pending() -> Result<(), Box<dyn Error>>
 }
 
 #[tokio::test]
+async fn approve_missing_approval_emits_approval_requested() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-APPROVE-REQUEST-EVENT", &["feature"], "trusted-signer")?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let tracker = Arc::new(StubTracker::with(vec![issue]));
+    let tmp = TempDir::new()?;
+    let spy = Arc::new(ExecutionSpy::default());
+    let runner = Arc::new(SpyRunner {
+        spy: Arc::clone(&spy),
+    });
+    let workspace = Arc::new(SpyWorkspace {
+        root: tmp.path().join("workspaces"),
+        spy,
+    });
+    let trust_client: Arc<dyn TrustClient> = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+    let crypto = approval_crypto();
+    let (signing_client, key_resolver) = approval_crypto_clients(&crypto);
+    let (events_tx, _) = tokio::sync::broadcast::channel(DISPATCH_EVENT_CHANNEL_CAPACITY);
+    let orc = Orchestrator::new_with_signing(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config,
+        trust_client,
+        Some(signing_client),
+        Some(key_resolver),
+    )
+    .with_event_tx(events_tx);
+    let mut events_rx = orc
+        .subscribe()
+        .ok_or("orchestrator should expose configured event sink")?;
+
+    let resolution = orc.run_once().await?;
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+
+    match next_dispatch_event(&mut events_rx).await? {
+        DispatchEvent::ApprovalRequested {
+            issue_id,
+            signer_agent_id,
+        } => {
+            assert_eq!(issue_id.as_str(), "XSY-APPROVE-REQUEST-EVENT");
+            assert_eq!(signer_agent_id.as_str(), "trusted-signer");
+        }
+        other @ DispatchEvent::ApprovalExpired { .. } => {
+            return Err(format!("unexpected dispatch event: {other:?}").into());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn approve_expired_approval_re_pending() -> Result<(), Box<dyn Error>> {
     let issue = network_issue("XSY-APPROVE-EXPIRED", &["feature"], "trusted-signer")?;
     let approval = signed_approval_event(
@@ -1965,6 +2030,70 @@ async fn approve_expired_approval_re_pending() -> Result<(), Box<dyn Error>> {
         "XSY-APPROVE-EXPIRED",
         &ReleaseReasonCode::AwaitingApproval,
     )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn approve_expired_approval_emits_approval_expired() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-APPROVE-EXPIRED-EVENT", &["feature"], "trusted-signer")?;
+    let approval = signed_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        "2000-01-01T00:00:00Z",
+    )?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let tracker = Arc::new(StubTracker::with(vec![issue]));
+    *lock(&tracker.approvals)? = ApprovalState {
+        events: vec![approval],
+        consumed: Vec::new(),
+    };
+    let tmp = TempDir::new()?;
+    let spy = Arc::new(ExecutionSpy::default());
+    let runner = Arc::new(SpyRunner {
+        spy: Arc::clone(&spy),
+    });
+    let workspace = Arc::new(SpyWorkspace {
+        root: tmp.path().join("workspaces"),
+        spy,
+    });
+    let trust_client: Arc<dyn TrustClient> = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+    let crypto = approval_crypto();
+    let (signing_client, key_resolver) = approval_crypto_clients(&crypto);
+    let (events_tx, _) = tokio::sync::broadcast::channel(DISPATCH_EVENT_CHANNEL_CAPACITY);
+    let orc = Orchestrator::new_with_signing(
+        Arc::clone(&tracker),
+        runner,
+        workspace,
+        sysclock(),
+        config,
+        trust_client,
+        Some(signing_client),
+        Some(key_resolver),
+    )
+    .with_event_tx(events_tx);
+    let mut events_rx = orc
+        .subscribe()
+        .ok_or("orchestrator should expose configured event sink")?;
+
+    let resolution = orc.run_once().await?;
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+
+    match next_dispatch_event(&mut events_rx).await? {
+        DispatchEvent::ApprovalExpired { issue_id } => {
+            assert_eq!(issue_id.as_str(), "XSY-APPROVE-EXPIRED-EVENT");
+        }
+        other @ DispatchEvent::ApprovalRequested { .. } => {
+            return Err(format!("unexpected dispatch event: {other:?}").into());
+        }
+    }
     Ok(())
 }
 

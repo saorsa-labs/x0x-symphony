@@ -5,11 +5,15 @@ use std::{
 
 use anyhow::Context;
 use clap::Parser;
-use tokio::net::TcpListener;
-use tracing::{error, info};
+use serde_json::json;
+use tokio::{net::TcpListener, sync::broadcast};
+use tracing::{error, info, warn};
 use x0x_symphony_bin::{api, auth, config};
 use x0x_symphony_core::AgentId;
-use x0x_symphony_orchestrator::{Orchestrator, SystemClock, TrustClient, X0xdTrustClient};
+use x0x_symphony_orchestrator::{
+    DispatchEvent, Orchestrator, SystemClock, TrustClient, X0xdTrustClient,
+    DISPATCH_EVENT_CHANNEL_CAPACITY,
+};
 use x0x_symphony_runner_shell::{RunnerSpec, ShellRunner};
 use x0x_symphony_signing::{SigningClient, SigningPolicy, TrustedKeyResolver, X0xdClient};
 use x0x_symphony_tracker_x0x_crdt::X0xCrdtTracker;
@@ -67,16 +71,20 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let api_signing_client: Arc<dyn SigningClient> = signing_client.clone();
     let approval_signing_client: Arc<dyn SigningClient> = signing_client.clone();
     let approval_key_resolver: Arc<dyn TrustedKeyResolver> = signing_client;
-    let orchestrator = Arc::new(Orchestrator::new_with_signing(
-        tracker.clone(),
-        runner,
-        workspace,
-        Arc::new(SystemClock),
-        orchestrator_config,
-        trust_client,
-        Some(approval_signing_client),
-        Some(approval_key_resolver),
-    ));
+    let (dispatch_events_tx, _) = broadcast::channel(DISPATCH_EVENT_CHANNEL_CAPACITY);
+    let orchestrator = Arc::new(
+        Orchestrator::new_with_signing(
+            tracker.clone(),
+            runner,
+            workspace,
+            Arc::new(SystemClock),
+            orchestrator_config,
+            trust_client,
+            Some(approval_signing_client),
+            Some(approval_key_resolver),
+        )
+        .with_event_tx(dispatch_events_tx),
+    );
 
     let _ = orchestrator.reconcile().await;
     let sweep = orchestrator
@@ -96,6 +104,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .with_proofs_dir(proofs_dir)
         .with_signing_client(Some(api_signing_client))
         .with_approval_ttl(workflow.security.approval_ttl);
+    if let Some(dispatch_events_rx) = orchestrator.subscribe() {
+        spawn_dispatch_event_forwarder(dispatch_events_rx, app_state.events_sender());
+    }
     let app = api::build_router(app_state);
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -169,6 +180,46 @@ fn workflow_root(config_path: &Path) -> PathBuf {
     config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+fn spawn_dispatch_event_forwarder(
+    mut dispatch_events_rx: broadcast::Receiver<DispatchEvent>,
+    events_tx: broadcast::Sender<api::EventNotice>,
+) {
+    let _forwarder = tokio::spawn(async move {
+        loop {
+            match dispatch_events_rx.recv().await {
+                Ok(event) => {
+                    let notice = dispatch_event_notice(event);
+                    let _send_result = events_tx.send(notice);
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "dispatch event forwarder lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn dispatch_event_notice(event: DispatchEvent) -> api::EventNotice {
+    match event {
+        DispatchEvent::ApprovalRequested {
+            issue_id,
+            signer_agent_id,
+        } => api::EventNotice::new(
+            "approval_requested",
+            json!({
+                "issue_id": issue_id.as_str(),
+                "signer_agent_id": signer_agent_id.as_str(),
+            })
+            .to_string(),
+        ),
+        DispatchEvent::ApprovalExpired { issue_id } => api::EventNotice::new(
+            "approval_expired",
+            json!({ "issue_id": issue_id.as_str() }).to_string(),
+        ),
+    }
 }
 
 fn init_tracing() {
