@@ -355,9 +355,8 @@ impl<T, R, W> Orchestrator<T, R, W> {
     ///
     /// When both signing clients are present, the approval gate
     /// cryptographically verifies approval and denial signatures before treating
-    /// them as executable operator consent. Passing `None` for either client
-    /// preserves the legacy envelope-consistency-only behavior used by existing
-    /// local tests and unsigned development fixtures.
+    /// them as executable operator consent. In `Approve` mode, passing `None`
+    /// for either client fails closed before any task execution can start.
     // XSY-0055 intentionally mirrors the existing constructor parameters and
     // adds two optional security clients without breaking call sites.
     #[allow(clippy::too_many_arguments)]
