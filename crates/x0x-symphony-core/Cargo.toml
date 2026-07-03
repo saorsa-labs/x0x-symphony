@@ -1,6 +1,8 @@
 [package]
 name = "x0x-symphony-core"
 description = "Core traits and domain types for x0x-symphony."
+categories = ["development-tools", "data-structures"]
+keywords = ["p2p", "distributed", "task-orchestration", "x0x", "symphony"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

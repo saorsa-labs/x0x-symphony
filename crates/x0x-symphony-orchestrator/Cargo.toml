@@ -1,6 +1,8 @@
 [package]
 name = "x0x-symphony-orchestrator"
 description = "Dispatch orchestrator tying the tracker, runner, and workspace together for x0x-symphony."
+categories = ["development-tools", "concurrency", "network-programming"]
+keywords = ["orchestration", "scheduler", "distributed", "p2p", "task"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,9 +23,9 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "process", "fs"] }
 tracing = "0.1"
-x0x-symphony-core = { path = "../x0x-symphony-core" }
-x0x-symphony-signing = { path = "../x0x-symphony-signing" }
-x0x-symphony-workspace = { path = "../x0x-symphony-workspace" }
+x0x-symphony-core = { path = "../x0x-symphony-core", version = "0.1.0" }
+x0x-symphony-signing = { path = "../x0x-symphony-signing", version = "0.1.0" }
+x0x-symphony-workspace = { path = "../x0x-symphony-workspace", version = "0.1.0" }
 
 [target.'cfg(unix)'.dependencies]
 tokio = { version = "1", features = ["signal"] }

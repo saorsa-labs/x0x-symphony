@@ -1,6 +1,8 @@
 [package]
 name = "x0x-symphony-bin"
 description = "Daemon and CLI binaries for x0x-symphony."
+categories = ["command-line-utilities", "development-tools", "network-programming"]
+keywords = ["cli", "daemon", "distributed", "p2p", "task-orchestration"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -36,13 +38,13 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal", "sync", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-saorsa-sandbox = { path = "../saorsa-sandbox" }
-x0x-symphony-core = { path = "../x0x-symphony-core" }
-x0x-symphony-orchestrator = { path = "../x0x-symphony-orchestrator" }
-x0x-symphony-runner-shell = { path = "../x0x-symphony-runner-shell" }
-x0x-symphony-signing = { path = "../x0x-symphony-signing" }
-x0x-symphony-tracker-x0x-crdt = { path = "../x0x-symphony-tracker-x0x-crdt" }
-x0x-symphony-workspace = { path = "../x0x-symphony-workspace" }
+saorsa-sandbox = { path = "../saorsa-sandbox", version = "0.1.0" }
+x0x-symphony-core = { path = "../x0x-symphony-core", version = "0.1.0" }
+x0x-symphony-orchestrator = { path = "../x0x-symphony-orchestrator", version = "0.1.0" }
+x0x-symphony-runner-shell = { path = "../x0x-symphony-runner-shell", version = "0.1.0" }
+x0x-symphony-signing = { path = "../x0x-symphony-signing", version = "0.1.0" }
+x0x-symphony-tracker-x0x-crdt = { path = "../x0x-symphony-tracker-x0x-crdt", version = "0.1.0" }
+x0x-symphony-workspace = { path = "../x0x-symphony-workspace", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3"

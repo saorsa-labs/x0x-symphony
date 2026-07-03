@@ -1,6 +1,8 @@
 [package]
 name = "x0x-symphony-workspace"
 description = "Contained workspace manager and hook executor for x0x-symphony."
+categories = ["development-tools", "filesystem"]
+keywords = ["workspace", "isolation", "filesystem", "sandbox", "task"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +17,7 @@ async-trait = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "process", "time", "rt"] }
 tracing = "0.1"
-x0x-symphony-core = { path = "../x0x-symphony-core" }
+x0x-symphony-core = { path = "../x0x-symphony-core", version = "0.1.0" }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
