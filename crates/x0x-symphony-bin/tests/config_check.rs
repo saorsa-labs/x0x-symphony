@@ -221,6 +221,67 @@ fn sharding_workers_emit_deprecation_warn() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn legacy_codex_block_emits_deprecation_warn_without_failing_load() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_with_legacy_codex_block();
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(writer.clone())
+        .without_time()
+        .finish();
+
+    let config =
+        tracing::subscriber::with_default(subscriber, || WorkflowConfig::from_markdown(&workflow))?;
+
+    assert!(config.warnings.iter().any(|warning| warning
+        .contains("`codex:` top-level block is deprecated and will be removed in M5 (XSY-0031)")));
+    assert!(logs_from_writer(&writer)?
+        .contains("`codex:` top-level block is deprecated and will be removed in M5 (XSY-0031)"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_codex_block_config_check_warns_but_succeeds() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let workflow_path = dir.path().join("WORKFLOW.md");
+    std::fs::write(&workflow_path, workflow_with_legacy_codex_block())?;
+    let workflow_arg = workflow_path.to_string_lossy().into_owned();
+
+    let output = run_cli(&["x0x-symphony", "config", "check", "--config", &workflow_arg]).await?;
+
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "config ok\n");
+    assert!(output
+        .stderr
+        .contains("warning: `codex:` top-level block is deprecated"));
+    assert!(output.stderr.contains("will be removed in M5 (XSY-0031)"));
+    assert!(output
+        .stderr
+        .contains("`runner: {kind: shell, preset: codex}`"));
+    assert!(output
+        .stderr
+        .contains("docs/symphony/operator.md#migrating-from-the-legacy-codex-block"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_without_legacy_codex_block_has_no_codex_warning() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let workflow_path = dir.path().join("WORKFLOW.md");
+    std::fs::write(&workflow_path, workflow_missing("none"))?;
+    let workflow_arg = workflow_path.to_string_lossy().into_owned();
+
+    let config = WorkflowConfig::from_markdown(&workflow_missing("none"))?;
+    let output = run_cli(&["x0x-symphony", "config", "check", "--config", &workflow_arg]).await?;
+
+    assert!(config.warnings.is_empty());
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "config ok\n");
+    assert_eq!(output.stderr, "");
+    Ok(())
+}
+
+#[test]
 fn network_dispatch_policy_values_parse() -> Result<(), Box<dyn Error>> {
     for (raw, expected) in [
         ("off", NetworkDispatchPolicy::Off),
@@ -373,6 +434,18 @@ fn invalid_workflow_problems(workflow: &str) -> Result<Vec<String>, Box<dyn Erro
 
 fn workflow_with_security(security_body: &str) -> String {
     workflow_missing("none").replace("agent:\n", &format!("security:\n{security_body}\nagent:\n"))
+}
+
+fn workflow_with_legacy_codex_block() -> String {
+    workflow_missing("none").replace(
+        "runner:\n  kind: shell\n",
+        concat!(
+            "codex:\n",
+            "  app_server: true\n\n",
+            "runner:\n",
+            "  kind: shell\n",
+        ),
+    )
 }
 
 fn workflow_missing(block: &str) -> String {
