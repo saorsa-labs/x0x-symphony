@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use reqwest::StatusCode;
 use thiserror::Error;
-use x0x_symphony_core::IssueDraft;
+use x0x_symphony_core::{Issue, IssueDraft, WorkerCard};
 
 use crate::{client, config::WorkflowConfig};
 
@@ -38,11 +38,14 @@ pub struct CommandLine {
 /// Top-level CLI subcommands.
 #[derive(Clone, Debug, Subcommand)]
 pub enum Commands {
-    /// List tasks, optionally filtered by state.
+    /// List tasks, optionally filtered by state, or show one task by id.
     Tasks {
         /// State filter, such as `todo` or `review`.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "id")]
         state: Option<String>,
+        /// Show one task by id.
+        #[arg(long)]
+        id: Option<String>,
     },
     /// Claim a task by id.
     Claim {
@@ -62,6 +65,8 @@ pub enum Commands {
     },
     /// Show daemon status.
     Status,
+    /// Show live worker-discovery cards.
+    Workers,
     /// Inspect and act on network-sourced task approvals.
     Approvals {
         /// Approval subcommand.
@@ -230,9 +235,14 @@ pub async fn run(command_line: CommandLine) -> Result<Output> {
 async fn run_daemon_command(command_line: &CommandLine, command: &Commands) -> Result<Output> {
     let client = client_options(command_line).into_client().await?;
     match command {
-        Commands::Tasks { state } => {
-            let tasks = client.tasks(state.as_deref()).await?;
-            Ok(Output::success(format_tasks(&tasks)))
+        Commands::Tasks { state, id } => {
+            if let Some(id) = id {
+                let task = client.task(id).await?;
+                Ok(Output::success(format_task_detail(&task)))
+            } else {
+                let tasks = client.tasks(state.as_deref()).await?;
+                Ok(Output::success(format_tasks(&tasks)))
+            }
         }
         Commands::Claim { id } => {
             let claim = client.claim(id).await?;
@@ -253,6 +263,10 @@ async fn run_daemon_command(command_line: &CommandLine, command: &Commands) -> R
         Commands::Status => {
             let status = client.status().await?;
             Ok(Output::success(format_status(&status)))
+        }
+        Commands::Workers => {
+            let workers = client.workers().await?;
+            Ok(Output::success(format_workers(&workers)))
         }
         Commands::Approvals { command } => match command {
             ApprovalsCommand::List => {
@@ -378,6 +392,94 @@ fn format_tasks(tasks: &[crate::api::Task]) -> String {
         ));
     }
     join_lines(&lines)
+}
+
+fn format_task_detail(task: &Issue) -> String {
+    let priority = task
+        .priority
+        .map_or_else(|| "p-".to_owned(), |value| format!("p{value}"));
+    let labels = if task.labels.is_empty() {
+        "-".to_owned()
+    } else {
+        task.labels.join(",")
+    };
+    let mut lines = vec![
+        "task:".to_owned(),
+        format!("id: {}", task.id),
+        format!("identifier: {}", task.identifier),
+        format!("title: {}", task.title),
+        format!("state: {}", task.state),
+        format!("priority: {priority}"),
+        format!("labels: {labels}"),
+    ];
+    if let Some(claim) = &task.claim {
+        lines.push(format!(
+            "claim: {} heartbeat {}",
+            claim.by, claim.heartbeat_at
+        ));
+    }
+    if let Some(handoff) = &task.handoff {
+        lines.push(format!("handoff: {}", handoff.summary));
+    }
+    join_lines(&lines)
+}
+
+fn format_workers(workers: &[WorkerCard]) -> String {
+    let mut lines = Vec::with_capacity(workers.len().saturating_add(1));
+    lines.push("workers:".to_owned());
+    if workers.is_empty() {
+        lines.push("- none".to_owned());
+    } else {
+        for worker in workers {
+            let agent_id = worker.agent_id.to_string();
+            let capabilities = joined_or_dash(&worker.capabilities);
+            let presets = joined_or_dash(&worker.runner_presets);
+            lines.push(format!(
+                "- {} caps={} presets={} load={}/{} platform={} age={}",
+                short_agent_id(&agent_id),
+                capabilities,
+                presets,
+                worker.current_load,
+                worker.max_load,
+                format_platform(&worker.platform),
+                worker_age(&worker.issued_at),
+            ));
+        }
+    }
+    join_lines(&lines)
+}
+
+fn joined_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_owned()
+    } else {
+        values.join(",")
+    }
+}
+
+fn short_agent_id(agent_id: &str) -> String {
+    agent_id.chars().take(12).collect()
+}
+
+fn format_platform(platform: &x0x_symphony_core::PlatformInfo) -> String {
+    format!("{}/{}", platform.os, platform.arch)
+}
+
+fn worker_age(issued_at: &str) -> String {
+    let Ok(issued_at) = chrono::DateTime::parse_from_rfc3339(issued_at) else {
+        return "unknown".to_owned();
+    };
+    let elapsed = chrono::Utc::now().signed_duration_since(issued_at.with_timezone(&chrono::Utc));
+    let seconds = elapsed.num_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
 }
 
 fn format_pending_approvals(pending: &[crate::api::PendingApproval]) -> String {

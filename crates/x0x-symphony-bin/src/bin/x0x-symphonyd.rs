@@ -103,19 +103,20 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .with_event_tx(dispatch_events_tx),
     );
     spawn_worker_load_updater(worker_discovery.clone(), orchestrator.clone());
-    let _worker_discovery_handle = worker_discovery.run().await;
+    let _worker_discovery_handle = worker_discovery.clone().run().await;
 
     run_startup_maintenance(&orchestrator).await?;
 
-    let app = build_app(
+    let app = build_app(AppComponents {
         tracker,
-        &orchestrator,
+        orchestrator: orchestrator.clone(),
         agent_id,
         api_token,
         proofs_dir,
-        api_signing_client,
-        workflow.security.approval_ttl,
-    );
+        signing_client: api_signing_client,
+        worker_discovery,
+        approval_ttl: workflow.security.approval_ttl,
+    });
     let bound = bind_http(bind_addr, &data_dir).await?;
     info!(
         bind = %bound.actual_addr,
@@ -167,24 +168,34 @@ async fn bind_http(bind_addr: std::net::SocketAddr, data_dir: &Path) -> anyhow::
     })
 }
 
-fn build_app(
+struct AppComponents {
     tracker: Arc<X0xCrdtTracker>,
-    orchestrator: &Arc<Orchestrator<X0xCrdtTracker, ShellRunner, Manager>>,
+    orchestrator: Arc<Orchestrator<X0xCrdtTracker, ShellRunner, Manager>>,
     agent_id: AgentId,
     api_token: String,
     proofs_dir: PathBuf,
     signing_client: Arc<dyn SigningClient>,
+    worker_discovery: Arc<workers::WorkerDiscovery>,
     approval_ttl: Duration,
-) -> axum::Router {
+}
+
+fn build_app(components: AppComponents) -> axum::Router {
     let concrete_orchestrator: Arc<Orchestrator<X0xCrdtTracker, ShellRunner, Manager>> =
-        Arc::clone(orchestrator);
+        components.orchestrator.clone();
     let orchestrator_handle: Arc<dyn api::OrchestratorHandle> = concrete_orchestrator;
-    let api_tracker: Arc<dyn x0x_symphony_core::Tracker> = tracker;
-    let app_state = api::AppState::new(api_tracker, agent_id, api_token, Some(orchestrator_handle))
-        .with_proofs_dir(proofs_dir)
-        .with_signing_client(Some(signing_client))
-        .with_approval_ttl(approval_ttl);
-    if let Some(dispatch_events_rx) = orchestrator.subscribe() {
+    let api_tracker: Arc<dyn x0x_symphony_core::Tracker> = components.tracker;
+    let api_worker_discovery: Arc<dyn WorkerViewProvider> = components.worker_discovery;
+    let app_state = api::AppState::new(
+        api_tracker,
+        components.agent_id,
+        components.api_token,
+        Some(orchestrator_handle),
+    )
+    .with_proofs_dir(components.proofs_dir)
+    .with_signing_client(Some(components.signing_client))
+    .with_worker_discovery(Some(api_worker_discovery))
+    .with_approval_ttl(components.approval_ttl);
+    if let Some(dispatch_events_rx) = components.orchestrator.subscribe() {
         spawn_dispatch_event_forwarder(dispatch_events_rx, app_state.events_sender());
     }
     api::build_router(app_state)

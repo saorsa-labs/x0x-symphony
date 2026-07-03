@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use x0x_symphony_core::{ApprovalEvent, ApprovalVerdict, Issue, IssueDraft};
+use x0x_symphony_core::{ApprovalEvent, ApprovalVerdict, Issue, IssueDraft, WorkerCard};
 
 use crate::{
     api::{
         ClaimResponse, HandoffRequest, HandoffResponse, PendingApproval, Proof, ProofList, Routes,
-        Status, SubmitApprovalRequest, Task,
+        Status, SubmitApprovalRequest, Task, Workers,
     },
     auth, config,
 };
@@ -166,6 +166,15 @@ impl SymphonyClient {
         self.get_json(&path).await
     }
 
+    /// Fetch one task by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`enum@Error`] for transport, status, or decoding failures.
+    pub async fn task(&self, id: &str) -> Result<Issue> {
+        self.get_json(&format!("/symphony/tasks/{id}")).await
+    }
+
     /// Fetch daemon status.
     ///
     /// # Errors
@@ -173,6 +182,17 @@ impl SymphonyClient {
     /// Returns [`enum@Error`] for transport, status, or decoding failures.
     pub async fn status(&self) -> Result<Status> {
         self.get_json("/symphony/status").await
+    }
+
+    /// Fetch live worker cards visible to the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`enum@Error`] for transport, status, or decoding failures.
+    pub async fn workers(&self) -> Result<Vec<WorkerCard>> {
+        self.get_json::<Workers>("/symphony/workers")
+            .await
+            .map(|response| response.workers)
     }
 
     /// List network-sourced issues awaiting approval.
@@ -310,6 +330,7 @@ impl SymphonyClient {
             .http
             .get(&url)
             .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
             .map_err(|source| Error::Request {

@@ -9,8 +9,11 @@ use std::{
 };
 
 use axum::{
-    extract::{Path as AxumPath, Query, State},
-    http::{header::AUTHORIZATION, Method, Request, StatusCode},
+    extract::{OriginalUri, Path as AxumPath, Query, State},
+    http::{
+        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, Method, Request, StatusCode,
+    },
     middleware,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -27,9 +30,10 @@ use tokio::{sync::broadcast, time};
 use x0x_symphony_core::{
     approval_decision, content_hash, sha256_hex, AgentId, ApprovalDecision, ApprovalEvent,
     ApprovalState, ApprovalVerdict, Claim, Handoff, Issue, IssueDraft, IssueId, IssueSource,
-    SignatureEnvelope, SignatureProvenance, Tracker, APPROVAL_CONTEXT, SIGN_ALGORITHM,
+    SignatureEnvelope, SignatureProvenance, Tracker, WorkerCard, APPROVAL_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_signing::SigningClient;
+use x0x_symphony_tracker_x0x_crdt::WorkerViewProvider;
 
 const AUTH_ERROR: &str = "missing or invalid Authorization: Bearer token";
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -50,6 +54,7 @@ pub struct AppState {
     orchestrator: Option<Arc<dyn OrchestratorHandle>>,
     api_token: String,
     signing_client: Option<Arc<dyn SigningClient>>,
+    worker_discovery: Option<Arc<dyn WorkerViewProvider>>,
     approval_ttl: Duration,
     events_tx: broadcast::Sender<EventNotice>,
 }
@@ -101,6 +106,27 @@ pub struct Status {
     pub active_claims: Vec<ClaimInfo>,
     /// Whether this API state carries an orchestrator handle.
     pub orchestrator_attached: bool,
+}
+
+/// Worker view returned by `/symphony/workers`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Workers {
+    /// Current non-expired, verified worker cards visible to the daemon.
+    pub workers: Vec<WorkerCard>,
+    /// Monotonic epoch of the worker view that produced `workers`.
+    pub view_epoch: u64,
+    /// Operator note when worker discovery is not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TaskDetail {
+    #[serde(flatten)]
+    issue: Issue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature_provenance: Option<PendingApprovalProvenance>,
+    approval_summary: ApprovalSummary,
 }
 
 /// Route metadata returned by `/symphony/routes`.
@@ -310,6 +336,7 @@ impl AppState {
             orchestrator,
             api_token,
             signing_client: None,
+            worker_discovery: None,
             approval_ttl: DEFAULT_APPROVAL_TTL,
             events_tx,
         }
@@ -326,6 +353,16 @@ impl AppState {
     #[must_use]
     pub fn with_signing_client(mut self, client: Option<Arc<dyn SigningClient>>) -> Self {
         self.signing_client = client;
+        self
+    }
+
+    /// Return a copy that exposes live worker-discovery snapshots when configured.
+    #[must_use]
+    pub fn with_worker_discovery(
+        mut self,
+        worker_discovery: Option<Arc<dyn WorkerViewProvider>>,
+    ) -> Self {
+        self.worker_discovery = worker_discovery;
         self
     }
 
@@ -379,10 +416,17 @@ impl AppState {
 /// Build the daemon HTTP router.
 pub fn build_router(state: AppState) -> Router {
     let auth_layer = middleware::from_fn_with_state(state.clone(), auth_middleware);
+    let proof_routes = Router::new()
+        .route("/{issue_id}/{ts}/manifest.json", get(show_proof_manifest))
+        .route("/{issue_id}/{ts}/stdout.log", get(show_proof_stdout))
+        .route("/{issue_id}/{ts}/stderr.log", get(show_proof_stderr))
+        .fallback(show_proof_fallback);
     Router::new()
         .route("/health", get(health))
         .route("/symphony/tasks", get(tasks))
+        .route("/symphony/tasks/{id}", get(task_detail))
         .route("/symphony/status", get(status))
+        .route("/symphony/workers", get(workers))
         .route("/symphony/events", get(events))
         .route("/symphony/approvals/pending", get(approvals_pending))
         .route("/symphony/approvals/{id}", post(submit_approval))
@@ -391,7 +435,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/symphony/handoff/{id}", post(handoff_issue))
         .route("/symphony/routes", get(routes))
         .route("/symphony/proofs", get(list_proofs))
-        .route("/symphony/proofs/{*name}", get(show_proof))
+        .nest("/symphony/proofs", proof_routes)
         .layer(auth_layer)
         .with_state(state)
 }
@@ -469,6 +513,37 @@ async fn tasks(
     Ok(Json(tasks))
 }
 
+async fn task_detail(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<TaskDetail>, Error> {
+    let issue_id =
+        IssueId::new(id.clone()).map_err(|error| Error::BadRequest(error.to_string()))?;
+    let issues = state
+        .tracker
+        .fetch_by_ids(std::slice::from_ref(&issue_id))
+        .await
+        .map_err(|error| Error::Tracker(error.to_string()))?;
+    let issue = issues
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::NotFound(id.clone()))?;
+    let signature_provenance = issue
+        .signature_provenance
+        .as_ref()
+        .map(PendingApprovalProvenance::from);
+    let approval_state = state
+        .tracker
+        .load_approval_state(&issue_id)
+        .await
+        .map_err(|error| Error::Tracker(error.to_string()))?;
+    Ok(Json(TaskDetail {
+        issue,
+        signature_provenance,
+        approval_summary: approval_summary(&approval_state),
+    }))
+}
+
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, Error> {
     let issues = state
         .tracker
@@ -476,6 +551,24 @@ async fn status(State(state): State<AppState>) -> Result<Json<Status>, Error> {
         .await
         .map_err(|error| Error::Tracker(error.to_string()))?;
     Ok(Json(status_from_issues(&state, &issues)))
+}
+
+async fn workers(State(state): State<AppState>) -> Json<Workers> {
+    let Some(worker_discovery) = &state.worker_discovery else {
+        return Json(Workers {
+            workers: Vec::new(),
+            view_epoch: 0,
+            note: Some("worker discovery is not configured".to_owned()),
+        });
+    };
+    let snapshot = worker_discovery.snapshot().await;
+    let mut workers = snapshot.cards;
+    workers.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+    Json(Workers {
+        workers,
+        view_epoch: snapshot.view_epoch,
+        note: None,
+    })
 }
 
 async fn events(
@@ -711,23 +804,115 @@ async fn list_proofs(State(state): State<AppState>) -> Result<Json<ProofList>, E
     Ok(Json(ProofList { proofs }))
 }
 
-async fn show_proof(
+async fn show_proof_fallback(
     State(state): State<AppState>,
-    AxumPath(name): AxumPath<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> Result<Json<Proof>, Error> {
+    let name = uri
+        .path()
+        .strip_prefix("/symphony/proofs/")
+        .ok_or_else(|| Error::NotFound(uri.path().to_owned()))?;
+    show_proof_by_name(state, name.to_owned()).await
+}
+
+async fn show_proof_by_name(state: AppState, name: String) -> Result<Json<Proof>, Error> {
     let root = state.proofs_root();
     let path = safe_proof_path(&root, &name)?;
-    let content = tokio::fs::read_to_string(&path).await.map_err(|source| {
+    let content = read_proof_to_string(&path, &name).await?;
+    Ok(Json(Proof { name, content }))
+}
+
+async fn show_proof_manifest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((issue_id, ts)): AxumPath<(String, String)>,
+) -> Result<Response, Error> {
+    show_proof_artifact(
+        state,
+        &headers,
+        &issue_id,
+        &ts,
+        "manifest.json",
+        "application/json",
+    )
+    .await
+}
+
+async fn show_proof_stdout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((issue_id, ts)): AxumPath<(String, String)>,
+) -> Result<Response, Error> {
+    show_proof_artifact(
+        state,
+        &headers,
+        &issue_id,
+        &ts,
+        "stdout.log",
+        "text/plain; charset=utf-8",
+    )
+    .await
+}
+
+async fn show_proof_stderr(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((issue_id, ts)): AxumPath<(String, String)>,
+) -> Result<Response, Error> {
+    show_proof_artifact(
+        state,
+        &headers,
+        &issue_id,
+        &ts,
+        "stderr.log",
+        "text/plain; charset=utf-8",
+    )
+    .await
+}
+
+async fn show_proof_artifact(
+    state: AppState,
+    headers: &HeaderMap,
+    issue_id: &str,
+    ts: &str,
+    file_name: &'static str,
+    content_type: &'static str,
+) -> Result<Response, Error> {
+    let root = state.proofs_root();
+    let path = safe_proof_artifact_path(&root, issue_id, ts, file_name)?;
+    let name = format!("{issue_id}/{ts}/{file_name}");
+    if accepts_json(headers) {
+        return show_proof_by_name(state, name)
+            .await
+            .map(IntoResponse::into_response);
+    }
+    let content = read_proof_to_string(&path, &name).await?;
+    Ok(([(CONTENT_TYPE, content_type)], content).into_response())
+}
+
+fn accepts_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|part| part.starts_with("application/json"))
+        })
+}
+
+async fn read_proof_to_string(path: &Path, name: &str) -> Result<String, Error> {
+    tokio::fs::read_to_string(path).await.map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
-            Error::NotFound(name.clone())
+            Error::NotFound(name.to_owned())
         } else {
             Error::Io {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 source,
             }
         }
-    })?;
-    Ok(Json(Proof { name, content }))
+    })
 }
 
 /// Sign an approval or denial event exactly as the dispatch gate verifies it.
@@ -968,10 +1153,15 @@ fn route_infos() -> Vec<RouteInfo> {
         ("GET", "/symphony/approvals/pending"),
         ("GET", "/symphony/events"),
         ("GET", "/symphony/proofs"),
-        ("GET", "/symphony/proofs/{name}"),
+        ("GET", "/symphony/proofs/{issue_id}/{ts}/manifest.json"),
+        ("GET", "/symphony/proofs/{issue_id}/{ts}/stdout.log"),
+        ("GET", "/symphony/proofs/{issue_id}/{ts}/stderr.log"),
+        ("GET", "/symphony/proofs/{*name}"),
         ("GET", "/symphony/routes"),
         ("GET", "/symphony/status"),
         ("GET", "/symphony/tasks"),
+        ("GET", "/symphony/tasks/{id}"),
+        ("GET", "/symphony/workers"),
         ("POST", "/symphony/approvals/{id}"),
         ("POST", "/symphony/claim/{id}"),
         ("POST", "/symphony/handoff/{id}"),
@@ -1006,4 +1196,39 @@ fn safe_proof_path(root: &Path, name: &str) -> Result<PathBuf, Error> {
         return Err(Error::BadRequest("proof name must not be empty".to_owned()));
     }
     Ok(path)
+}
+
+fn safe_proof_artifact_path(
+    root: &Path,
+    issue_id: &str,
+    ts: &str,
+    file_name: &'static str,
+) -> Result<PathBuf, Error> {
+    let issue_id = safe_proof_segment("issue_id", issue_id)?;
+    let ts = safe_proof_segment("ts", ts)?;
+    Ok(root.join(issue_id).join(ts).join(file_name))
+}
+
+fn safe_proof_segment<'a>(label: &str, value: &'a str) -> Result<&'a str, Error> {
+    if value.trim().is_empty() {
+        return Err(Error::BadRequest(format!(
+            "proof {label} must not be empty"
+        )));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(Error::BadRequest(format!(
+            "proof {label} must be a single path segment"
+        )));
+    }
+    let candidate = Path::new(value);
+    if candidate.is_absolute() {
+        return Err(Error::BadRequest(format!("proof {label} must be relative")));
+    }
+    let mut components = candidate.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(value),
+        _ => Err(Error::BadRequest(format!(
+            "proof {label} must stay inside proofs directory"
+        ))),
+    }
 }
