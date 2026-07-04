@@ -1,6 +1,6 @@
 //! Gossip-backed worker discovery for `x0x-symphonyd`.
 //!
-//! The daemon publishes signed [`WorkerCard`] advertisements to x0xd's gossip
+//! The daemon publishes signed [`x0x_symphony_core::WorkerCard`] advertisements to x0xd's gossip
 //! pub/sub HTTP surface and maintains a TTL-reaped live view of cards received
 //! from peers. The x0x CRDT tracker snapshots this live view when it creates
 //! symphony-owned issues and freezes their shard slate.

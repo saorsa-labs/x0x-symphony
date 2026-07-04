@@ -6,18 +6,21 @@ on:
       - 'v*'
   workflow_dispatch:
 
-# Mirror x0x release concurrency without publishing: a rerun for the same
-# tag/ref cancels the older in-flight validation build.
+# Do NOT cancel an in-flight release run — a half-published crate set is
+# the worst possible state. A new v* tag push queues behind the current run.
+# x0x uses cancel-in-progress: true for single-crate publish; this workspace
+# publishes 8 crates in sequence, so we must let each run finish.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# contents: write is intentionally reserved for the M5 release jobs that will
-# create GitHub releases/assets. This M1 stub does not publish or sign anything.
+# contents: write is required for the publish-crates job (GitHub release
+# creation is a future addition; publishing to crates.io uses the
+# CARGO_REGISTRY_TOKEN secret, not the contents permission).
 permissions:
   contents: write
 
@@ -36,18 +39,17 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "Release stub running for tag ${GITHUB_REF_NAME}."
+            echo "Release running for tag ${GITHUB_REF_NAME}."
           elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            echo "::notice::Manual release-stub dry run on ${GITHUB_REF}; select a v* test tag such as v0.0.0-test to mirror a tag push."
+            echo "::notice::Manual release dry run on ${GITHUB_REF}; select a v* test tag such as v0.0.0-test to mirror a tag push."
           else
             echo "::error::Release workflow only supports v* tag pushes and manual dry runs."
             exit 1
           fi
 
-  # x0x issue #128 lesson: do not build a release tag unless CI succeeds for
-  # that tagged commit. Because the current CI workflow is branch/PR scoped,
-  # this stub gates the release matrix by re-running the canonical `just check`
-  # on the checked-out ref before any release build starts.
+  # x0x issue #128 lesson: do not build or publish a release tag unless CI
+  # succeeds for that tagged commit. Re-run the canonical `just check` on the
+  # checked-out ref before any release job starts.
   ci-gate:
     name: CI gate (just check)
     needs: validate-release-metadata
@@ -74,10 +76,9 @@ jobs:
       - name: Require canonical CI success for this ref
         run: just check
 
-  # Publish/sign/notarize jobs are deferred to M5 (XSY-0035/0036). This stub
-  # validates the build matrix on tag push and uploads build outputs only for
-  # verification. Per-binary packaging lands when x0x-symphony-bin exists
-  # (XSY-0007); do not reference daemon/CLI binaries before then.
+  # Cross-platform build verification. Runs in parallel with publish-crates
+  # after ci-gate passes. Binary packaging lands when x0x-symphony-bin exists
+  # (XSY-0007); artifacts uploaded here are for verification only.
   build-release:
     name: Build ${{ matrix.platform }}
     needs: [validate-release-metadata, ci-gate]
@@ -191,3 +192,134 @@ jobs:
           name: release-${{ matrix.platform }}
           path: release-artifacts/${{ matrix.platform }}/
           if-no-files-found: error
+
+  # ============================================================
+  # Publish to crates.io (XSY-0036)
+  #
+  # Publishes all 8 workspace crates in dependency order per
+  # docs/release-process.md. Each crate uses path+version dual
+  # form for internal deps; the version must be indexed before
+  # the next dependent can publish. publish_crate() retries on
+  # index lag and treats "already uploaded" as success so reruns
+  # are safe (idempotent).
+  #
+  # PREREQUISITE: the CARGO_REGISTRY_TOKEN secret must be set on
+  # this repository (or inherited from the saorsa-labs org).
+  # Add it with:
+  #   gh secret set CARGO_REGISTRY_TOKEN -R saorsa-labs/x0x-symphony
+  # ============================================================
+  publish-crates:
+    name: Publish to crates.io
+    needs: ci-gate
+    runs-on: ubuntu-latest
+    # Publish only on real v* tag pushes, not workflow_dispatch dry runs.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve workspace version
+        id: ver
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "::error::Could not parse workspace version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Workspace version: $version"
+
+      - name: Fail fast if CARGO_REGISTRY_TOKEN is missing
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not set."
+            echo "Add it with: gh secret set CARGO_REGISTRY_TOKEN -R saorsa-labs/x0x-symphony"
+            exit 1
+          fi
+          echo "CARGO_REGISTRY_TOKEN present."
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          # publish_crate <name> [max_tries]
+          #   "already uploaded/exists" → idempotent success (safe to rerun)
+          #   "no matching package named" or version-not-found → index lag → retry
+          #   anything else → hard failure
+          publish_crate() {
+            local name="$1" max_tries="${2:-5}" try=1
+            while :; do
+              echo "::group::Try ${try}/${max_tries}: cargo publish -p ${name}"
+              set +e
+              OUTPUT=$(cargo publish -p "${name}" 2>&1)
+              STATUS=$?
+              set -e
+              echo "$OUTPUT"
+              echo "::endgroup::"
+
+              if [ $STATUS -eq 0 ]; then
+                echo "::notice::${name} ${{ steps.ver.outputs.version }} published to crates.io"
+                return 0
+              fi
+
+              # Already on crates.io — idempotent success.
+              if echo "$OUTPUT" | grep -qiE "already (uploaded|exists|been uploaded|previously uploaded)"; then
+                echo "::notice::${name} ${{ steps.ver.outputs.version }} already on crates.io — treating as success"
+                return 0
+              fi
+
+              # Index lag: a dependency was just published and is not yet visible
+              # to the registry resolver. Retry after a backoff.
+              if echo "$OUTPUT" | grep -qiE "no matching package named|failed to select a version|failed to find"; then
+                if [ $try -lt $max_tries ]; then
+                  echo "::notice::${name}: index lag on try ${try}/${max_tries}; retrying in 30s"
+                  sleep 30
+                  try=$((try + 1))
+                  continue
+                fi
+              fi
+
+              echo "::error::cargo publish failed for ${name} (exit $STATUS)"
+              return 1
+            done
+          }
+
+          # ── Dependency order per docs/release-process.md ──────────────────
+          # 1. Leaf crate — no internal dependencies.
+          publish_crate x0x-symphony-core
+
+          # 2. Depends on x0x-symphony-core.
+          publish_crate x0x-symphony-signing
+
+          # 3. Depends on x0x-symphony-core.
+          publish_crate saorsa-sandbox
+
+          # 4. Depends on x0x-symphony-core + x0x-symphony-signing.
+          publish_crate x0x-symphony-tracker-x0x-crdt
+
+          # 5. Depends on saorsa-sandbox + x0x-symphony-core.
+          publish_crate x0x-symphony-runner-shell
+
+          # 6. Depends on x0x-symphony-core.
+          publish_crate x0x-symphony-workspace
+
+          # 7. Depends on x0x-symphony-core + x0x-symphony-signing + x0x-symphony-workspace.
+          publish_crate x0x-symphony-orchestrator
+
+          # 8. Depends on all of the above; publish LAST.
+          publish_crate x0x-symphony-bin
+
+          echo "::notice::All 8 x0x-symphony crates published for ${{ steps.ver.outputs.version }}"
