@@ -82,3 +82,53 @@ cargo publish -p x0x-symphony-workspace
 cargo publish -p x0x-symphony-orchestrator
 cargo publish -p x0x-symphony-bin
 ```
+
+## Signing key format (canon)
+
+The post-quantum archive signatures produced by the `sign-release` job use
+an **ML-DSA-65** secret key (FIPS-204, 4032 raw bytes). The org-level GitHub
+secret `ML_DSA_SECRET_KEY` holds that key **base64-encoded for transport
+only** (5376 chars), and `sign-release` decodes it back to raw bytes with
+`base64 --decode` before handing it to `x0x-keygen`.
+
+**Canon going forward: raw FIPS-204 ML-DSA-65 bytes everywhere; base64 for
+transport only.** Do not store hex text.
+
+To (re)populate the secret correctly from the on-disk raw key:
+
+```sh
+# On-disk raw key is 4032 bytes. Encode it as base64 (5376 chars) for the secret.
+base64 -i ~/.saorsa-keys/release-signing-key.secret | gh secret set ML_DSA_SECRET_KEY \
+  --org saorsa-labs --visibility all
+# Then delete the .secret.hex sibling file — hex is the wrong transport encoding
+# and is what caused the v0.1.0 InvalidKeySize failure (see XSY-0058).
+```
+
+### Why the encoding matters (the v0.1.0 incident)
+
+`sign-release` runs `base64 --decode` on the secret. If the secret instead
+holds **hex text** (8064 chars), the decode still succeeds — because every
+hex character is also a valid base64 character — but produces **6048 bytes**
+(8064 ÷ 4 × 3), which `x0x-keygen` rejects with
+`InvalidKeySize { expected: 4032, got: 6048 }`. Correct values:
+
+| Secret content        | Decodes to | Result                                  |
+|-----------------------|------------|-----------------------------------------|
+| base64 of raw key (5376 chars) | 4032 bytes | ✅ correct                       |
+| hex text of raw key (8064 chars) | 6048 bytes | ❌ InvalidKeySize             |
+| raw bytes pasted directly       | varies    | ❌ not base64                       |
+
+### Verifying before a release
+
+A dispatch-only workflow, `.github/workflows/verify-signing-secret.yml`,
+decodes the secret exactly as `sign-release` does and asserts 4032 bytes
+(printing only the length, never key material). **Run it after any key
+rotation** — from the Actions tab → *Verify signing secret* → *Run workflow* —
+before pushing a release tag.
+
+### Cross-repo: x0x
+
+`x0x`'s own `release.yml` uses the identical `base64 --decode` step, so the
+**same secret repopulation cures both repos** — no x0x code change required.
+The `verify-signing-secret.yml` guard can be ported to x0x symmetrically if
+desired (filed as an option under XSY-0058).
