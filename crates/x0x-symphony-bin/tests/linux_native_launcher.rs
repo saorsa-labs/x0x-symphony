@@ -138,7 +138,14 @@ fn landlock_denies_outside_path_and_allows_workspace() -> Result<(), Box<dyn std
     let mut config = base_config(&shell, &workspace);
     config.args = vec![
         "-c".to_owned(),
-        "cat \"$1\" >/dev/null 2>&1 && exit 42; cat \"$2\" >/dev/null".to_owned(),
+        // Read the forbidden (outside-workspace) file; if Landlock allows it, exit
+        // 42 to signal a containment break. Otherwise fall through to the allowed
+        // (inside-workspace) read, which must succeed (exit 0). Do NOT redirect to
+        // /dev/null — it is a read-only path in the sandbox config, so the
+        // (correctly-enforcing) sandbox would deny the redirect's write and mask
+        // the real containment check. stdout/stderr are captured by run_launcher
+        // and ignored; only the exit status is asserted.
+        "cat \"$1\" 2>&1 && exit 42; cat \"$2\"".to_owned(),
         "sh".to_owned(),
         forbidden_file.to_string_lossy().into_owned(),
         allowed_file.to_string_lossy().into_owned(),
