@@ -288,86 +288,11 @@ jobs:
           if-no-files-found: error
 
   # ============================================================
-  # ML-DSA-65 sign release archives (post-quantum).
-  # Reuses x0x-keygen (same org, same ML_DSA_SECRET_KEY secret) by
-  # checking out x0x at a pinned tag, mirroring the x0x pipeline.
-  # ============================================================
-  sign-release:
-    name: ML-DSA-65 Sign Archives
-    needs: build-release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout x0x-symphony (for LICENSE/README referenced later)
-        uses: actions/checkout@v5
-
-      # x0x-keygen is the shared signing tool for saorsa-labs post-quantum
-      # archive signatures. Pin to a stable tag so a moving x0x main cannot
-      # break symphony's release. Bump deliberately.
-      - name: Checkout x0x (for x0x-keygen)
-        uses: actions/checkout@v5
-        with:
-          repository: saorsa-labs/x0x
-          ref: v0.28.0
-          path: x0x-keygen-src
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            x0x-keygen-src/target
-          key: ${{ runner.os }}-sign-cargo-${{ hashFiles('x0x-keygen-src/**/Cargo.lock') }}
-
-      - name: Build x0x-keygen
-        run: cargo build --release --manifest-path x0x-keygen-src/Cargo.toml --bin x0x-keygen
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v5
-        with:
-          path: artifacts
-          pattern: release-*
-
-      - name: Write ML-DSA-65 signing key
-        env:
-          ML_DSA_SECRET_KEY: ${{ secrets.ML_DSA_SECRET_KEY }}
-        run: |
-          echo "$ML_DSA_SECRET_KEY" | base64 --decode > /tmp/release-signing.secret
-          chmod 600 /tmp/release-signing.secret
-
-      - name: Sign archives with ML-DSA-65
-        run: |
-          KEYGEN="x0x-keygen-src/target/release/x0x-keygen"
-          for archive in artifacts/release-*/*.tar.gz artifacts/release-*/*.zip; do
-            [ -f "$archive" ] || continue
-            "$KEYGEN" sign \
-              --key /tmp/release-signing.secret \
-              --input "$archive" \
-              --output "${archive}.sig" \
-              --context "x0x-symphony-release-v1"
-            echo "Signed: $archive"
-          done
-
-      - name: Clean up signing key
-        if: always()
-        run: rm -f /tmp/release-signing.secret
-
-      - name: Upload signed artifacts
-        uses: actions/upload-artifact@v5
-        with:
-          name: ml-dsa-signatures
-          path: artifacts/release-*/*.sig
-          if-no-files-found: error
-
-  # ============================================================
   # GPG-sign release archives and create the GitHub Release.
   # ============================================================
   create-release:
     name: Create GitHub Release
-    needs: [build-release, sign-release]
+    needs: [build-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -379,12 +304,6 @@ jobs:
         with:
           path: artifacts
           pattern: release-*
-
-      - name: Download ML-DSA-65 signatures
-        uses: actions/download-artifact@v5
-        with:
-          name: ml-dsa-signatures
-          path: artifacts
 
       - name: Import GPG key
         env:
@@ -466,16 +385,18 @@ jobs:
 
             | Platform | Archive | Signatures |
             |----------|---------|------------|
-            | Linux x64 (glibc) | `x0x-symphony-linux-x64-gnu.tar.gz` | ML-DSA-65 + GPG |
-            | Linux x64 (musl/static) | `x0x-symphony-linux-x64-musl.tar.gz` | ML-DSA-65 + GPG |
-            | Linux ARM64 | `x0x-symphony-linux-arm64-gnu.tar.gz` | ML-DSA-65 + GPG |
-            | macOS x64 (Intel) | `x0x-symphony-macos-x64.tar.gz` | ML-DSA-65 + Apple + GPG |
-            | macOS ARM64 (Apple Silicon) | `x0x-symphony-macos-arm64.tar.gz` | ML-DSA-65 + Apple + GPG |
-            | Windows x64 | `x0x-symphony-windows-x64.zip` | ML-DSA-65 + GPG |
+            | Linux x64 (glibc) | `x0x-symphony-linux-x64-gnu.tar.gz` | GPG |
+            | Linux x64 (musl/static) | `x0x-symphony-linux-x64-musl.tar.gz` | GPG |
+            | Linux ARM64 | `x0x-symphony-linux-arm64-gnu.tar.gz` | GPG |
+            | macOS x64 (Intel) | `x0x-symphony-macos-x64.tar.gz` | Apple + GPG |
+            | macOS ARM64 (Apple Silicon) | `x0x-symphony-macos-arm64.tar.gz` | Apple + GPG |
+            | Windows x64 | `x0x-symphony-windows-x64.zip` | GPG |
 
-            All binaries are signed with ML-DSA-65 (post-quantum, `.sig` files)
-            and GPG (`.asc` files). macOS binaries are additionally codesigned
-            with Apple Developer ID and notarized (notarization is best-effort —
+            All release archives are GPG-signed (`.asc` files); macOS binaries are additionally codesigned
+            with Apple Developer ID and notarized (best-effort: signed-but-un-notarized ships with a
+            Gatekeeper prompt if the Apple Developer agreement is mid-renewal). Post-quantum
+            ML-DSA-65 archive signing is deferred to a follow-up (XSY-0058) pending key/tooling
+            alignment (notarization is best-effort —
             a signed-but-un-notarized macOS binary runs with a Gatekeeper prompt
             if the Apple Developer Program agreement is mid-renewal).
 
@@ -580,10 +501,13 @@ jobs:
 
               # Index lag: a dependency was just published and is not yet visible
               # to the registry resolver. Retry after a backoff.
-              if echo "$OUTPUT" | grep -qiE "no matching package named|failed to select a version|failed to find"; then
+              # Rate limit: crates.io throttles bursts of new-crate publishes with
+              # HTTP 429 ("too many new crates in a short period"); the window is
+              # short (minutes) so retry with a longer backoff.
+              if echo "$OUTPUT" | grep -qiE "no matching package named|failed to select a version|failed to find|too many requests|429|rate.?limit|try again after"; then
                 if [ $try -lt $max_tries ]; then
-                  echo "::notice::${name}: index lag on try ${try}/${max_tries}; retrying in 30s"
-                  sleep 30
+                  echo "::notice::${name}: index lag / rate limit on try ${try}/${max_tries}; retrying in 60s"
+                  sleep 60
                   try=$((try + 1))
                   continue
                 fi
