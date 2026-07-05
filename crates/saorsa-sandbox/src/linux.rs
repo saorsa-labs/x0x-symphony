@@ -15,7 +15,7 @@ use std::{
 
 use async_trait::async_trait;
 use landlock::{
-    Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
+    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
     RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
 };
 use serde::{Deserialize, Serialize};
@@ -398,6 +398,14 @@ fn apply_landlock(config: &LauncherConfig) -> Result<()> {
     let abi = ABI::V1;
     let read_access = AccessFs::from_read(abi);
     let write_access = AccessFs::from_all(abi);
+    // Rights legitimate for non-directory files. Landlock rejects directory-only
+    // rights (e.g. `ReadDir`) applied to file paths with
+    // "incompatible directory-only access-rights"; `read_only_paths`/
+    // `read_write_paths` mix directories and files (system dirs + the target
+    // executable + `/dev/null`), so each path's rights must be filtered to its
+    // type. Directories keep the full requested set; files are intersected with
+    // this mask (preserving ReadFile/WriteFile/Execute, dropping ReadDir/Make*).
+    let file_mask = AccessFs::from_file(abi);
     let mut builder = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(write_access)
@@ -409,13 +417,15 @@ fn apply_landlock(config: &LauncherConfig) -> Result<()> {
     }
     let mut ruleset = builder.create().map_err(landlock_error)?;
     for path in &config.read_only_paths {
+        let access = rights_for_path_type(path, read_access, file_mask)?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(path_fd(path)?, read_access))
+            .add_rule(PathBeneath::new(path_fd(path)?, access))
             .map_err(landlock_error)?;
     }
     for path in &config.read_write_paths {
+        let access = rights_for_path_type(path, write_access, file_mask)?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(path_fd(path)?, write_access))
+            .add_rule(PathBeneath::new(path_fd(path)?, access))
             .map_err(landlock_error)?;
     }
     let status = ruleset.restrict_self().map_err(landlock_error)?;
@@ -423,6 +433,27 @@ fn apply_landlock(config: &LauncherConfig) -> Result<()> {
         return Err(Error::landlock("ruleset was not enforced"));
     }
     Ok(())
+}
+
+/// Filter `requested` access rights to the subset legitimate for `path`'s type.
+///
+/// Landlock directory-only rights (`ReadDir`, `Remove*`, `Make*`, `Refer`) are
+/// rejected when applied to a non-directory file; intersecting with `file_mask`
+/// (`AccessFs::from_file`) drops them while preserving file rights
+/// (`ReadFile`/`WriteFile`/`Execute`). Directories keep the full `requested` set
+/// (directory traversal + content access for entries beneath them).
+fn rights_for_path_type(
+    path: &Path,
+    requested: BitFlags<AccessFs>,
+    file_mask: BitFlags<AccessFs>,
+) -> Result<BitFlags<AccessFs>> {
+    let metadata =
+        fs::metadata(path).map_err(|source| Error::sandbox_io(path.to_path_buf(), source))?;
+    if metadata.is_dir() {
+        Ok(requested)
+    } else {
+        Ok(requested & file_mask)
+    }
 }
 
 fn exec_target(config: LauncherConfig) -> Result<()> {
@@ -705,6 +736,36 @@ mod tests {
         let derived = derive_cgroup_parent_from_content(Path::new("/sys/fs/cgroup"), "0::/\n")?;
 
         assert_eq!(derived, PathBuf::from("/sys/fs/cgroup"));
+        Ok(())
+    }
+
+    #[test]
+    fn file_paths_do_not_receive_directory_only_rights() -> Result<()> {
+        // Landlock rejects directory-only rights (e.g. ReadDir) on file paths
+        // with "incompatible directory-only access-rights". rights_for_path_type
+        // must filter them out for files while preserving them for directories.
+        let abi = ABI::V1;
+        let read_access = AccessFs::from_read(abi);
+        let file_mask = AccessFs::from_file(abi);
+
+        // A real directory keeps ReadDir (needed to list + traverse).
+        let dir_rights = rights_for_path_type(Path::new("/tmp"), read_access, file_mask)?;
+        assert!(
+            dir_rights.contains(AccessFs::ReadDir),
+            "directory rights must include ReadDir"
+        );
+
+        // A real non-directory file (/dev/null) must NOT receive ReadDir, but
+        // must preserve ReadFile.
+        let file_rights = rights_for_path_type(Path::new("/dev/null"), read_access, file_mask)?;
+        assert!(
+            !file_rights.contains(AccessFs::ReadDir),
+            "file rights must not include ReadDir"
+        );
+        assert!(
+            file_rights.contains(AccessFs::ReadFile),
+            "file rights must preserve ReadFile"
+        );
         Ok(())
     }
 
