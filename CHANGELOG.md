@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — M4/M5 distributed operations, consent, sandboxing, and polish
+## [v0.1.0] — 2026-07-02
+
+First public release. Distributed task orchestration for AI agents: sharded
+claim ownership, post-quantum (ML-DSA-65) signed claims/handoffs, a
+consent-gated dispatch gate for network-sourced work, and a native Linux
+Landlock + cgroup-v2 sandbox (`#![forbid(unsafe_code)]`). Built on the x0x
+TaskList CRDT backbone and ant-quic transport.
+
+M4/M5 distributed operations, consent, sandboxing, and polish.
 
 ### Added
 

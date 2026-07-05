@@ -8,8 +8,7 @@ on:
 
 # Do NOT cancel an in-flight release run — a half-published crate set is
 # the worst possible state. A new v* tag push queues behind the current run.
-# x0x uses cancel-in-progress: true for single-crate publish; this workspace
-# publishes 8 crates in sequence, so we must let each run finish.
+# This workspace publishes 8 crates in sequence, so we must let each run finish.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -18,9 +17,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# contents: write is required for the publish-crates job (GitHub release
-# creation is a future addition; publishing to crates.io uses the
-# CARGO_REGISTRY_TOKEN secret, not the contents permission).
+# contents: write is required to create the GitHub Release and upload assets.
 permissions:
   contents: write
 
@@ -76,9 +73,12 @@ jobs:
       - name: Require canonical CI success for this ref
         run: just check
 
-  # Cross-platform build verification. Runs in parallel with publish-crates
-  # after ci-gate passes. Binary packaging lands when x0x-symphony-bin exists
-  # (XSY-0007); artifacts uploaded here are for verification only.
+  # ============================================================
+  # Build + sign release binaries for all platforms.
+  # Mirrors the x0x release pipeline: real binary packaging,
+  # macOS codesign + notarization, Linux strip, SHA-256 checksums.
+  # Binaries: x0x-symphonyd (daemon) + x0x-symphony (CLI).
+  # ============================================================
   build-release:
     name: Build ${{ matrix.platform }}
     needs: [validate-release-metadata, ci-gate]
@@ -146,58 +146,357 @@ jobs:
         if: matrix.use_zigbuild
         uses: taiki-e/install-action@cargo-zigbuild
 
-      - name: Build workspace with cargo-zigbuild (Linux)
+      - name: Build workspace with cargo-zigbuild (Linux cross)
         if: matrix.use_zigbuild
-        run: cargo zigbuild --workspace --all-features --release --target ${{ matrix.target }}
+        run: cargo zigbuild --workspace --all-features --release --target ${{ matrix.target }} --bin x0x-symphonyd --bin x0x-symphony
 
       - name: Build workspace with cargo (native)
         if: ${{ !matrix.use_zigbuild }}
-        run: cargo build --workspace --all-features --release --target ${{ matrix.target }}
+        run: cargo build --workspace --all-features --release --target ${{ matrix.target }} --bin x0x-symphonyd --bin x0x-symphony
 
-      - name: Stage build artifacts for verification
-        shell: bash
+      # ---- macOS Code Signing & Notarization (mirrors x0x) ----
+      - name: Import macOS signing certificate
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
-          staging="release-artifacts/${{ matrix.platform }}"
-          release_dir="target/${{ matrix.target }}/release"
-          mkdir -p "${staging}"
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-          {
-            echo "platform=${{ matrix.platform }}"
-            echo "target=${{ matrix.target }}"
-            echo "archive=${{ matrix.archive }}"
-            echo "ref=${GITHUB_REF}"
-            echo "sha=${GITHUB_SHA}"
-            echo "builder=$([[ '${{ matrix.use_zigbuild }}' == 'true' ]] && echo cargo-zigbuild || echo cargo)"
-            echo "note=Workspace build only; per-binary packaging lands with x0x-symphony-bin (XSY-0007)."
-          } > "${staging}/BUILD-METADATA.txt"
+          echo "$MACOS_CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
 
-          if [[ -d "${release_dir}" ]]; then
-            shopt -s nullglob
-            artifacts=("${release_dir}"/*.rlib "${release_dir}"/*.rmeta "${release_dir}"/*.d)
-            if (( ${#artifacts[@]} > 0 )); then
-              cp "${artifacts[@]}" "${staging}/"
-            else
-              echo "::notice::No top-level library artifacts found in ${release_dir}; uploading build metadata for verification."
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERTIFICATE_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Sign macOS binaries
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          for bin in x0x-symphonyd x0x-symphony; do
+            BINARY="target/${{ matrix.target }}/release/${bin}"
+            if [ -f "$BINARY" ]; then
+              codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$BINARY"
+              codesign --verify --deep --strict "$BINARY"
+              echo "Signed ${bin} successfully"
             fi
+          done
+
+      # Notarization contacts Apple and validates the Developer Program License
+      # Agreement; an expired/unsigned agreement returns HTTP 403 and is an
+      # account-level blocker, not a build defect. Binaries are still codesigned,
+      # so an un-notarized macOS binary is usable with a Gatekeeper prompt. Keep
+      # this non-blocking so a lapsed agreement cannot hold back the Linux/
+      # Windows release + crates.io publish; re-run once the agreement is
+      # re-signed to ship notarized macOS binaries.
+      - name: Notarize macOS binaries
+        if: startsWith(matrix.platform, 'macos')
+        continue-on-error: true
+        env:
+          MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+        run: |
+          for bin in x0x-symphonyd x0x-symphony; do
+            BINARY="target/${{ matrix.target }}/release/${bin}"
+            if [ -f "$BINARY" ]; then
+              ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize-${bin}.zip"
+              if xcrun notarytool submit "$RUNNER_TEMP/notarize-${bin}.zip" \
+                --apple-id "$MACOS_NOTARIZATION_APPLE_ID" \
+                --password "$MACOS_NOTARIZATION_PASSWORD" \
+                --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
+                --wait; then
+                echo "Notarized ${bin} successfully"
+              else
+                echo "::warning::Notarization failed for ${bin} (likely an expired Apple Developer agreement); shipping signed-but-un-notarized binary."
+              fi
+            fi
+          done
+
+      - name: Clean up macOS keychain
+        if: startsWith(matrix.platform, 'macos') && always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+
+      # ---- Strip Linux binaries ----
+      - name: Strip binaries (Linux)
+        if: startsWith(matrix.platform, 'linux')
+        run: |
+          for bin in x0x-symphonyd x0x-symphony; do
+            BINARY="target/${{ matrix.target }}/release/${bin}"
+            if [ -f "$BINARY" ]; then strip "$BINARY" || true; fi
+          done
+
+      # ---- Package artifacts ----
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          set -euo pipefail
+          STAGING="x0x-symphony-${{ matrix.platform }}"
+          mkdir -p "$STAGING"
+          for bin in x0x-symphonyd x0x-symphony; do
+            BIN="target/${{ matrix.target }}/release/${bin}"
+            if [ -f "$BIN" ]; then cp "$BIN" "$STAGING/"; fi
+          done
+          cp LICENSE "$STAGING/" 2>/dev/null || true
+          cp README.md "$STAGING/" 2>/dev/null || true
+          tar czf "x0x-symphony-${{ matrix.platform }}.tar.gz" "$STAGING"
+          echo "ASSET=x0x-symphony-${{ matrix.platform }}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $staging = "x0x-symphony-${{ matrix.platform }}"
+          New-Item -ItemType Directory -Path $staging -Force
+          $daemon = "target/${{ matrix.target }}/release/x0x-symphonyd.exe"
+          if (Test-Path $daemon) { Copy-Item $daemon -Destination $staging }
+          $cli = "target/${{ matrix.target }}/release/x0x-symphony.exe"
+          if (Test-Path $cli) { Copy-Item $cli -Destination $staging }
+          if (Test-Path "LICENSE") { Copy-Item LICENSE -Destination $staging }
+          if (Test-Path "README.md") { Copy-Item README.md -Destination $staging }
+          Compress-Archive -Path "$staging/*" -DestinationPath "x0x-symphony-${{ matrix.platform }}.zip"
+          "ASSET=x0x-symphony-${{ matrix.platform }}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Generate SHA-256 checksum
+        shell: bash
+        run: |
+          hash_cmd="sha256sum"
+          if ! command -v sha256sum &>/dev/null; then
+            hash_cmd="shasum -a 256"
+          fi
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            $hash_cmd "x0x-symphony-${{ matrix.platform }}.zip" > "x0x-symphony-${{ matrix.platform }}.zip.sha256"
           else
-            echo "::warning::Release directory ${release_dir} was not found after build."
+            $hash_cmd "x0x-symphony-${{ matrix.platform }}.tar.gz" > "x0x-symphony-${{ matrix.platform }}.tar.gz.sha256"
           fi
 
-          ls -la "${staging}"
-
-      - name: Upload build artifacts
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v5
         with:
           name: release-${{ matrix.platform }}
-          path: release-artifacts/${{ matrix.platform }}/
+          path: |
+            x0x-symphony-${{ matrix.platform }}.*
           if-no-files-found: error
+
+  # ============================================================
+  # ML-DSA-65 sign release archives (post-quantum).
+  # Reuses x0x-keygen (same org, same ML_DSA_SECRET_KEY secret) by
+  # checking out x0x at a pinned tag, mirroring the x0x pipeline.
+  # ============================================================
+  sign-release:
+    name: ML-DSA-65 Sign Archives
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout x0x-symphony (for LICENSE/README referenced later)
+        uses: actions/checkout@v5
+
+      # x0x-keygen is the shared signing tool for saorsa-labs post-quantum
+      # archive signatures. Pin to a stable tag so a moving x0x main cannot
+      # break symphony's release. Bump deliberately.
+      - name: Checkout x0x (for x0x-keygen)
+        uses: actions/checkout@v5
+        with:
+          repository: saorsa-labs/x0x
+          ref: v0.28.0
+          path: x0x-keygen-src
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            x0x-keygen-src/target
+          key: ${{ runner.os }}-sign-cargo-${{ hashFiles('x0x-keygen-src/**/Cargo.lock') }}
+
+      - name: Build x0x-keygen
+        run: cargo build --release --manifest-path x0x-keygen-src/Cargo.toml --bin x0x-keygen
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          pattern: release-*
+
+      - name: Write ML-DSA-65 signing key
+        env:
+          ML_DSA_SECRET_KEY: ${{ secrets.ML_DSA_SECRET_KEY }}
+        run: |
+          echo "$ML_DSA_SECRET_KEY" | base64 --decode > /tmp/release-signing.secret
+          chmod 600 /tmp/release-signing.secret
+
+      - name: Sign archives with ML-DSA-65
+        run: |
+          KEYGEN="x0x-keygen-src/target/release/x0x-keygen"
+          for archive in artifacts/release-*/*.tar.gz artifacts/release-*/*.zip; do
+            [ -f "$archive" ] || continue
+            "$KEYGEN" sign \
+              --key /tmp/release-signing.secret \
+              --input "$archive" \
+              --output "${archive}.sig" \
+              --context "x0x-symphony-release-v1"
+            echo "Signed: $archive"
+          done
+
+      - name: Clean up signing key
+        if: always()
+        run: rm -f /tmp/release-signing.secret
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: ml-dsa-signatures
+          path: artifacts/release-*/*.sig
+          if-no-files-found: error
+
+  # ============================================================
+  # GPG-sign release archives and create the GitHub Release.
+  # ============================================================
+  create-release:
+    name: Create GitHub Release
+    needs: [build-release, sign-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          pattern: release-*
+
+      - name: Download ML-DSA-65 signatures
+        uses: actions/download-artifact@v5
+        with:
+          name: ml-dsa-signatures
+          path: artifacts
+
+      - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --import --batch --yes
+
+      - name: Export public key
+        run: |
+          gpg --armor --export david@saorsalabs.com > SAORSA_PUBLIC_KEY.asc
+          if [ ! -s SAORSA_PUBLIC_KEY.asc ]; then
+            echo "Error: Failed to export public key"
+            exit 1
+          fi
+
+      - name: GPG-sign release archives
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          for archive in artifacts/release-*/*.tar.gz artifacts/release-*/*.zip; do
+            [ -f "$archive" ] || continue
+            gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+              --detach-sign --armor --output "${archive}.asc" "$archive" <<< "$GPG_PASSPHRASE"
+          done
+
+      - name: Collect all release files
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          for dir in artifacts/release-*/; do
+            cp "$dir"/*.tar.gz release-files/ 2>/dev/null || true
+            cp "$dir"/*.zip release-files/ 2>/dev/null || true
+            cp "$dir"/*.sha256 release-files/ 2>/dev/null || true
+            cp "$dir"/*.asc release-files/ 2>/dev/null || true
+            cp "$dir"/*.sig release-files/ 2>/dev/null || true
+          done
+          cp SAORSA_PUBLIC_KEY.asc release-files/
+          ls -la release-files/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          draft: false
+          generate_release_notes: true
+          body: |
+            ## x0x-symphony ${{ github.ref_name }}
+
+            **Distributed Task Orchestration for AI Agents**
+
+            A decentralized, privacy-focused task-orchestration system: sharded
+            claim ownership, post-quantum signed claims/handoffs, a consent-gated
+            dispatch gate for network-sourced work, and a native Linux Landlock +
+            cgroup-v2 sandbox (`#![forbid(unsafe_code)]`). Built on the x0x
+            TaskList CRDT backbone and ant-quic transport.
+
+            ### Binaries Included
+
+            - **x0x-symphonyd** — the orchestration daemon (REST API + CLI host)
+            - **x0x-symphony** — the operator CLI
+
+            ### Installation
+
+            **From source:**
+            ```bash
+            cargo install x0x-symphony-bin
+            ```
+
+            **Run:**
+            ```bash
+            x0x-symphonyd --config WORKFLOW.md --data-dir ./data --bind 127.0.0.1:11000
+            ```
+
+            See [`docs/symphony/operator.md`](docs/symphony/operator.md) for the
+            full worked example, troubleshooting matrix, and the consent-based
+            dispatch flow.
+
+            ### Platform Binaries
+
+            | Platform | Archive | Signatures |
+            |----------|---------|------------|
+            | Linux x64 (glibc) | `x0x-symphony-linux-x64-gnu.tar.gz` | ML-DSA-65 + GPG |
+            | Linux x64 (musl/static) | `x0x-symphony-linux-x64-musl.tar.gz` | ML-DSA-65 + GPG |
+            | Linux ARM64 | `x0x-symphony-linux-arm64-gnu.tar.gz` | ML-DSA-65 + GPG |
+            | macOS x64 (Intel) | `x0x-symphony-macos-x64.tar.gz` | ML-DSA-65 + Apple + GPG |
+            | macOS ARM64 (Apple Silicon) | `x0x-symphony-macos-arm64.tar.gz` | ML-DSA-65 + Apple + GPG |
+            | Windows x64 | `x0x-symphony-windows-x64.zip` | ML-DSA-65 + GPG |
+
+            All binaries are signed with ML-DSA-65 (post-quantum, `.sig` files)
+            and GPG (`.asc` files). macOS binaries are additionally codesigned
+            with Apple Developer ID and notarized (notarization is best-effort —
+            a signed-but-un-notarized macOS binary runs with a Gatekeeper prompt
+            if the Apple Developer Program agreement is mid-renewal).
+
+            ### Verify Signatures
+
+            ```bash
+            # Import the Saorsa Labs public GPG key (bundled as SAORSA_PUBLIC_KEY.asc)
+            gpg --import SAORSA_PUBLIC_KEY.asc
+            gpg --verify x0x-symphony-linux-x64-gnu.tar.gz.asc x0x-symphony-linux-x64-gnu.tar.gz
+            ```
+
+            ### CHANGELOG
+
+            See [`CHANGELOG.md`](CHANGELOG.md) for the full M0..M5 history with
+            breaking-change and security callouts.
 
   # ============================================================
   # Publish to crates.io (XSY-0036)
   #
   # Publishes all 8 workspace crates in dependency order per
-  # docs/release-process.md. Each crate uses path+version dual
+  # docs/symphony/release-process.md. Each crate uses path+version dual
   # form for internal deps; the version must be indexed before
   # the next dependent can publish. publish_crate() retries on
   # index lag and treats "already uploaded" as success so reruns
@@ -205,8 +504,6 @@ jobs:
   #
   # PREREQUISITE: the CARGO_REGISTRY_TOKEN secret must be set on
   # this repository (or inherited from the saorsa-labs org).
-  # Add it with:
-  #   gh secret set CARGO_REGISTRY_TOKEN -R saorsa-labs/x0x-symphony
   # ============================================================
   publish-crates:
     name: Publish to crates.io
@@ -297,7 +594,7 @@ jobs:
             done
           }
 
-          # ── Dependency order per docs/release-process.md ──────────────────
+          # ── Dependency order per docs/symphony/release-process.md ──────────────
           # 1. Leaf crate — no internal dependencies.
           publish_crate x0x-symphony-core
 
