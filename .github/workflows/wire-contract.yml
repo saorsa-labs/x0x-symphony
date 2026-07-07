@@ -1,0 +1,122 @@
+name: Live wire-contract
+
+# Boots a pinned-latest x0xd and runs the live (#[ignore]) wire-contract tests
+# against it, so x0x<->symphony endpoint drift (sign/verify, task-list/claim
+# CRUD) is caught continuously rather than only by a point-in-time static
+# cross-check. See GitHub issue #4.
+#
+# The live MLS group-isolation test (needs two daemons) is intentionally not
+# included here; this job covers the single-daemon smoke the issue asked for.
+
+on:
+  schedule:
+    - cron: "13 6 * * *" # daily 06:13 UTC
+  workflow_dispatch:
+    inputs:
+      x0xd_tag:
+        description: "x0x release tag to boot (blank = latest)"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  X0XD_PORT: "19111"
+
+permissions:
+  contents: read
+
+jobs:
+  live-wire-contract:
+    name: Boot x0xd, run live sign/verify + task-list tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout x0x-symphony
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Resolve x0xd tag
+        id: tag
+        run: echo "x0xd_tag=${{ inputs.x0xd_tag || '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download + extract x0xd
+        env:
+          GH_TOKEN: ${{ github.token }}
+          X0XD_TAG: ${{ steps.tag.outputs.x0xd_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x0xd-release
+          if [ -n "${X0XD_TAG}" ]; then
+            gh release download "${X0XD_TAG}" --repo saorsa-labs/x0x -p 'x0x-linux-x64-gnu.tar.gz' -D /tmp/x0xd-release
+          else
+            gh release download --repo saorsa-labs/x0x -p 'x0x-linux-x64-gnu.tar.gz' -D /tmp/x0xd-release
+          fi
+          tar -xzf /tmp/x0xd-release/x0x-linux-x64-gnu.tar.gz -C /tmp/x0xd-release
+          X0XD_BIN="$(find /tmp/x0xd-release -type f -name x0xd | head -1)"
+          if [ -z "${X0XD_BIN}" ]; then echo "::error::x0xd binary not found in release archive"; ls -R /tmp/x0xd-release; exit 1; fi
+          chmod +x "${X0XD_BIN}"
+          echo "X0XD_BIN=${X0XD_BIN}" >> "$GITHUB_ENV"
+          echo "Booting: ${X0XD_BIN} ($(${X0XD_BIN} --version))"
+
+      - name: Boot isolated x0xd
+        run: |
+          set -euo pipefail
+          export X0XD_CI_HOME="$(mktemp -d)"
+          echo "X0XD_CI_HOME=${X0XD_CI_HOME}" >> "$GITHUB_ENV"
+          # HOME + XDG isolation keeps x0xd's identity + data dir inside the
+          # temp dir (Linux data dir is XDG_DATA_HOME-based); the bootstrap +
+          # peer-cache flags keep it off the live network.
+          HOME="${X0XD_CI_HOME}" \
+            XDG_CONFIG_HOME="${X0XD_CI_HOME}/.config" \
+            XDG_DATA_HOME="${X0XD_CI_HOME}/.local/share" \
+            XDG_CACHE_HOME="${X0XD_CI_HOME}/.cache" \
+            RUST_LOG=x0x=info nohup "${X0XD_BIN}" \
+            --name ci --api-port "${X0XD_PORT}" \
+            --no-hard-coded-bootstrap --disable-peer-cache \
+            > /tmp/x0xd.log 2>&1 &
+          echo "X0XD_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 40); do
+            if curl -sf "http://127.0.0.1:${X0XD_PORT}/health" >/dev/null 2>&1; then
+              echo "x0xd healthy after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -sf "http://127.0.0.1:${X0XD_PORT}/health" || { echo "::error::x0xd did not become healthy"; cat /tmp/x0xd.log; exit 1; }
+
+      - name: Run live wire-contract tests
+        run: |
+          set -euo pipefail
+          TOK_PATH=""
+          for i in $(seq 1 10); do
+            TOK_PATH="$(grep -oP 'API token (?:generated|loaded) at \K.*' /tmp/x0xd.log | head -1)"
+            [ -n "${TOK_PATH}" ] && break
+            sleep 1
+          done
+          if [ -z "${TOK_PATH}" ]; then echo "::error::api-token path not found in x0xd log"; cat /tmp/x0xd.log; exit 1; fi
+          TOK="$(cat "${TOK_PATH}")"
+          export X0XD_URL="http://127.0.0.1:${X0XD_PORT}"
+          export X0XD_TOKEN="${TOK}"
+          export X0X_API_TOKEN="${TOK}"
+          # 1) sign -> verify round-trip (live_signing).
+          cargo nextest run -p x0x-symphony-signing --test live_signing --run-ignored only --nocapture
+          # 2) task-list / claim / heartbeat / handoff CRUD (the single-daemon
+          #    live_x0xd test; the MLS group-isolation test needs 2 daemons).
+          cargo nextest run -p x0x-symphony-tracker-x0x-crdt --test live_x0xd --run-ignored only \
+            -E 'test(live_create_claim_heartbeat_handoff_against_x0xd)' --nocapture
+
+      - name: Teardown x0xd
+        if: always()
+        run: |
+          kill "${X0XD_PID:-}" 2>/dev/null || true
+          rm -rf "${X0XD_CI_HOME:-}" /tmp/x0xd-release /tmp/x0xd.log || true
