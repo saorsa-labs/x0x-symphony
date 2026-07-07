@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.1] — 2026-07-07
+
+Patch release: security fix and the first release with post-quantum archive
+signing.
+
+### Added
+
+- First release with working ML-DSA-65 archive signing in `release.yml`
+  (XSY-0058): the `sign-release` job is restored and the org
+  `ML_DSA_SECRET_KEY` encoding is corrected (verified green by the dispatch-only
+  `verify-signing-secret` workflow), so published artifacts now ship `.sig`
+  files alongside GPG/codesign/SHA-256. v0.1.0 shipped without these.
+
+### Security
+
+- Constant-time bearer-token comparison in the daemon API (fixes #5):
+  `bearer_header_matches` and `query_token_matches` now hash both sides with
+  SHA-256 and compare via `subtle::ConstantTimeEq` (`core::constant_time_eq`),
+  mirroring x0x's server auth. Closes a timing side-channel (LOW; loopback-only,
+  32-byte hex token).
+
+### Changed
+
+- ADR-0006 Amendment 1 records the XSY-0057 decision: native macOS Seatbelt is
+  deferred indefinitely; macOS containment stays Tier-1 `sandbox-exec` (the
+  industry-standard MACF path). `docs/symphony/security.md` reframed
+  accordingly.
+
 ## [v0.1.0] — 2026-07-02
 
 First public release. Distributed task orchestration for AI agents: sharded
