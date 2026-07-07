@@ -126,7 +126,7 @@ Backend selection:
 | Platform | `backend = auto` order | Notes |
 |----------|------------------------|-------|
 | Linux | `native` (Landlock + cgroup-v2) → `bwrap` → `landlock-restrict` → `none` | Firejail was deliberately replaced with Bubblewrap. The native backend uses the internal `saorsa-sandbox-launcher`; Bubblewrap provides filesystem, PID, and network namespace isolation, but domain-level egress allow-lists require an outer policy engine such as `srt`; when Bubblewrap is the effective backend, egress allow-list entries are advisory metadata rather than DNS firewall rules. |
-| macOS | `srt` → `/usr/bin/sandbox-exec` → `none` | `sandbox-exec` enforces filesystem and coarse network operations from generated SBPL. Domain allow-lists are not DNS-specific; native Seatbelt remains XSY-0057. |
+| macOS | `srt` → `/usr/bin/sandbox-exec` → `none` | `sandbox-exec` enforces filesystem and coarse network operations from generated SBPL. Domain allow-lists are not DNS-specific; native Seatbelt deferred indefinitely (XSY-0057 → review, per ADR-0006 Amendment 1). |
 | Windows | `none` | Tier 1 has no Windows host sandbox; non-local dispatch must fail closed. |
 
 `on_unavailable` controls only local work: `warn` logs and runs the
@@ -222,7 +222,18 @@ additional defense-in-depth on top.
 | Platform | Backend | Status |
 |----------|---------|--------|
 | **Linux** | Native Landlock (access control) + cgroup-v2 (resource bounding), via the internal `saorsa-sandbox-launcher` binary | Native (XSY-0042); no external tool forked |
-| **macOS** | **Tier-1 `sandbox-exec` (external tool)** | External-tool wrapper (XSY-0027). Native macOS Seatbelt is a research follow-up (XSY-0057) — see ADR-0006 (M) for why a native crate is not available today |
+| **macOS** | **Tier-1 `sandbox-exec` (external tool)** | External-tool wrapper (XSY-0027). Native macOS Seatbelt **deferred indefinitely** (XSY-0057 → review, 2026-07-07) — see ADR-0006 (M) + Amendment 1. `sandbox-exec` is the industry-standard macOS containment path. The `auto` probe order (`srt` → `sandbox-exec` → `none`) is in the selection table above |
+
+**macOS `sandbox-exec` rationale:** `sandbox-exec` is the path Chromium,
+Mozilla, `containerd-shim-darwin`, and Apple's own first-party apps use for
+process sandboxing on macOS. It is a front-end to the same Seatbelt/MACF
+enforcement path a native `sandbox_init` call would use: it compiles the
+generated SBPL profile to bytecode and applies it through the kernel MACF layer.
+The deprecation banner has been emitted since macOS Sierra (2016) with no removal in ~9 years; no supported
+non-App-Store replacement exists (Apple containerization issue #737, open). A
+native backend would save one fork and silence the warning but would add no
+containment — see ADR-0006 (M) and Amendment 1 for why native macOS Seatbelt is
+deferred (XSY-0057).
 
 **`unsafe` policy:** `saorsa-sandbox` carries `#![forbid(unsafe_code)]`. Symphony
 writes zero `unsafe`; the `unsafe` that enforcement depends on lives only inside

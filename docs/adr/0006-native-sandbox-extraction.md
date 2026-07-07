@@ -174,3 +174,70 @@ classification + 9 adversarial fail-closed tests intact). With the forbid
 attribute + dispatch.rs-untouched constraints, this work stream sits **below**
 standing-trigger #1 once this ADR is signed off — it runs to completion
 merge-on-green without further holds.
+
+## Amendment 1 — XSY-0057 macOS-native decision (2026-07-07)
+
+**Status:** Accepted (2026-07-07)
+**Decider:** David Irvine (operator). (The dedicated advisor subagent was
+infra-blocked this session — every `task` subagent died on a `localhost:8080`
+Saorsa Labs wiki 404 at bootstrap before reading its prompt; the advisor role
+was filled by the lead. See XSY-0057 handoff.)
+**Supersedes nothing in (M);** records the XSY-0057 acceptance-#1 decision that
+the M1 split explicitly deferred.
+
+XSY-0057's own acceptance criterion #1 required a decision: adopt a mature safe
+crate, build a scoped FFI enclave, or defer indefinitely. Research re-confirmed
+2026-07-07:
+
+- **Crate landscape (crates.io, 2026-07-07):** no mature safe macOS Seatbelt
+  crate exists. `seatbelt` 0.5.10 (1,913 downloads) is Microsoft's `oxidizer`
+  resilience library — unrelated to Seatbelt. `safe-shell` 0.1.2 (39 total
+  downloads) is the closest candidate and remains far below the decision-(P)
+  vetting bar.
+- **API status:** `sandbox_init*` / `sandbox_init_with_parameters` are still
+  private, deprecated APIs. Mark Rowe (bdash.net.nz, 2024-11): "All of the
+  sandbox APIs described here are private APIs. Apple continues to make use of
+  these lower-level APIs for sandboxing its first-party applications and helper
+  tools." Apple containerization issue #737 (2026-05, open) confirms "there is
+  no published replacement that covers server-side / CLI process sandboxing."
+- **Industry posture:** `sandbox-exec` / the `sandbox_init` family remain the
+  path Chromium, Mozilla, `containerd-shim-darwin`, and Apple's own first-party
+  apps lean on. Deprecation banner since macOS Sierra (2016); ~9 years, no
+  removal.
+
+### Decision: Option A — defer indefinitely (macOS stays Tier-1 `sandbox-exec`)
+
+- **A. Defer (keep Tier-1 `sandbox-exec`)** — **ACCEPTED.** `sandbox-exec`
+  *drives the same Seatbelt enforcement path*: it compiles the generated SBPL →
+  bytecode and applies it via the same kernel MACF path a native `sandbox_init`
+  call would.
+  The only deltas from a native backend are one extra process fork, a stderr deprecation
+  warning, and `sandbox-exec` doing the SBPL compile. Zero new `unsafe`, zero
+  new risk, already shipped and tested (XSY-0027).
+- **B. Scoped FFI enclave** (`saorsa-sandbox-macos-seatbelt`,
+  `unsafe_code="allow"`, thin FFI to `sandbox_init_with_parameters`,
+  self-applying launcher) — **REJECTED.** This is the same pattern as the L2
+  "audited unsafe enclave" decision (L) rejected for Linux — relocated to macOS,
+  against a *private/deprecated* API (worse fragility than Landlock). It
+  requires symphony-authored `unsafe` plus an amendment to the permitted-crate
+  list, contradicting principle (P) in the same breath as adopting it, for **no
+  security gain** over the MACF enforcement `sandbox-exec` already provides.
+- **C. Adopt a mature safe crate** — **NOT AVAILABLE.** None exists today.
+
+### Re-evaluation triggers (revisit this decision if any occurs)
+
+1. A safe macOS Seatbelt crate crosses the decision-(P) vetting bar: maintained,
+   widely used (≥ ~10,000 downloads), preferably authored by the subsystem
+   owner.
+2. Apple ships a **supported, non-App-Store** API for applying a Seatbelt policy
+   at exec time (a documented `sandbox_init_with_parameters` replacement or a
+   new framework) — not Endpoint Security, which is AV/EDR-grade and
+   distribution-gated.
+3. Apple announces a concrete `sandbox-exec` removal timeline, or `sandbox-exec`
+   is observed removed or broken on a supported macOS beta or release (whichever
+   comes first).
+
+This satisfies XSY-0057 acceptance criterion #1 (decision recorded) and #4
+(security.md containment-status table updated). Criteria #2 and #3 are
+conditional on implementation and remain N/A under the defer decision. XSY-0057
+moves `todo` → `review`.
