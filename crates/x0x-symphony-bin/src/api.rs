@@ -28,9 +28,9 @@ use serde_json::json;
 use thiserror::Error;
 use tokio::{sync::broadcast, time};
 use x0x_symphony_core::{
-    approval_decision, content_hash, sha256_hex, AgentId, ApprovalDecision, ApprovalEvent,
-    ApprovalState, ApprovalVerdict, Claim, Handoff, Issue, IssueDraft, IssueId, IssueSource,
-    SignatureEnvelope, SignatureProvenance, Tracker, VerificationNotice, WorkerCard,
+    approval_decision, constant_time_eq, content_hash, sha256_hex, AgentId, ApprovalDecision,
+    ApprovalEvent, ApprovalState, ApprovalVerdict, Claim, Handoff, Issue, IssueDraft, IssueId,
+    IssueSource, SignatureEnvelope, SignatureProvenance, Tracker, VerificationNotice, WorkerCard,
     APPROVAL_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_signing::SigningClient;
@@ -998,7 +998,7 @@ fn bearer_header_matches(request: &Request<axum::body::Body>, target: &str) -> b
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == target)
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), target.as_bytes()))
 }
 
 fn query_token_matches(request: &Request<axum::body::Body>, target: &str) -> bool {
@@ -1009,7 +1009,7 @@ fn query_token_matches(request: &Request<axum::body::Body>, target: &str) -> boo
         query
             .split('&')
             .filter_map(|pair| pair.strip_prefix("token="))
-            .any(|token| token == target)
+            .any(|token| constant_time_eq(token.as_bytes(), target.as_bytes()))
     })
 }
 

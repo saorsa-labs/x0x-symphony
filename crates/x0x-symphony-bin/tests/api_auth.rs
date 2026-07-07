@@ -156,6 +156,59 @@ async fn symphony_routes_require_bearer_token() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+async fn invalid_bearer_and_query_tokens_are_rejected() -> Result<(), Box<dyn Error>> {
+    let tracker: Arc<dyn Tracker> = Arc::new(StaticTracker { issues: vec![] });
+    let state = AppState::new(
+        tracker,
+        AgentId::new("symphonyd")?,
+        "secret-token".to_owned(),
+        None,
+    );
+    let server = spawn_server(state).await?;
+    // Timeout guards against the SSE `/symphony/events` stream holding the test open.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    // A wrong bearer token is rejected (constant_time_eq returns false).
+    let wrong = client
+        .get(format!("{}/symphony/status", server.base_url))
+        .bearer_auth("wrong-token")
+        .send()
+        .await?;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    // A near-miss token sharing a long prefix is still rejected — no early exit
+    // on the matching prefix.
+    let near_miss = client
+        .get(format!("{}/symphony/status", server.base_url))
+        .bearer_auth("secret-tokem")
+        .send()
+        .await?;
+    assert_eq!(near_miss.status(), StatusCode::UNAUTHORIZED);
+
+    // The `/symphony/events` SSE route authenticates via the `?token=` query param.
+    let query_ok = client
+        .get(format!(
+            "{}/symphony/events?token=secret-token",
+            server.base_url
+        ))
+        .send()
+        .await?;
+    assert_eq!(query_ok.status(), StatusCode::OK);
+
+    let query_wrong = client
+        .get(format!(
+            "{}/symphony/events?token=wrong-token",
+            server.base_url
+        ))
+        .send()
+        .await?;
+    assert_eq!(query_wrong.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
 async fn post_symphony_issues_calls_tracker_create_issue() -> Result<(), Box<dyn Error>> {
     let tracker: Arc<dyn Tracker> = Arc::new(CreateTracker);
     let state = AppState::new(

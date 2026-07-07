@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::{Handoff, Result};
 
@@ -133,6 +134,18 @@ pub fn sha256_hex(payload: &[u8]) -> String {
     }
     encoded
 }
+/// Constant-time comparison of two secret byte strings.
+///
+/// Both inputs are SHA-256 hashed first, so the comparison runs over
+/// fixed-length digests and never early-exits on secret content. Used for
+/// bearer-token authentication to avoid timing side-channels, mirroring x0x's
+/// server auth.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let a_digest = Sha256::digest(a);
+    let b_digest = Sha256::digest(b);
+    a_digest.as_slice().ct_eq(b_digest.as_slice()).into()
+}
 
 fn hex_nibble(nibble: u8) -> char {
     match nibble {
@@ -149,5 +162,28 @@ where
     match Option::<String>::deserialize(deserializer)? {
         Some(value) => Ok(value),
         None => Ok(String::new()),
+    }
+}
+
+#[cfg(test)]
+mod constant_time_eq_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn equal_inputs_match() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+    }
+
+    #[test]
+    fn different_inputs_differ() {
+        assert!(!constant_time_eq(b"secret-token", b"secret-tokem"));
+        assert!(!constant_time_eq(b"secret-token", b"other-token"));
+    }
+
+    #[test]
+    fn different_lengths_differ() {
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(!constant_time_eq(b"", b"secret"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

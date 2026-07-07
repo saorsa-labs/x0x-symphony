@@ -32,7 +32,9 @@ pub use runner::{
     EventStream, Prompt, Runner, RunnerCapabilities, RunnerEvent, RunnerEventKind, SessionContext,
     SessionHandle, SessionId, TurnOutcome, TurnStatus, UsageReport,
 };
-pub use signing::{sha256_hex, SignatureEnvelope, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM};
+pub use signing::{
+    constant_time_eq, sha256_hex, SignatureEnvelope, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
+};
 pub use tracker::{PollContext, ReleaseReason, ReleaseReasonCode, Tracker};
 pub use workers::{
     PlatformInfo, WorkerCard, DEFAULT_WORKER_CARD_TTL_SECONDS, WORKER_CARD_CONTEXT,
