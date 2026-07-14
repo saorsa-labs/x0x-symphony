@@ -33,7 +33,8 @@ pub use runner::{
     SessionHandle, SessionId, TurnOutcome, TurnStatus, UsageReport,
 };
 pub use signing::{
-    constant_time_eq, sha256_hex, SignatureEnvelope, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM,
+    constant_time_eq, sha256_hex, SignatureEnvelope, CLAIM_CONTEXT, HANDOFF_CONTEXT,
+    ISSUE_PROVENANCE_CONTEXT, SIGN_ALGORITHM,
 };
 pub use tracker::{PollContext, ReleaseReason, ReleaseReasonCode, Tracker};
 pub use workers::{

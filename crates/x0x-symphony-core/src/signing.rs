@@ -20,6 +20,13 @@ pub const CLAIM_CONTEXT: &str = "x0x-symphony-claim-v1";
 /// Domain-separation context for handoff records.
 pub const HANDOFF_CONTEXT: &str = "x0x-symphony-handoff-v1";
 
+/// Domain-separation context for issue creation provenance records.
+///
+/// Signed at issue creation time by the local x0xd agent to attest that this
+/// daemon created the issue payload. Verified on read so the dispatch gate
+/// treats locally-created CRDT issues as cryptographically provenanced.
+pub const ISSUE_PROVENANCE_CONTEXT: &str = "x0x-symphony-issue-provenance-v1";
+
 /// Detached signature metadata stored beside a signed claim or handoff.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignatureEnvelope {

@@ -7,7 +7,7 @@ use serde_json::Value;
 use thiserror::Error;
 use x0x_symphony_core::{
     ApprovalConsumed, ApprovalEvent, Claim, Handoff, Issue, IssueId, IssueSource, IssueState,
-    ReleaseReason, Shard, SymphonyError,
+    ReleaseReason, Shard, SignatureEnvelope, SymphonyError,
 };
 
 use crate::client::{AddTaskDraft, TaskEntry};
@@ -26,6 +26,9 @@ pub const APPROVAL_BLOB_KIND: &str = "x0x-symphony-approval-v1";
 
 /// Shard blob kind marker.
 pub const SHARD_BLOB_KIND: &str = "shard";
+
+/// Provenance blob kind marker.
+pub const PROVENANCE_BLOB_KIND: &str = "x0x-symphony-provenance-v1";
 
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
@@ -247,6 +250,39 @@ impl ShardBlob {
     }
 }
 
+/// Issue creation signature stored under `provenance-<task-id>`.
+///
+/// Written when the daemon creates an issue through the x0x CRDT tracker.
+/// The envelope signs a deterministic payload (`issue_id`, `title`,
+/// `description`) under [`ISSUE_PROVENANCE_CONTEXT`]. On read, the tracker
+/// verifies the envelope and attaches [`SignatureProvenance::Verified`] so the
+/// dispatch gate treats the locally-created issue as a cryptographically
+/// attested record rather than an unsigned network-sourced one.
+///
+/// [`ISSUE_PROVENANCE_CONTEXT`]: x0x_symphony_core::ISSUE_PROVENANCE_CONTEXT
+/// [`SignatureProvenance::Verified`]: x0x_symphony_core::SignatureProvenance::Verified
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProvenanceBlob {
+    /// Blob schema version.
+    pub schema_version: u32,
+    /// Blob kind marker.
+    pub kind: String,
+    /// Signature envelope covering the issue creation payload.
+    pub envelope: SignatureEnvelope,
+}
+
+impl ProvenanceBlob {
+    /// Build a provenance blob from a verified signature envelope.
+    #[must_use]
+    pub fn new(envelope: SignatureEnvelope) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            kind: PROVENANCE_BLOB_KIND.to_owned(),
+            envelope,
+        }
+    }
+}
+
 /// Return the `KvStore` id used for Symphony metadata for a `TaskList`.
 #[must_use]
 pub fn store_id_for_list(list_id: &str) -> String {
@@ -269,6 +305,12 @@ pub fn handoff_key(task_id: &str) -> String {
 #[must_use]
 pub fn shard_key(task_id: &str) -> String {
     format!("shard-{task_id}")
+}
+
+/// Return the `KvStore` key for a task's provenance blob.
+#[must_use]
+pub fn provenance_key(task_id: &str) -> String {
+    format!("provenance-{task_id}")
 }
 
 /// Return the `KvStore` key for a task's approval blob.
@@ -334,6 +376,24 @@ pub fn encode_shard_blob(blob: &ShardBlob) -> Result<Vec<u8>> {
 ///
 /// Returns [`MappingError::Json`] if the blob cannot be decoded.
 pub fn decode_shard_blob(bytes: &[u8]) -> Result<ShardBlob> {
+    serde_json::from_slice(bytes).map_err(|source| MappingError::Json { source })
+}
+
+/// Encode a provenance blob as JSON bytes for x0xd `KvStore`.
+///
+/// # Errors
+///
+/// Returns [`MappingError::Json`] if the blob cannot be serialized.
+pub fn encode_provenance_blob(blob: &ProvenanceBlob) -> Result<Vec<u8>> {
+    serde_json::to_vec(blob).map_err(|source| MappingError::Json { source })
+}
+
+/// Decode a provenance blob from x0xd `KvStore` JSON bytes.
+///
+/// # Errors
+///
+/// Returns [`MappingError::Json`] if the blob cannot be decoded.
+pub fn decode_provenance_blob(bytes: &[u8]) -> Result<ProvenanceBlob> {
     serde_json::from_slice(bytes).map_err(|source| MappingError::Json { source })
 }
 
