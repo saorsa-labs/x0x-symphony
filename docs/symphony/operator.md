@@ -176,6 +176,12 @@ Validate before starting the daemon:
 Start `x0xd` with an identity that can access `x0x-symphony-demo`, then start
 `symphonyd` in a separate terminal:
 
+> **Bearer token:** If your `x0xd` requires an API token (e.g. when
+> `auth_required` is set), export `X0X_API_TOKEN` before starting the daemon.
+> The tracker client, worker gossip publisher, and worker subscriber all read
+> this variable. `X0XD_TOKEN` only feeds the trust gate and is **not** used
+> for REST/WebSocket authentication.
+
 ```bash
 mkdir -p /tmp/x0x-symphony-demo/data
 ./target/release/x0x-symphonyd \
@@ -209,6 +215,13 @@ Create a local symphony-owned issue through the daemon-backed tracker:
   --label x0x-symphony
 # created XSY-0100
 ```
+
+> **Dispatch status:** The daemon now auto-creates the `TaskList` and
+> sidecar `KvStore` on startup, so `issue new` works against a clean x0xd.
+> However, full dispatch (claim → run → handoff) depends on the dispatch
+> gate / issue-provenance signing regression being resolved. Until that
+> lands, the daemon will create the issue but may not dispatch it to a
+> runner.
 
 Watch the daemon claim and hand off the task:
 
@@ -512,11 +525,13 @@ x0x-symphonyd \
 On start the daemon:
 
 1. loads + validates `WORKFLOW.md` (same checks as `config check`),
-2. writes the actual bound port to `<data-dir>/daemon.port`,
-3. loads-or-generates the bearer token at `<data-dir>/api-token` (0600),
-4. reconciles any stale self-owned claims left from a previous run,
-5. enters the poll loop, and
-6. serves the HTTP API on the loopback address.
+2. ensures the configured TaskList and `symphony-<list-id>` KvStore exist in
+   x0xd, creating them if missing (idempotent),
+3. writes the actual bound port to `<data-dir>/daemon.port`,
+4. loads-or-generates the bearer token at `<data-dir>/api-token` (0600),
+5. reconciles any stale self-owned claims left from a previous run,
+6. enters the poll loop, and
+7. serves the HTTP API on the loopback address.
 
 ### Shutdown and restart
 
@@ -596,9 +611,10 @@ Operational implications:
 
 1. **Run x0xd first.** Daemon startup fails if `signing.x0xd_url` is
    unreachable or `/agent` cannot return the local agent id.
-2. **TaskList/KvStore availability is an x0xd concern.** The daemon assumes the
-   configured TaskList and its sidecar store are available through x0xd. x0xd
-   permissions or MLS membership determine what the daemon can see.
+2. **Surfaces are auto-created on startup.** The daemon ensures the configured
+   TaskList and its `symphony-<list-id>` KvStore sidecar exist before the poll
+   loop starts, creating them via x0xd if missing. x0xd permissions or MLS
+   membership still determine what the daemon can see and write.
 3. **No git commits or file locks.** The removed M1-M2 JSONL adapter no longer
    writes `issues/issues.jsonl`, takes `.git/index.lock`, or commits tracker
    transitions. The bootstrap issue database remains only as project history and
