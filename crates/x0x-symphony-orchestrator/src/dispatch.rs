@@ -741,33 +741,38 @@ where
             }
         };
 
-        let trust_level = self.trust_client.trust_level(signer.as_str()).await?;
-        let refusal = if trust_level == TrustLevel::Blocked {
-            Some((
-                ReleaseReasonCode::BlockedSigner,
-                format!("network-sourced issue signer {signer} is blocked in x0xd contacts"),
-            ))
-        } else if trust_level == TrustLevel::Unknown {
-            Some((
-                ReleaseReasonCode::UnknownSigner,
-                format!("network-sourced issue signer {signer} is unknown to x0xd contacts"),
-            ))
-        } else if trust_level < self.config.required_trust {
-            Some((
-                ReleaseReasonCode::UntrustedSigner,
-                format!(
-                    "network-sourced issue signer {signer} has trust {trust_level}; required {}",
-                    self.config.required_trust
-                ),
-            ))
-        } else {
-            None
-        };
-
-        if let Some((code, detail)) = refusal {
-            self.block_for_dispatch_refusal(guard, claim, code, detail)
-                .await?;
-            return Ok(DispatchGateOutcome::Blocked);
+        // Self-authored provenance: the daemon signed this issue itself when it
+        // created the task through the x0x CRDT tracker. The daemon's own
+        // agent_id is never in its own x0xd contacts, so skip the contacts
+        // lookup — self-authored is local by definition and implicitly trusted.
+        if signer != self.config.agent_id {
+            let trust_level = self.trust_client.trust_level(signer.as_str()).await?;
+            let refusal = if trust_level == TrustLevel::Blocked {
+                Some((
+                    ReleaseReasonCode::BlockedSigner,
+                    format!("network-sourced issue signer {signer} is blocked in x0xd contacts"),
+                ))
+            } else if trust_level == TrustLevel::Unknown {
+                Some((
+                    ReleaseReasonCode::UnknownSigner,
+                    format!("network-sourced issue signer {signer} is unknown to x0xd contacts"),
+                ))
+            } else if trust_level < self.config.required_trust {
+                Some((
+                    ReleaseReasonCode::UntrustedSigner,
+                    format!(
+                        "network-sourced issue signer {signer} has trust {trust_level}; required {}",
+                        self.config.required_trust
+                    ),
+                ))
+            } else {
+                None
+            };
+            if let Some((code, detail)) = refusal {
+                self.block_for_dispatch_refusal(guard, claim, code, detail)
+                    .await?;
+                return Ok(DispatchGateOutcome::Blocked);
+            }
         }
 
         match self.config.network_dispatch {
