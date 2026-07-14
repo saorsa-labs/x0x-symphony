@@ -116,7 +116,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     spawn_proof_reaper(tracker.clone(), orchestrator.clone(), proofs_dir.clone());
     let _worker_discovery_handle = worker_discovery.clone().run().await;
 
-    run_startup_maintenance(&orchestrator).await?;
+    run_startup_maintenance(&tracker, &orchestrator).await?;
 
     let app = build_app(AppComponents {
         tracker,
@@ -254,10 +254,14 @@ fn build_tracker(
         .context("failed to configure x0x CRDT tracker")?;
     Ok(Arc::new(tracker))
 }
-
 async fn run_startup_maintenance(
+    tracker: &Arc<X0xCrdtTracker>,
     orchestrator: &Orchestrator<X0xCrdtTracker, ShellRunner, Manager>,
 ) -> anyhow::Result<()> {
+    tracker
+        .ensure_surfaces()
+        .await
+        .context("failed to ensure x0xd tracker surfaces")?;
     let _ = orchestrator.reconcile().await;
     let sweep = orchestrator
         .sweep_orphans()

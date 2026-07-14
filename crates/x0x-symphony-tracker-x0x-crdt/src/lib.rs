@@ -49,7 +49,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use reqwest::StatusCode;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 use x0x_symphony_core::{
     sha256_hex, shard, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff,
     Issue, IssueDraft, IssueId, IssueState, PollContext, ReleaseReason, ShardRole,
@@ -689,6 +689,41 @@ impl X0xCrdtTracker {
             .ok_or_else(|| TrackerError::IssueNotFound { id: id.clone() })
     }
 
+    /// Ensure the configured `TaskList` and companion `KvStore` exist in x0xd.
+    ///
+    /// Creates both surfaces if missing. Idempotent: surfaces that already
+    /// exist are left untouched. Respects group-scoped list and store ids
+    /// when a group is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrackerError::Client`] when x0xd listing or creation fails.
+    pub async fn ensure_surfaces(&self) -> Result<()> {
+        let scope = self.resource_scope().await?;
+        let task_lists = self.client.list_task_lists().await?;
+        if !task_lists.iter().any(|entry| entry.id == scope.list_id) {
+            info!(
+                list_id = %scope.list_id,
+                group_scoped = scope.group_scoped,
+                "creating missing x0xd TaskList for symphony tracker"
+            );
+            self.client
+                .create_task_list(&scope.list_id, &scope.list_id)
+                .await?;
+        }
+        let stores = self.client.list_kv_stores().await?;
+        if !stores.iter().any(|entry| entry.id == scope.store_id) {
+            info!(
+                store_id = %scope.store_id,
+                "creating missing x0xd KvStore sidecar for symphony tracker"
+            );
+            self.client
+                .create_kv_store(&scope.store_id, &scope.store_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn create_issue_with_shard(&self, draft: IssueDraft) -> Result<Issue> {
         if draft.title.trim().is_empty() {
             return Err(SymphonyError::validation("issue.title", "must not be empty").into());
@@ -726,11 +761,31 @@ impl X0xCrdtTracker {
                 "cannot assign shard: live worker view is empty; start at least one trusted worker",
             )
         })?;
-        self.put_shard_blob(
-            &task_id,
-            &ShardBlob::new(shard, snapshot.view_epoch, now_utc()),
-        )
-        .await?;
+        if let Err(error) = self
+            .put_shard_blob(
+                &task_id,
+                &ShardBlob::new(shard, snapshot.view_epoch, now_utc()),
+            )
+            .await
+        {
+            warn!(
+                task_id = %task_id,
+                error = %error,
+                "shard blob write failed; marking task terminal to avoid zombie"
+            );
+            if let Err(cleanup_error) = self
+                .client
+                .update_task(&scope.list_id, &task_id, TaskAction::Complete)
+                .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    error = %cleanup_error,
+                    "failed to mark zombie task terminal; bare task remains in TaskList"
+                );
+            }
+            return Err(error);
+        }
         self.fetch_issue(&issue_id).await
     }
 
@@ -1374,6 +1429,15 @@ mod tests {
         joins: Vec<String>,
         list_task_calls: Vec<String>,
         hidden_list_ids: Vec<String>,
+        /// When true, `list_task_lists`/`list_kv_stores` return empty to
+        /// simulate missing surfaces.
+        surfaces_missing: bool,
+        /// Topics passed to `create_task_list`.
+        created_lists: Vec<String>,
+        /// Topics passed to `create_kv_store`.
+        created_stores: Vec<String>,
+        /// When true, `put_kv` returns a synthetic HTTP 500.
+        put_kv_failing: bool,
     }
 
     impl MockApi {
@@ -1477,11 +1541,31 @@ mod tests {
         async fn put_count(&self) -> usize {
             self.state.lock().await.puts.len()
         }
+
+        async fn set_surfaces_missing(&self, missing: bool) {
+            self.state.lock().await.surfaces_missing = missing;
+        }
+
+        async fn set_put_kv_failing(&self, failing: bool) {
+            self.state.lock().await.put_kv_failing = failing;
+        }
+
+        async fn created_lists(&self) -> Vec<String> {
+            self.state.lock().await.created_lists.clone()
+        }
+
+        async fn created_stores(&self) -> Vec<String> {
+            self.state.lock().await.created_stores.clone()
+        }
     }
 
     #[async_trait]
     impl X0xdApi for MockApi {
         async fn list_task_lists(&self) -> client::Result<Vec<TaskListEntry>> {
+            let state = self.state.lock().await;
+            if state.surfaces_missing {
+                return Ok(Vec::new());
+            }
             Ok(vec![TaskListEntry {
                 id: "list-a".to_owned(),
                 topic: "list-a".to_owned(),
@@ -1489,6 +1573,7 @@ mod tests {
         }
 
         async fn create_task_list(&self, _name: &str, topic: &str) -> client::Result<String> {
+            self.state.lock().await.created_lists.push(topic.to_owned());
             Ok(topic.to_owned())
         }
 
@@ -1594,6 +1679,10 @@ mod tests {
         }
 
         async fn list_kv_stores(&self) -> client::Result<Vec<TaskListEntry>> {
+            let state = self.state.lock().await;
+            if state.surfaces_missing {
+                return Ok(Vec::new());
+            }
             Ok(vec![TaskListEntry {
                 id: store_id_for_list("list-a"),
                 topic: store_id_for_list("list-a"),
@@ -1601,6 +1690,11 @@ mod tests {
         }
 
         async fn create_kv_store(&self, _name: &str, topic: &str) -> client::Result<String> {
+            self.state
+                .lock()
+                .await
+                .created_stores
+                .push(topic.to_owned());
             Ok(topic.to_owned())
         }
 
@@ -1631,6 +1725,12 @@ mod tests {
             _content_type: &str,
         ) -> client::Result<()> {
             let mut state = self.state.lock().await;
+            if state.put_kv_failing {
+                return Err(ClientError::Http {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    body: "store not found".to_owned(),
+                });
+            }
             state
                 .kv
                 .insert((store_id.to_owned(), key.to_owned()), value.to_vec());
@@ -2372,6 +2472,60 @@ mod tests {
                 .to_string()
                 .contains("signature verification transport error"),
             "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_surfaces_creates_missing_surfaces() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        api.set_surfaces_missing(true).await;
+        let tracker = tracker(api.clone())?;
+
+        tracker.ensure_surfaces().await?;
+
+        let created_lists = api.created_lists().await;
+        let created_stores = api.created_stores().await;
+        assert_eq!(created_lists, vec!["list-a".to_owned()]);
+        assert_eq!(created_stores, vec![store_id_for_list("list-a")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_surfaces_idempotent_when_surfaces_exist() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        let tracker = tracker(api.clone())?;
+
+        tracker.ensure_surfaces().await?;
+
+        // Default mock already lists list-a and symphony-list-a, so nothing
+        // should have been created.
+        assert!(api.created_lists().await.is_empty());
+        assert!(api.created_stores().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_issue_marks_task_terminal_on_shard_write_failure() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        api.set_put_kv_failing(true).await;
+        let provider = MockWorkerView::new(vec![worker_snapshot(
+            &["agent-a", "agent-b", "agent-c"],
+            1,
+        )?]);
+        let tracker = tracker_with_worker_view(api.clone(), provider)?;
+
+        let result = tracker.create_issue(issue_draft("Zombie test")).await;
+        assert!(
+            result.is_err(),
+            "create_issue should fail when put_kv fails"
+        );
+
+        // The bare task was added but should have been marked terminal.
+        let completes = api.action_count(TaskAction::Complete).await;
+        assert_eq!(
+            completes, 1,
+            "task should have been completed (marked terminal) to avoid zombie"
         );
         Ok(())
     }
