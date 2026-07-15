@@ -1172,8 +1172,13 @@ where
         consumed_at: &str,
     ) -> Result<ApprovalConsumed> {
         let content_hash = content_hash(issue);
+        // A random component keeps nonces unique even when the binding fields
+        // and timestamp repeat exactly; the signature still binds issue id,
+        // content hash, and signer, so uniqueness no longer depends on input
+        // variety.
+        let entropy: u128 = rand::random();
         let nonce_source = format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{entropy:032x}",
             issue.id, content_hash, signer, consumed_at, self.config.agent_id
         );
         let nonce = sha256_hex(nonce_source.as_bytes());

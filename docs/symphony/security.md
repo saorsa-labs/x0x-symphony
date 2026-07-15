@@ -120,20 +120,48 @@ means the replay-protection state is tampered or forged: the gate refuses to
 dispatch (`invalid_signature` block) rather than guessing in either direction.
 Consumption records may only un-park work in one narrow way: the tracker-level
 `requeue_blocked` transition refuses any blocked issue whose reason is not
-`awaiting_approval`, so approvals can never resurrect security-blocked or
-retry-exhausted work.
+`awaiting_approval`, so no Tracker-API path can resurrect security-blocked or
+retry-exhausted work. That invariant holds within the Tracker API; a hostile
+writer inside the replicated tracker group could still mutate raw claim blobs
+directly — replicated-writer integrity is tracked in
+[#10](https://github.com/saorsa-labs/x0x-symphony/issues/10).
 
-**Concurrent multi-node approval is at-least-once, not exactly-once.** The
-approval/consumption store is a per-issue KV blob updated by read-modify-write;
-two nodes that concurrently evaluate the same valid approval (or reunite after
-a partition) can each consume and dispatch once, and a racing write can drop a
-consumption record (see
-[#10](https://github.com/saorsa-labs/x0x-symphony/issues/10)). Within one node,
-dispatch is serialized by the exclusive claim and the approve-requeue path is
-idempotent. The operational guarantee is therefore **at-least-once dispatch
-with convergent deduplication** under concurrent multi-node approval — keep
-runner side effects idempotent, exactly as required for retry semantics
-elsewhere in this pilot.
+**Dispatch/consumption guarantees in v0.1 (read carefully).** The
+approval/consumption store is a per-issue KV blob updated by
+read-modify-write, and claim-blob state transitions are not yet
+integrity-signed; the structural fix is tracked in
+[#10](https://github.com/saorsa-labs/x0x-symphony/issues/10). The actual
+semantics are:
+
+- **Single node, no crash:** exactly-once — dispatch is serialized by the
+  exclusive claim, and each dispatch stores its signed consumption record
+  before the runner starts.
+- **Single node, crash windows:** a crash after the consumption record is
+  stored but before the runner completes yields **zero** executions with the
+  approval already spent. Operator recovery: approve the payload again (a
+  fresh approval mints a fresh consumption) or re-issue the task under a new
+  id.
+- **Concurrent multi-node writers:** the RMW blob update is not a convergent
+  set — two nodes that evaluate the same valid approval concurrently (or
+  reunite after a partition) can each dispatch once, and a racing write can
+  drop an approval or consumption record entirely. Multi-node approval is
+  therefore **best-effort**: runners MUST be idempotent.
+- **Hostile replicated writers:** unsigned claim-blob transitions (status,
+  `release_reason`) mean a hostile writer inside the replicated tracker group
+  can mutate issue state directly, bypassing Tracker-API invariants. Pilot
+  mitigation: run the symphony TaskList/KvStore only within a trusted,
+  closed tracker group (`required_trust`, vetted membership).
+
+**Recovery: dispatch refused with `invalid_signature` consumption state.** A
+garbage or tampered consumption record parks the issue as `blocked` with
+reason code `invalid_signature` and detail "approval consumption record
+failed signature verification". To repair: inspect the approval blob in the
+symphony sidecar store — store `symphony-<list-id>`, key
+`approval-<task-id>` (x0xd `GET /stores/symphony-<list-id>/keys/approval-<task-id>`);
+its `consumed` array holds the offending record(s). Either rewrite that key
+with the corrupted entries removed (keeping only records this daemon signed),
+or — simpler and safer — re-create the issue with `issue new` (a new task id
+starts with empty approval state) and mark the corrupted one done/cancelled.
 
 ---
 

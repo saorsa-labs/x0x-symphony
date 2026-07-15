@@ -601,6 +601,7 @@ struct MockApprovalCrypto {
     keys: Mutex<BTreeMap<String, Vec<u8>>>,
     outcomes: Mutex<BTreeMap<Vec<u8>, VerifyOutcome>>,
     verify_calls: Mutex<Vec<MockVerifyCall>>,
+    fail_sign: Mutex<bool>,
 }
 
 impl MockApprovalCrypto {
@@ -641,6 +642,10 @@ impl MockApprovalCrypto {
         guard(&self.keys).insert(agent_id.to_owned(), public_key.to_vec());
     }
 
+    fn fail_signing(&self) {
+        *guard(&self.fail_sign) = true;
+    }
+
     fn verify_calls(&self) -> Vec<MockVerifyCall> {
         guard(&self.verify_calls).clone()
     }
@@ -672,6 +677,11 @@ impl SigningClient for MockApprovalCrypto {
         context: &str,
         payload: &[u8],
     ) -> x0x_symphony_signing::Result<SignResponse> {
+        if *guard(&self.fail_sign) {
+            return Err(SigningError::InvalidResponse(
+                "mock signing failure".to_owned(),
+            ));
+        }
         Ok(SignResponse {
             agent_id: "mock-approver".to_owned(),
             public_key_b64: BASE64.encode(b"mock-public-key"),
@@ -4525,6 +4535,113 @@ async fn forged_local_marker_cannot_claim_self_exception_under_approve(
         &tracker,
         "XSY-GATE-FORGED-LOCAL",
         &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    Ok(())
+}
+
+/// Review round 3: if signing the consumption record fails, the gate must
+/// park the issue (fail-closed) rather than dispatch without a durable signed
+/// consumption record — an unrecorded dispatch would be replayable the next
+/// time the approval is evaluated.
+#[tokio::test]
+async fn consumption_signing_failure_parks_issue_not_dispatches() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-CONSUME-SIGNFAIL", &["feature"], "trusted-signer")?;
+    let approval = crypto_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+        b"signfail-approval-signature",
+    )?;
+    let crypto = approval_crypto();
+    crypto.set_outcome_for_event(&approval, VerifyOutcome::Valid)?;
+    crypto.fail_signing();
+    let (signing_client, key_resolver) = approval_crypto_clients(&crypto);
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, _trust) = run_spy_dispatch_with_crypto(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval],
+            consumed: Vec::new(),
+        },
+        signing_client,
+        key_resolver,
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_consumed_count(&tracker, 0);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-CONSUME-SIGNFAIL",
+        &ReleaseReasonCode::VerifyTransportError,
+    )?;
+    Ok(())
+}
+
+/// Review round 3: a consumption record whose signature material cannot even
+/// be base64-decoded is unverifiable state — the gate refuses to dispatch
+/// (fail-closed) instead of guessing.
+#[tokio::test]
+async fn undecodable_consumption_signature_refuses_dispatch() -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-CONSUME-UNDECODABLE", &["feature"], "trusted-signer")?;
+    let approval = crypto_approval_event(
+        &issue,
+        "trusted-signer",
+        ApprovalVerdict::Approve,
+        &now_iso(),
+        b"undec-approval-signature",
+    )?;
+    let mut consumed = signed_consumed_event(&approval, "nonce-undec", &now_iso())?;
+    consumed.signature.signature_b64 = "%%%not-base64%%%".to_owned();
+    let crypto = approval_crypto();
+    crypto.set_outcome_for_event(&approval, VerifyOutcome::Valid)?;
+    // Signer key resolvable, so the refusal is specifically the undecodable
+    // signature material.
+    crypto.add_key("consumer", b"consumer-public-key");
+    let (signing_client, key_resolver) = approval_crypto_clients(&crypto);
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "trusted-signer",
+        TrustLevel::Trusted,
+    )]));
+
+    let (resolution, spy, tracker, _trust) = run_spy_dispatch_with_crypto(
+        issue,
+        config,
+        trust,
+        ApprovalState {
+            events: vec![approval],
+            consumed: vec![consumed],
+        },
+        signing_client,
+        key_resolver,
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_consumed_count(&tracker, 1);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-CONSUME-UNDECODABLE",
+        &ReleaseReasonCode::InvalidSignature,
     )?;
     Ok(())
 }
