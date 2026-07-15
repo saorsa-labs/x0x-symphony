@@ -16,12 +16,13 @@ use crate::{
 mod claude_code;
 mod codex;
 mod config_only;
+mod pi;
 
 /// Names of built-in shell-runner presets.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PresetName {
-    /// Codex CLI app-server preset.
+    /// Codex CLI non-interactive `exec` preset.
     Codex,
     /// Claude Code non-interactive CLI preset.
     ClaudeCode,
@@ -31,7 +32,7 @@ pub enum PresetName {
     Glm,
     /// Minimax CLI config-only preset.
     Minimax,
-    /// Pi CLI config-only preset.
+    /// Pi CLI non-interactive preset.
     Pi,
 }
 
@@ -109,7 +110,7 @@ pub fn resolve(name: PresetName) -> Result<RunnerSpec> {
         PresetName::Kimi => config_only::spec("kimi", "kimi"),
         PresetName::Glm => config_only::spec("glm", "glm"),
         PresetName::Minimax => config_only::spec("minimax", "minimax"),
-        PresetName::Pi => config_only::spec("pi", "pi"),
+        PresetName::Pi => pi::spec(),
     }
 }
 

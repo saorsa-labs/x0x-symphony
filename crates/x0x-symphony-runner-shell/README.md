@@ -19,15 +19,18 @@ runner spec or the session context are added, and secret-like names ending in
 
 ## Built-in presets
 
-| Preset | Command | Args | Declared env |
-| --- | --- | --- | --- |
-| `codex` | `codex` | `app-server` | `NO_COLOR=1`, `TERM=dumb` |
-| `claude_code` | `claude` | `--print --output-format stream-json` | `NO_COLOR=1`, `TERM=dumb` |
-| `kimi` | `kimi` | `--stdin` | `NO_COLOR=1`, `TERM=dumb` |
-| `glm` | `glm` | `--stdin` | `NO_COLOR=1`, `TERM=dumb` |
-| `minimax` | `minimax` | `--stdin` | `NO_COLOR=1`, `TERM=dumb` |
-| `pi` | `pi` | `--stdin` | `NO_COLOR=1`, `TERM=dumb` |
+| Preset | Command | Args | Declared env | Tested harness version |
+| --- | --- | --- | --- | --- |
+| `codex` | `codex` | `exec` | `NO_COLOR=1`, `TERM=dumb` | codex-cli 0.144.1 |
+| `claude_code` | `claude` | `--print --output-format stream-json --verbose` | `NO_COLOR=1`, `TERM=dumb` | Claude Code 2.1.208 |
+| `kimi` | `kimi` | `--stdin` | `NO_COLOR=1`, `TERM=dumb` | unverified |
+| `glm` | `glm` | `--stdin` | `NO_COLOR=1`, `TERM=dumb` | unverified |
+| `minimax` | `minimax` | `--stdin` | `NO_COLOR=1`, `TERM=dumb` | unverified |
+| `pi` | `pi` | `--print` | `NO_COLOR=1`, `TERM=dumb` | pi 0.80.3 |
 
 Operators may override `command`, `args`, timeout, event-buffer sizing, or env
 in `WORKFLOW.md` under `runner:` or a preset-specific block such as
 `runner.claude_code:`. Overrides remain argv arrays; they are not templates.
+This is the supported escape hatch when an installed harness version diverges
+from the tested one. Validate installed harnesses with `just preset-smoke`
+(see `tests/preset_live_smoke.rs`).

@@ -50,7 +50,7 @@ End-state v1.0 invariants:
 | Issue state                | TaskItem checkbox + LWW metadata register                            |
 | Issue claim                | Signed CRDT claim record with TTL heartbeat                          |
 | Per-issue workspace        | Per-task isolated workspace under runner-controlled root             |
-| Codex app-server runner    | Pluggable runner trait with `shell`, `codex`, `claude_code` impls    |
+| Codex runner (upstream Symphony concept) | Pluggable runner trait with `shell`, `codex`, `claude_code` impls |
 | Tracker polling            | x0xd TaskList polling now; gossip pubsub on TaskList topic later      |
 | Status/logging             | x0xd REST + WebSocket + per-issue `proofs/` artefact tree            |
 | Handoff state              | Signed handoff payload in TaskItem metadata + linked artefact dir    |
@@ -155,7 +155,7 @@ Adapters:
 | Runner        | Mechanism                                              | Notes                            |
 |---------------|--------------------------------------------------------|----------------------------------|
 | `shell`       | Spawns a child process with prompt on stdin            | Universal fallback. Default.     |
-| `codex`       | Wraps `codex app-server` per Symphony spec             | Optional preset over `shell`.    |
+| `codex`       | Wraps `codex exec` (non-interactive, prompt on stdin)  | Optional preset over `shell`.    |
 | `claude_code` | Wraps `claude` CLI with non-interactive flags          | Preset over `shell`.             |
 | `kimi`/`glm`/`minimax`/`pi` | Configured presets over `shell`          | No bespoke crates.               |
 
