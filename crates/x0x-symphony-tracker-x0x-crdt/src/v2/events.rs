@@ -43,6 +43,10 @@ pub const APPROVAL_CONTEXT_V2: &str = "x0x-symphony-approval-v2";
 /// bytes are a fixed sentinel and are never stored.
 pub const BOOTSTRAP_CONTEXT_V2: &str = "x0x-symphony-bootstrap-v2";
 
+/// Domain-separation context for v2 consumption records (the v2 upgrade of
+/// `x0x-symphony-approval-consumed-v1`).
+pub const CONSUME_CONTEXT_V2: &str = "x0x-symphony-consume-v2";
+
 /// Prefix marking a v2 list reference (disjoint namespace, design r2 Q5).
 pub const V2_LIST_REF_PREFIX: &str = "symphony2:";
 
@@ -57,6 +61,12 @@ pub const ROSTER_KEY_PREFIX: &str = "roster-";
 
 /// Key prefix for transition events.
 pub const EVENT_KEY_PREFIX: &str = "ev-";
+
+/// Key prefix for dispatch-approval events.
+pub const APPROVAL_KEY_PREFIX: &str = "ap-";
+
+/// Key prefix for consumption events.
+pub const CONSUME_KEY_PREFIX: &str = "cs-";
 
 /// Return the per-author event-store topic for `(list_uuid, agent_id)`.
 ///
@@ -87,6 +97,18 @@ pub fn event_key(issue_id: &str, event_hash_hex: &str) -> String {
 #[must_use]
 pub fn roster_key(roster_epoch: u64, event_hash_hex: &str) -> String {
     format!("{ROSTER_KEY_PREFIX}{roster_epoch:010}-{event_hash_hex}")
+}
+
+/// Return the KV key for a dispatch approval: `ap-<issue-id>-<event-hash>`.
+#[must_use]
+pub fn approval_key(issue_id: &str, event_hash_hex: &str) -> String {
+    format!("{APPROVAL_KEY_PREFIX}{issue_id}-{event_hash_hex}")
+}
+
+/// Return the KV key for a consumption event: `cs-<issue-id>-<event-hash>`.
+#[must_use]
+pub fn consume_key(issue_id: &str, event_hash_hex: &str) -> String {
+    format!("{CONSUME_KEY_PREFIX}{issue_id}-{event_hash_hex}")
 }
 
 /// Validate a v2 list uuid: lowercase `[a-z0-9-]`, 1..=64 chars.
@@ -496,6 +518,143 @@ impl TransitionEventV2 {
     /// Returns a serialization error message (unreachable for plain data).
     pub fn to_signed_bytes(&self) -> Result<Vec<u8>, String> {
         serde_json::to_vec(self).map_err(|e| format!("transition encode failed: {e}"))
+    }
+}
+
+/// Verdict of a v2 dispatch approval (parity with v1 `ApprovalVerdict`).
+/// Denials are terminal for the bound issue content: the gate never
+/// dispatches an issue revision that carries an admitted denial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalVerdictV2 {
+    /// Authorize dispatch of the bound issue content.
+    Approve,
+    /// Refuse dispatch of the bound issue content.
+    Deny,
+}
+
+/// WP-B dispatch-approval event, signed under [`APPROVAL_CONTEXT_V2`] and
+/// stored at [`approval_key`] in the APPROVER's own event store. Participates
+/// in the approver's per-author hash chain (shared `author_seq` numbering
+/// with transitions), so approval history is equivocation-evident too.
+///
+/// `approved_at` is a gate-time TTL input ONLY (design r2 finding C3): an
+/// expired approval still folds; the gate refuses to consume it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalEventV2 {
+    /// Always [`V2_SCHEMA`].
+    pub schema: u32,
+    /// Record discriminator; always `"dispatch_approval"` (distinct from the
+    /// requeue-justification approval kind `"approval"`).
+    pub kind: String,
+    /// List uuid binding (C8).
+    pub list_uuid: String,
+    /// Genesis manifest hash binding (C8).
+    pub genesis_manifest_hash: String,
+    /// Roster epoch the approver claims membership at.
+    pub roster_epoch: u64,
+    /// Issue the approval applies to.
+    pub issue_id: String,
+    /// Payload hash of the issue's `Open` event — binds the approval to the
+    /// exact issue content (v2 analogue of v1's `content_hash`).
+    pub open_event_hash: String,
+    /// Approver agent id; must satisfy the four-way author binding.
+    pub actor: String,
+    /// Lamport timestamp (global fold ordering).
+    pub lamport: u64,
+    /// Per-author chain sequence (shared numbering with transitions).
+    pub author_seq: u64,
+    /// Previous own-event hash in the approver's chain.
+    pub prev_own_event_hash: String,
+    /// Approve or deny.
+    pub verdict: ApprovalVerdictV2,
+    /// Uniqueness entropy so two otherwise-identical approvals are distinct
+    /// records.
+    pub entropy: String,
+    /// Approval time (seconds since epoch); gate-time TTL input only.
+    pub approved_at: u64,
+}
+
+impl ApprovalEventV2 {
+    /// Decode from exact signed bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptive reason when the bytes do not parse.
+    pub fn decode(payload: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(payload).map_err(|e| format!("approval decode failed: {e}"))
+    }
+
+    /// Serialize to the exact bytes to be signed and stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error message (unreachable for plain data).
+    pub fn to_signed_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|e| format!("approval encode failed: {e}"))
+    }
+}
+
+/// WP-B consumption event, signed under [`CONSUME_CONTEXT_V2`] and stored at
+/// [`consume_key`] in the CONSUMER's own event store. Participates in the
+/// consumer's per-author hash chain. Set-union convergent: concurrent
+/// consumers can never clobber each other's records — duplicates resolve
+/// deterministically in fold order and losers are surfaced as diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConsumeEventV2 {
+    /// Always [`V2_SCHEMA`].
+    pub schema: u32,
+    /// Record discriminator; always `"consume"`.
+    pub kind: String,
+    /// List uuid binding (C8).
+    pub list_uuid: String,
+    /// Genesis manifest hash binding (C8).
+    pub genesis_manifest_hash: String,
+    /// Roster epoch the consumer claims membership at.
+    pub roster_epoch: u64,
+    /// Issue the consumption applies to.
+    pub issue_id: String,
+    /// Consumer agent id; must satisfy the four-way author binding.
+    pub actor: String,
+    /// Lamport timestamp (global fold ordering; competing consumes for one
+    /// approval resolve by fold order).
+    pub lamport: u64,
+    /// Per-author chain sequence (shared numbering with transitions).
+    pub author_seq: u64,
+    /// Previous own-event hash in the consumer's chain.
+    pub prev_own_event_hash: String,
+    /// Payload hash of the approval being consumed.
+    pub approval_event_hash: String,
+    /// SHA-256 of the approval payload bytes; equals `approval_event_hash`
+    /// in v2 (kept separately for WP-B+ evolution, mirroring C6).
+    pub approval_payload_sha256: String,
+    /// Approver named by the consumed approval.
+    pub approver: String,
+    /// Fencing nonce of the consumer's fold-winning claim.
+    pub claim_nonce: String,
+    /// Payload hash of the consumer's fold-winning claim event.
+    pub claimed_event_hash: String,
+    /// Uniqueness entropy.
+    pub entropy: String,
+}
+
+impl ConsumeEventV2 {
+    /// Decode from exact signed bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptive reason when the bytes do not parse.
+    pub fn decode(payload: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(payload).map_err(|e| format!("consume decode failed: {e}"))
+    }
+
+    /// Serialize to the exact bytes to be signed and stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error message (unreachable for plain data).
+    pub fn to_signed_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|e| format!("consume encode failed: {e}"))
     }
 }
 

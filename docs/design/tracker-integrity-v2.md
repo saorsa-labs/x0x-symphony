@@ -48,8 +48,23 @@ Records inside an author's store:
 | `roster-<epoch:010>-<hash>` (creator only) | `RosterEventV2` envelope | `x0x-symphony-roster-v2` |
 | `ev-<issue-id>-<event-hash>` | `TransitionEventV2` envelope | `x0x-symphony-transition-v2` |
 
-Approval records (`x0x-symphony-approval-v2`) become their own per-key
-records in WP-B; in WP-A they appear embedded inside requeue justifications.
+WP-B adds two more per-key, per-author record types, both participating in
+the SAME per-author hash chain (shared `author_seq` numbering with
+transitions, so approval/consume history is equivocation-evident too):
+
+| Key | Content | Signed context |
+|---|---|---|
+| `ap-<issue-id>-<event-hash>` | `ApprovalEventV2` (kind `dispatch_approval`) | `x0x-symphony-approval-v2` |
+| `cs-<issue-id>-<event-hash>` | `ConsumeEventV2` (kind `consume`) | `x0x-symphony-consume-v2` |
+
+`ApprovalEventV2` binds (C8): schema, list, genesis, epoch, issue,
+`open_event_hash` (the issue's exact content — v2 analogue of v1's
+`content_hash`), verdict (approve/deny), entropy, `approved_at` (gate TTL
+input ONLY). `ConsumeEventV2` additionally binds the consumed approval's
+event hash + payload hash + approver, and the consumer's winning
+`claim_nonce` + claim event hash. The requeue-justification approval of WP-A
+(kind `"approval"`) shares the `x0x-symphony-approval-v2` context; the
+signed `kind` field discriminates, and every consumer checks it.
 
 Heartbeats are v1-style **mutable** liveness keys (`hb-<issue-id>`) and are
 **never fold inputs**. Because the event store is append-only they cannot
@@ -196,7 +211,7 @@ reason) — hostile input is visible, never silently dropped. Rejections and
 fork evidence are canonically sorted so diagnostics are order-independent
 too.
 
-### 2.4 Phase 2 — state machine
+### 2.4 Phase 2 — state machine and approval ledger
 
 Admitted events are applied in ascending `(lamport, author, event_hash)`
 order — a total order, so concurrent claims resolve identically everywhere.
@@ -223,7 +238,47 @@ mutation.
 
 Ineffective events are recorded as phase-2 rejections and change nothing.
 `FoldOutput` exposes per-issue `applied` event-hash logs, `max_admitted_lamport`
-(callers stamp their next event with `max+1`), rejections, and fork evidence.
+(callers stamp their next event with `max+1`), per-author chain tips,
+rejections, and fork evidence.
+
+**Approval ledger (WP-B).** The same ordered walk maintains:
+
+- `approvals`: admitted `ApprovalEventV2`s (a set — order-independent).
+- `effective_consumes`: at most ONE effective consume per approval, ever.
+  A consume is effective at its fold position iff (1) its approval is
+  admitted, names the same issue and approver, carries an `approve` verdict
+  and binds the issue's current `Open` content; (2) the consumer holds the
+  fold-winning claim (actor + `claim_nonce` + claim event hash all fence —
+  a non-winner's consume is never effective); and (3) no earlier
+  fold-ordered consume already took the approval.
+- `losing_consumes`: every non-effective consume attempt, surfaced with its
+  reason (duplicate, unfenced, unknown approval) — losers are diagnostics,
+  never silent.
+
+`FoldOutput::unconsumed_approvals(issue)` = admitted approve-verdict
+approvals for the issue's current content, minus effective consumes, minus
+everything when an admitted denial covers that content (denials terminal,
+v1 parity). TTL is NOT applied there (C3).
+
+### 2.5 The dispatch gate (WP-B, `v2::gate`)
+
+Consume-then-execute, failing toward zero executions:
+
+1. Fold; require the local agent to hold the fold-winning claim.
+2. An admitted denial for the current content ⇒ `Denied`.
+3. Candidates = `unconsumed_approvals`, filtered by the gate-time TTL
+   (`approved_at + ttl >= now`, caller-supplied clock — C3). None ⇒
+   `PendingApproval`.
+4. Durably append a `ConsumeEventV2` (chained, lamport `max+1`) — BEFORE any
+   execution.
+5. Settle re-read (config `settle`, default 2s — an optimization narrowing
+   the live-partition window, NOT a safety bound), then re-fold: our consume
+   must be THE effective consume for the approval; a competing winner ⇒
+   `AbortCompetingConsume` (no execution), ineffective ⇒ `AbortIneffective`.
+6. Crash anywhere after step 4 spends the approval with zero executions;
+   recovery = re-approval. Trust (`required_trust`) is deliberately NOT
+   checked in the gate — it stays the caller's dispatch-time policy (C2),
+   exactly as in the v1 orchestrator flow (checked before the gate).
 
 ## 3. What is deliberately NOT in the fold
 
@@ -231,9 +286,6 @@ Ineffective events are recorded as phase-2 rejections and change nothing.
   refuse dispatch/display only.
 - **TTL** (C3): approval expiry is checked at the dispatch gate against the
   local clock; folded state never depends on clocks.
-- **Consumption** (WP-B): per-key `ApprovalEvent`/`ConsumeEvent`,
-  claim-fenced consume + settle re-read, and duplicate/lost-consume
-  diagnostics land in WP-B on top of this fold.
 - **Compaction**: none in v0.2.0; future compaction must Merkle-commit
   history.
 - **Shard-primary consume** (Q6): recorded as a future liveness knob; not in
@@ -265,3 +317,17 @@ reclaim, 10-seed shuffle determinism, and genesis refusals. Identity vectors
 in `src/v2/identity.rs` are computed independently of the implementation;
 `tests/v2_live_x0xd.rs` cross-checks a live `/agent/sign` response against
 the local verifier when `X0XD_URL` is set.
+
+WP-B: `tests/v2_fold.rs` adds approval/consume fold coverage (approval
+admission bindings each violated; TTL explicitly NOT a fold input; denial
+masking; non-winner consume losing + winner effective; duplicate consumes →
+deterministic first-in-fold-order winner with the loser flagged, shuffled
+order agreeing; consume of an unknown approval losing).
+`tests/v2_gate.rs` drives `V2ApprovalGate` over an in-memory daemon double
+that honors the append-only contract and can release "concurrently
+arriving" peer records after the local consume write: happy path exactly
+once (second evaluation pends, one durable `cs-` record), partition-heal
+competing consume → `AbortCompetingConsume` with zero local executions,
+crash-after-consume → zero executions until re-approval then exactly once
+per approval, expired-at-gate approval still folding, denial blocking, and
+non-claim-winner refusal.

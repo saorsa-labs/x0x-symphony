@@ -11,14 +11,15 @@ use saorsa_pqc::{MlDsa65, MlDsaOperations, MlDsaSecretKey};
 use x0x_symphony_core::sha256_hex;
 use x0x_symphony_tracker_x0x_crdt::v2::{
     events::{
-        event_key, roster_key, ApprovalPayloadV2, GenesisPolicy, APPROVAL_CONTEXT_V2,
-        CARD_SELF_KEY, GENESIS_CONTEXT_V2, GENESIS_KEY, ROSTER_CONTEXT_V2, TRANSITION_CONTEXT_V2,
+        approval_key, consume_key, event_key, roster_key, ApprovalPayloadV2, GenesisPolicy,
+        APPROVAL_CONTEXT_V2, CARD_SELF_KEY, CONSUME_CONTEXT_V2, GENESIS_CONTEXT_V2, GENESIS_KEY,
+        ROSTER_CONTEXT_V2, TRANSITION_CONTEXT_V2,
     },
     fold_v2,
     identity::{assemble_external_dst, derive_agent_id_hex},
-    AuthorStream, BlockReason, EventEnvelope, FoldInput, FoldOutput, GenesisManifestV2,
-    IssueStatusV2, ListRefusal, RequeueJustification, RosterEventV2, StoreRecord,
-    TransitionEventV2, TransitionKind, V2_SCHEMA,
+    ApprovalEventV2, ApprovalVerdictV2, AuthorStream, BlockReason, ConsumeEventV2, EventEnvelope,
+    FoldInput, FoldOutput, GenesisManifestV2, IssueStatusV2, ListRefusal, RequeueJustification,
+    RosterEventV2, StoreRecord, TransitionEventV2, TransitionKind, V2_SCHEMA,
 };
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -142,6 +143,82 @@ impl<'a> Chain<'a> {
         let hash = sha256_hex(&payload);
         let envelope = self.author.sign_envelope(TRANSITION_CONTEXT_V2, &payload)?;
         let record = envelope_record(&event_key(issue, &hash), &envelope)?;
+        self.prev.clone_from(&hash);
+        Ok((hash, record))
+    }
+}
+
+impl Chain<'_> {
+    /// Build the next chained dispatch approval; returns `(hash, record)`.
+    fn next_approval(
+        &mut self,
+        epoch: u64,
+        issue: &str,
+        lamport: u64,
+        open_event_hash: &str,
+        verdict: ApprovalVerdictV2,
+        approved_at: u64,
+    ) -> TestResult<(String, StoreRecord)> {
+        self.seq += 1;
+        let event = ApprovalEventV2 {
+            schema: V2_SCHEMA,
+            kind: "dispatch_approval".to_owned(),
+            list_uuid: self.fixture_list.clone(),
+            genesis_manifest_hash: self.genesis_hash.clone(),
+            roster_epoch: epoch,
+            issue_id: issue.to_owned(),
+            open_event_hash: open_event_hash.to_owned(),
+            actor: self.author.id.clone(),
+            lamport,
+            author_seq: self.seq,
+            prev_own_event_hash: self.prev.clone(),
+            verdict,
+            entropy: format!("entropy-{}", self.seq),
+            approved_at,
+        };
+        let payload = event.to_signed_bytes().map_err(err)?;
+        let hash = sha256_hex(&payload);
+        let envelope = self.author.sign_envelope(APPROVAL_CONTEXT_V2, &payload)?;
+        let record = envelope_record(&approval_key(issue, &hash), &envelope)?;
+        self.prev.clone_from(&hash);
+        Ok((hash, record))
+    }
+
+    /// Build the next chained consume; returns `(hash, record)`.
+    #[allow(clippy::too_many_arguments)]
+    fn next_consume(
+        &mut self,
+        epoch: u64,
+        issue: &str,
+        lamport: u64,
+        approval_event_hash: &str,
+        approver: &str,
+        claim_nonce: &str,
+        claimed_event_hash: &str,
+    ) -> TestResult<(String, StoreRecord)> {
+        self.seq += 1;
+        let event = ConsumeEventV2 {
+            schema: V2_SCHEMA,
+            kind: "consume".to_owned(),
+            list_uuid: self.fixture_list.clone(),
+            genesis_manifest_hash: self.genesis_hash.clone(),
+            roster_epoch: epoch,
+            issue_id: issue.to_owned(),
+            actor: self.author.id.clone(),
+            lamport,
+            author_seq: self.seq,
+            prev_own_event_hash: self.prev.clone(),
+            approval_event_hash: approval_event_hash.to_owned(),
+            approval_payload_sha256: approval_event_hash.to_owned(),
+            approver: approver.to_owned(),
+            claim_nonce: claim_nonce.to_owned(),
+            claimed_event_hash: claimed_event_hash.to_owned(),
+            entropy: format!("entropy-{}", self.seq),
+        };
+        let payload = event.to_signed_bytes().map_err(err)?;
+        let hash = sha256_hex(&payload);
+        let envelope = self.author.sign_envelope(CONSUME_CONTEXT_V2, &payload)?;
+        let record = envelope_record(&consume_key(issue, &hash), &envelope)?;
         self.prev.clone_from(&hash);
         Ok((hash, record))
     }
@@ -1678,5 +1755,403 @@ fn cross_author_future_dating_rejects_both_authors() -> TestResult {
         .filter(|r| r.contains("exceeds admitted maximum"))
         .count();
     assert_eq!(lamport_rejections, 2);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// WP-B: dispatch approvals + consumes in the fold
+// ---------------------------------------------------------------------------
+
+/// Common WP-B scenario: creator opens i1, worker claims it, approver is a
+/// roster member.
+struct WpbScenario {
+    fixture: ListFixture,
+    creator: Author,
+    worker: Author,
+    approver: Author,
+    creator_records: Vec<StoreRecord>,
+    worker_records: Vec<StoreRecord>,
+    worker_chain: (u64, String),
+    open_hash: String,
+    claim_hash: String,
+    claim_nonce: String,
+}
+
+fn wpb_scenario(list: &str) -> TestResult<WpbScenario> {
+    let creator = Author::generate()?;
+    let worker = Author::generate()?;
+    let approver = Author::generate()?;
+    let fixture = make_genesis(&creator, list, &[&creator, &worker, &approver])?;
+    let mut chain_c = Chain::new(&creator, &fixture);
+    let (open_hash, r_open) = chain_c.next(
+        0,
+        "i1",
+        1,
+        TransitionKind::Open {
+            title: "t".to_owned(),
+            spec: "s".to_owned(),
+        },
+    )?;
+    let mut chain_w = Chain::new(&worker, &fixture);
+    let claim_nonce = "nonce-w".to_owned();
+    let (claim_hash, r_claim) = chain_w.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: claim_nonce.clone(),
+        },
+    )?;
+    Ok(WpbScenario {
+        creator_records: vec![fixture.genesis_record.clone(), r_open],
+        worker_records: vec![r_claim],
+        worker_chain: (chain_w.seq, chain_w.prev.clone()),
+        fixture,
+        creator,
+        worker,
+        approver,
+        open_hash,
+        claim_hash,
+        claim_nonce,
+    })
+}
+
+fn fold_wpb(
+    scenario: &WpbScenario,
+    approver_records: Vec<StoreRecord>,
+    extra_worker: Vec<StoreRecord>,
+) -> TestResult<FoldOutput> {
+    let mut worker_records = scenario.worker_records.clone();
+    worker_records.extend(extra_worker);
+    fold(
+        &scenario.fixture,
+        &scenario.creator,
+        vec![
+            stream(&scenario.creator, scenario.creator_records.clone()),
+            stream(&scenario.worker, worker_records),
+            stream(&scenario.approver, approver_records),
+        ],
+    )
+    .map_err(|e| err(e.to_string()))
+}
+
+#[test]
+fn valid_approval_folds_and_is_unconsumed() -> TestResult {
+    let scenario = wpb_scenario("list-wb1")?;
+    let mut chain_ap = Chain::new(&scenario.approver, &scenario.fixture);
+    let (ap_hash, r_ap) = chain_ap.next_approval(
+        0,
+        "i1",
+        3,
+        &scenario.open_hash,
+        ApprovalVerdictV2::Approve,
+        100,
+    )?;
+    let out = fold_wpb(&scenario, vec![r_ap], vec![])?;
+    assert!(out.approvals.contains_key(&ap_hash));
+    let unconsumed = out.unconsumed_approvals("i1");
+    assert_eq!(unconsumed.len(), 1);
+    assert_eq!(unconsumed[0].event_hash, ap_hash);
+    Ok(())
+}
+
+#[test]
+fn ttl_is_not_a_fold_input_ancient_approval_still_folds() -> TestResult {
+    let scenario = wpb_scenario("list-wb2")?;
+    let mut chain_ap = Chain::new(&scenario.approver, &scenario.fixture);
+    // approved_at = 1 (ancient). The fold must neither reject nor hide it —
+    // TTL is gate-time policy only (design r2 C3).
+    let (ap_hash, r_ap) = chain_ap.next_approval(
+        0,
+        "i1",
+        3,
+        &scenario.open_hash,
+        ApprovalVerdictV2::Approve,
+        1,
+    )?;
+    let out = fold_wpb(&scenario, vec![r_ap], vec![])?;
+    assert!(out.approvals.contains_key(&ap_hash));
+    assert_eq!(out.unconsumed_approvals("i1").len(), 1);
+    Ok(())
+}
+
+#[test]
+fn approval_admission_bindings_each_violated() -> TestResult {
+    let scenario = wpb_scenario("list-wb3")?;
+
+    // (1) Wrong record kind inside the signed payload.
+    let bad_kind = ApprovalEventV2 {
+        schema: V2_SCHEMA,
+        kind: "approval".to_owned(),
+        list_uuid: scenario.fixture.list_uuid.clone(),
+        genesis_manifest_hash: scenario.fixture.genesis_hash.clone(),
+        roster_epoch: 0,
+        issue_id: "i1".to_owned(),
+        open_event_hash: scenario.open_hash.clone(),
+        actor: scenario.approver.id.clone(),
+        lamport: 3,
+        author_seq: 1,
+        prev_own_event_hash: scenario.fixture.genesis_hash.clone(),
+        verdict: ApprovalVerdictV2::Approve,
+        entropy: "e".to_owned(),
+        approved_at: 100,
+    };
+    let payload = bad_kind.to_signed_bytes().map_err(err)?;
+    let hash = sha256_hex(&payload);
+    let envelope = scenario
+        .approver
+        .sign_envelope(APPROVAL_CONTEXT_V2, &payload)?;
+    let record = envelope_record(&approval_key("i1", &hash), &envelope)?;
+    let out = fold_wpb(&scenario, vec![record], vec![])?;
+    assert!(out.approvals.is_empty());
+    assert_some_reason_contains(&out, "!= dispatch_approval")?;
+
+    // (2) Approval read from the WRONG store (four-way binding).
+    let mut chain_ap = Chain::new(&scenario.approver, &scenario.fixture);
+    let (_, r_ap) = chain_ap.next_approval(
+        0,
+        "i1",
+        3,
+        &scenario.open_hash,
+        ApprovalVerdictV2::Approve,
+        100,
+    )?;
+    let mut creator_records = scenario.creator_records.clone();
+    creator_records.push(r_ap);
+    let out = fold(
+        &scenario.fixture,
+        &scenario.creator,
+        vec![
+            stream(&scenario.creator, creator_records),
+            stream(&scenario.worker, scenario.worker_records.clone()),
+            stream(&scenario.approver, vec![]),
+        ],
+    )
+    .map_err(|e| err(e.to_string()))?;
+    assert!(out.approvals.is_empty());
+    assert_some_reason_contains(&out, "envelope signer")?;
+
+    // (3) Non-roster approver.
+    let outsider = Author::generate()?;
+    let mut chain_out = Chain::new(&outsider, &scenario.fixture);
+    let (_, r_out) = chain_out.next_approval(
+        0,
+        "i1",
+        3,
+        &scenario.open_hash,
+        ApprovalVerdictV2::Approve,
+        100,
+    )?;
+    let out = fold(
+        &scenario.fixture,
+        &scenario.creator,
+        vec![
+            stream(&scenario.creator, scenario.creator_records.clone()),
+            stream(&scenario.worker, scenario.worker_records.clone()),
+            stream(&outsider, vec![r_out]),
+        ],
+    )
+    .map_err(|e| err(e.to_string()))?;
+    assert!(out.approvals.is_empty());
+    assert_some_reason_contains(&out, "is not a roster member")?;
+
+    // (4) Wrong content address (key does not match payload hash).
+    let mut chain_ap = Chain::new(&scenario.approver, &scenario.fixture);
+    let (_, mut r_ap) = chain_ap.next_approval(
+        0,
+        "i1",
+        3,
+        &scenario.open_hash,
+        ApprovalVerdictV2::Approve,
+        100,
+    )?;
+    r_ap.key = approval_key("i1", &"0".repeat(64));
+    let out = fold_wpb(&scenario, vec![r_ap], vec![])?;
+    assert!(out.approvals.is_empty());
+    assert_some_reason_contains(&out, "content address")?;
+    Ok(())
+}
+
+#[test]
+fn denial_hides_approvals_for_same_content() -> TestResult {
+    let scenario = wpb_scenario("list-wb4")?;
+    let mut chain_ap = Chain::new(&scenario.approver, &scenario.fixture);
+    let (_, r_ok) = chain_ap.next_approval(
+        0,
+        "i1",
+        3,
+        &scenario.open_hash,
+        ApprovalVerdictV2::Approve,
+        100,
+    )?;
+    let (_, r_deny) = chain_ap.next_approval(
+        0,
+        "i1",
+        4,
+        &scenario.open_hash,
+        ApprovalVerdictV2::Deny,
+        101,
+    )?;
+    let out = fold_wpb(&scenario, vec![r_ok, r_deny], vec![])?;
+    assert_eq!(out.approvals.len(), 2);
+    assert!(out.unconsumed_approvals("i1").is_empty());
+    Ok(())
+}
+
+#[test]
+fn non_winner_consume_is_losing_and_winner_consume_is_effective() -> TestResult {
+    let scenario = wpb_scenario("list-wb5")?;
+    let mut chain_ap = Chain::new(&scenario.approver, &scenario.fixture);
+    let (ap_hash, r_ap) = chain_ap.next_approval(
+        0,
+        "i1",
+        3,
+        &scenario.open_hash,
+        ApprovalVerdictV2::Approve,
+        100,
+    )?;
+
+    // The approver also claims (later; loses) and tries to consume fenced on
+    // its own losing claim.
+    let (loser_claim_hash, r_loser_claim) = chain_ap.next(
+        0,
+        "i1",
+        4,
+        TransitionKind::Claim {
+            claim_nonce: "nonce-l".to_owned(),
+        },
+    )?;
+    let (_, r_loser_consume) = chain_ap.next_consume(
+        0,
+        "i1",
+        5,
+        &ap_hash,
+        &scenario.approver.id,
+        "nonce-l",
+        &loser_claim_hash,
+    )?;
+
+    // The fold-winning worker consumes with the correct fence.
+    let mut chain_w = Chain {
+        author: &scenario.worker,
+        fixture_list: scenario.fixture.list_uuid.clone(),
+        genesis_hash: scenario.fixture.genesis_hash.clone(),
+        seq: scenario.worker_chain.0,
+        prev: scenario.worker_chain.1.clone(),
+    };
+    let (win_hash, r_win_consume) = chain_w.next_consume(
+        0,
+        "i1",
+        6,
+        &ap_hash,
+        &scenario.approver.id,
+        &scenario.claim_nonce,
+        &scenario.claim_hash,
+    )?;
+
+    let out = fold_wpb(
+        &scenario,
+        vec![r_ap, r_loser_claim, r_loser_consume],
+        vec![r_win_consume],
+    )?;
+    // Loser surfaced, not effective; winner effective; approval consumed.
+    let effective = out
+        .effective_consumes
+        .get(&ap_hash)
+        .ok_or_else(|| err("no effective consume"))?;
+    assert_eq!(effective.event_hash, win_hash);
+    assert_eq!(effective.consume.actor, scenario.worker.id);
+    assert_eq!(out.losing_consumes.len(), 1);
+    assert!(out.losing_consumes[0].reason.contains("not fenced"));
+    assert!(out.unconsumed_approvals("i1").is_empty());
+    Ok(())
+}
+
+#[test]
+fn duplicate_consumes_resolve_deterministically_with_loser_flagged() -> TestResult {
+    let scenario = wpb_scenario("list-wb6")?;
+    let mut chain_ap = Chain::new(&scenario.approver, &scenario.fixture);
+    let (ap_hash, r_ap) = chain_ap.next_approval(
+        0,
+        "i1",
+        3,
+        &scenario.open_hash,
+        ApprovalVerdictV2::Approve,
+        100,
+    )?;
+    let mut chain_w = Chain {
+        author: &scenario.worker,
+        fixture_list: scenario.fixture.list_uuid.clone(),
+        genesis_hash: scenario.fixture.genesis_hash.clone(),
+        seq: scenario.worker_chain.0,
+        prev: scenario.worker_chain.1.clone(),
+    };
+    let (first_hash, r_c1) = chain_w.next_consume(
+        0,
+        "i1",
+        4,
+        &ap_hash,
+        &scenario.approver.id,
+        &scenario.claim_nonce,
+        &scenario.claim_hash,
+    )?;
+    let (second_hash, r_c2) = chain_w.next_consume(
+        0,
+        "i1",
+        5,
+        &ap_hash,
+        &scenario.approver.id,
+        &scenario.claim_nonce,
+        &scenario.claim_hash,
+    )?;
+
+    let base = (vec![r_ap], vec![r_c1, r_c2]);
+    let reference = fold_wpb(&scenario, base.0.clone(), base.1.clone())?;
+    let effective = reference
+        .effective_consumes
+        .get(&ap_hash)
+        .ok_or_else(|| err("no effective consume"))?;
+    // Fold order: lamport 4 before 5 — the first consume wins.
+    assert_eq!(effective.event_hash, first_hash);
+    assert_eq!(reference.losing_consumes.len(), 1);
+    assert_eq!(reference.losing_consumes[0].event_hash, second_hash);
+    assert!(reference.losing_consumes[0]
+        .reason
+        .contains("already consumed"));
+
+    // Shuffled input order agrees.
+    let reference_json = serde_json::to_value(&reference)?;
+    let shuffled = fold_wpb(&scenario, base.0, {
+        let mut v = base.1;
+        v.reverse();
+        v
+    })?;
+    assert_eq!(serde_json::to_value(&shuffled)?, reference_json);
+    Ok(())
+}
+
+#[test]
+fn consume_of_unknown_approval_is_losing() -> TestResult {
+    let scenario = wpb_scenario("list-wb7")?;
+    let mut chain_w = Chain {
+        author: &scenario.worker,
+        fixture_list: scenario.fixture.list_uuid.clone(),
+        genesis_hash: scenario.fixture.genesis_hash.clone(),
+        seq: scenario.worker_chain.0,
+        prev: scenario.worker_chain.1.clone(),
+    };
+    let (_, r_consume) = chain_w.next_consume(
+        0,
+        "i1",
+        4,
+        &"9".repeat(64),
+        &scenario.approver.id,
+        &scenario.claim_nonce,
+        &scenario.claim_hash,
+    )?;
+    let out = fold_wpb(&scenario, vec![], vec![r_consume])?;
+    assert!(out.effective_consumes.is_empty());
+    assert_eq!(out.losing_consumes.len(), 1);
+    assert!(out.losing_consumes[0].reason.contains("unknown"));
     Ok(())
 }

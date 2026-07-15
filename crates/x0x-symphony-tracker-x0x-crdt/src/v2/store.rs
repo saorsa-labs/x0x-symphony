@@ -30,9 +30,11 @@ use reqwest::StatusCode;
 use x0x_symphony_signing::{SigningClient, SigningError};
 
 use super::events::{
-    event_key, event_store_topic, heartbeat_store_topic, EventEnvelope, GenesisManifestV2,
-    GenesisPolicy, RosterEventV2, TransitionEventV2, BOOTSTRAP_CONTEXT_V2, CARD_SELF_KEY,
-    GENESIS_CONTEXT_V2, GENESIS_KEY, ROSTER_CONTEXT_V2, TRANSITION_CONTEXT_V2, V2_SCHEMA,
+    approval_key, consume_key, event_key, event_store_topic, heartbeat_store_topic,
+    ApprovalEventV2, ConsumeEventV2, EventEnvelope, GenesisManifestV2, GenesisPolicy,
+    RosterEventV2, TransitionEventV2, APPROVAL_CONTEXT_V2, BOOTSTRAP_CONTEXT_V2, CARD_SELF_KEY,
+    CONSUME_CONTEXT_V2, GENESIS_CONTEXT_V2, GENESIS_KEY, ROSTER_CONTEXT_V2, TRANSITION_CONTEXT_V2,
+    V2_SCHEMA,
 };
 use super::fold::{AuthorStream, FoldInput, StoreRecord};
 use super::identity::decode_b64;
@@ -225,6 +227,10 @@ pub enum V2StoreError {
     /// A value failed local validation.
     #[error("invalid v2 record: {0}")]
     Invalid(String),
+
+    /// The fold refused the entire list (downgrade defense).
+    #[error(transparent)]
+    Refused(#[from] super::fold::ListRefusal),
 }
 
 /// The local author's bound event store for one list.
@@ -564,6 +570,77 @@ impl V2StoreManager {
             .sign_envelope(own, TRANSITION_CONTEXT_V2, &payload)
             .await?;
         let key = event_key(&event.issue_id, &hash);
+        self.put_once(&own.topic, &key, &envelope).await?;
+        Ok(hash)
+    }
+
+    /// Sign and append a WP-B dispatch approval to the local author's store
+    /// at `ap-<issue-id>-<event-hash>`. Returns the payload hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V2StoreError::Invalid`] when the event does not name this
+    /// store's author/list, plus signing/client errors.
+    pub async fn append_approval(
+        &self,
+        own: &OwnEventStore,
+        event: &ApprovalEventV2,
+    ) -> Result<String> {
+        if event.actor != own.agent_id {
+            return Err(V2StoreError::Invalid(format!(
+                "approval actor {} is not the local author {}",
+                event.actor, own.agent_id
+            )));
+        }
+        if event.list_uuid != own.list_uuid {
+            return Err(V2StoreError::Invalid(format!(
+                "approval names list {} but this store serves {}",
+                event.list_uuid, own.list_uuid
+            )));
+        }
+        let payload = event.to_signed_bytes().map_err(V2StoreError::Invalid)?;
+        let hash = sha256_hex(&payload);
+        let envelope = self
+            .sign_envelope(own, APPROVAL_CONTEXT_V2, &payload)
+            .await?;
+        let key = approval_key(&event.issue_id, &hash);
+        self.put_once(&own.topic, &key, &envelope).await?;
+        Ok(hash)
+    }
+
+    /// Sign and append a WP-B consume to the local author's store at
+    /// `cs-<issue-id>-<event-hash>`. Returns the payload hash. This is the
+    /// durable "consume" half of consume-then-execute: callers must write
+    /// this BEFORE executing, and abort when the settle re-read shows a
+    /// competing effective consume.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V2StoreError::Invalid`] when the event does not name this
+    /// store's author/list, plus signing/client errors.
+    pub async fn append_consume(
+        &self,
+        own: &OwnEventStore,
+        event: &ConsumeEventV2,
+    ) -> Result<String> {
+        if event.actor != own.agent_id {
+            return Err(V2StoreError::Invalid(format!(
+                "consume actor {} is not the local author {}",
+                event.actor, own.agent_id
+            )));
+        }
+        if event.list_uuid != own.list_uuid {
+            return Err(V2StoreError::Invalid(format!(
+                "consume names list {} but this store serves {}",
+                event.list_uuid, own.list_uuid
+            )));
+        }
+        let payload = event.to_signed_bytes().map_err(V2StoreError::Invalid)?;
+        let hash = sha256_hex(&payload);
+        let envelope = self
+            .sign_envelope(own, CONSUME_CONTEXT_V2, &payload)
+            .await?;
+        let key = consume_key(&event.issue_id, &hash);
         self.put_once(&own.topic, &key, &envelope).await?;
         Ok(hash)
     }

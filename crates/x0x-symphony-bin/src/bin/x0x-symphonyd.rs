@@ -234,6 +234,17 @@ fn build_tracker(
     signing_client: Arc<X0xdClient>,
     worker_view: Arc<dyn WorkerViewProvider>,
 ) -> anyhow::Result<Arc<X0xCrdtTracker>> {
+    // Downgrade defense (tracker-integrity v2, design r2 Q5): a
+    // `symphony2:`-prefixed list reference addresses the v2 event-store
+    // namespace and must NEVER be silently treated as a v1 TaskList topic.
+    // The v2 dispatch path (WP-B fold + gate, `x0x_symphony_tracker_x0x_crdt::v2`)
+    // is not wired into the daemon yet, so refuse loudly instead.
+    if x0x_symphony_tracker_x0x_crdt::v2::V2ListRef::is_v2_namespace(&workflow.tracker.list_id) {
+        anyhow::bail!(
+            "tracker.list_id {} addresses the tracker-integrity v2 namespace;              v2 dispatch wiring is not yet enabled in x0x-symphonyd              (x0x-symphony#10 WP-B) — refusing rather than downgrading to v1",
+            workflow.tracker.list_id
+        );
+    }
     let mut tracker_builder = X0xCrdtTracker::builder(
         &workflow.signing.x0xd_url,
         &workflow.tracker.list_id,

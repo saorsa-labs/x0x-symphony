@@ -26,16 +26,19 @@
 
 pub mod events;
 pub mod fold;
+pub mod gate;
 pub mod identity;
 pub mod store;
 
 pub use events::{
-    BlockReason, EventEnvelope, GenesisManifestV2, RequeueJustification, RosterEventV2,
-    TransitionEventV2, TransitionKind, V2ListRef, TRANSITION_CONTEXT_V2, V2_LIST_REF_PREFIX,
-    V2_SCHEMA,
+    ApprovalEventV2, ApprovalVerdictV2, BlockReason, ConsumeEventV2, EventEnvelope,
+    GenesisManifestV2, RequeueJustification, RosterEventV2, TransitionEventV2, TransitionKind,
+    V2ListRef, TRANSITION_CONTEXT_V2, V2_LIST_REF_PREFIX, V2_SCHEMA,
 };
 pub use fold::{
-    fold_v2, AuthorStream, FoldInput, FoldOutput, ForkEvidence, IssueStateV2, IssueStatusV2,
-    ListRefusal, Rejection, RejectionPhase, StoreRecord, LAMPORT_MAX_SKEW,
+    fold_v2, AdmittedApprovalV2, AuthorStream, ChainTipV2, ConsumeDiagnostic, EffectiveConsumeV2,
+    FoldInput, FoldOutput, ForkEvidence, IssueStateV2, IssueStatusV2, ListRefusal, Rejection,
+    RejectionPhase, StoreRecord, LAMPORT_MAX_SKEW,
 };
-pub use store::{OwnEventStore, StorePolicyMode, V2StoreError, V2StoreManager};
+pub use gate::{build_claim_transition, V2ApprovalGate, V2GateConfig, V2GateDecision};
+pub use store::{OwnEventStore, StorePolicyMode, V2StoreApi, V2StoreError, V2StoreManager};
