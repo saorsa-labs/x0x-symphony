@@ -99,6 +99,13 @@ security:
   # always refused.
   required_trust: trusted
 
+# Tracker signing. `required` makes locally created issues carry verified
+# self-signed ML-DSA-65 provenance, so `issue new` dispatches under
+# network_dispatch=off/approve without entering the network consent gate.
+# `network_dispatch: approve` refuses to load without it.
+signing:
+  policy: required
+
 # Default runner: shell. Operators may configure a preset (codex,
 # claude_code, kimi, glm, minimax, pi) via runner.preset.
 runner:

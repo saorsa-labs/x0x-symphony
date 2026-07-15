@@ -88,12 +88,12 @@ async fn workflow_with_runner_sandbox_passes_config_check() -> Result<(), Box<dy
 
 #[test]
 fn security_config_maps_to_orchestrator_config() -> Result<(), Box<dyn Error>> {
-    let workflow = workflow_with_security(concat!(
+    let workflow = with_required_signing(&workflow_with_security(concat!(
         "  required_trust: known\n",
         "  network_dispatch: approve\n",
         "  approval_ttl: 2h\n",
         "  approval_webhook_url: https://approvals.example.test/hook\n",
-    ));
+    )));
 
     let config = WorkflowConfig::from_markdown(&workflow)?;
     let orchestrator = config.to_orchestrator_config(AgentId::new("agent-a")?)?;
@@ -371,7 +371,11 @@ fn network_dispatch_policy_values_parse() -> Result<(), Box<dyn Error>> {
         } else {
             ""
         };
-        let workflow = workflow_with_security(&format!("  network_dispatch: {raw}\n{ack}"));
+        let mut workflow = workflow_with_security(&format!("  network_dispatch: {raw}\n{ack}"));
+        if expected == NetworkDispatchPolicy::Approve {
+            // approve without signing.policy=required is rejected outright.
+            workflow = with_required_signing(&workflow);
+        }
 
         let config = WorkflowConfig::from_markdown(&workflow)?;
 
@@ -397,7 +401,9 @@ fn unknown_network_dispatch_policy_aborts_config_load() -> Result<(), Box<dyn Er
 
 #[test]
 fn legacy_network_dispatch_enabled_true_maps_to_approve() -> Result<(), Box<dyn Error>> {
-    let workflow = workflow_with_security("  network_dispatch_enabled: true\n");
+    let workflow = with_required_signing(&workflow_with_security(
+        "  network_dispatch_enabled: true\n",
+    ));
 
     let config = WorkflowConfig::from_markdown(&workflow)?;
 
@@ -430,6 +436,74 @@ fn auto_network_dispatch_without_ack_aborts_config_load() -> Result<(), Box<dyn 
         "problems were: {problems:?}"
     );
     Ok(())
+}
+
+/// Issue #6 defect 3: `network_dispatch: approve` with tracker signing
+/// disabled is an unrecoverable trap: locally created issues can never carry
+/// verified provenance, so nothing could ever be approved or dispatched. The
+/// pairing must be rejected at config load, mirroring the auto+`auto_ack` gate.
+#[test]
+fn approve_without_required_signing_aborts_config_load() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_with_security("  network_dispatch: approve\n");
+
+    let problems = invalid_workflow_problems(&workflow)?;
+
+    assert!(
+        problems.iter().any(|problem| problem
+            .starts_with("security.network_dispatch=approve requires signing.policy=required")),
+        "problems were: {problems:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn approve_with_required_signing_loads() -> Result<(), Box<dyn Error>> {
+    let workflow = with_required_signing(&workflow_with_security("  network_dispatch: approve\n"));
+
+    let config = WorkflowConfig::from_markdown(&workflow)?;
+
+    assert_eq!(
+        config.security.network_dispatch,
+        NetworkDispatchPolicy::Approve
+    );
+    assert!(config.warnings.is_empty());
+    Ok(())
+}
+
+/// Explicit `network_dispatch: off` without required signing leaves local
+/// issues undispatchable (they carry no self-signed provenance); the config
+/// must warn loudly instead of trapping the operator silently.
+#[test]
+fn explicit_off_without_required_signing_warns() -> Result<(), Box<dyn Error>> {
+    let workflow = workflow_with_security("  network_dispatch: off\n");
+
+    let config = WorkflowConfig::from_markdown(&workflow)?;
+
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("network_dispatch=off")
+                && warning.contains("signing.policy=required")),
+        "warnings were: {:?}",
+        config.warnings
+    );
+    Ok(())
+}
+
+/// A minimal config with no `security:` block keeps the quiet default —
+/// the off/signing pairing warning is only for explicitly configured security.
+#[test]
+fn default_security_without_block_does_not_warn() -> Result<(), Box<dyn Error>> {
+    let config = WorkflowConfig::from_markdown(&workflow_missing("none"))?;
+
+    assert_eq!(config.security.network_dispatch, NetworkDispatchPolicy::Off);
+    assert!(config.warnings.is_empty());
+    Ok(())
+}
+
+fn with_required_signing(workflow: &str) -> String {
+    workflow.replace("agent:\n", "signing:\n  policy: required\nagent:\n")
 }
 
 #[test]

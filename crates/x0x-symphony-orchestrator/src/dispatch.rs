@@ -21,9 +21,9 @@ use x0x_symphony_core::{
     approval_decision, content_hash, sha256_hex, AgentId, ApprovalConsumed, ApprovalDecision,
     ApprovalEvent, ApprovalState, ApprovalValidity, Claim, Handoff, HookEnv, HookName, HookOutcome,
     HookStatus, Issue, IssueId, IssueSource, Prompt, ReleaseReason, ReleaseReasonCode, Runner,
-    SessionContext, SignatureEnvelope, SignatureProvenance, Tracker, TurnStatus, ValidationResult,
-    ValidationStatus, Workspace, WorkspaceHandle, APPROVAL_CONSUMED_CONTEXT, APPROVAL_CONTEXT,
-    SIGN_ALGORITHM,
+    SessionContext, SignatureEnvelope, SignatureProvenance, SymphonyError, Tracker, TurnStatus,
+    ValidationResult, ValidationStatus, Workspace, WorkspaceHandle, APPROVAL_CONSUMED_CONTEXT,
+    APPROVAL_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_signing::{SigningClient, SigningError, TrustedKeyResolver, VerifyOutcome};
 
@@ -688,6 +688,20 @@ where
             return Ok(DispatchGateOutcome::Proceed);
         }
 
+        // Self-authored provenance: the daemon signed this issue itself when it
+        // created the task through the x0x CRDT tracker. Self-authored is local
+        // by definition, so it bypasses every network-dispatch policy gate
+        // (off/approve/auto). The exception is cryptographic — it requires
+        // *verified* provenance whose signer is this daemon's own agent_id —
+        // and can never be claimed through an unauthenticated source field.
+        if let Some(SignatureProvenance::Verified { signer_agent_id }) = &issue.signature_provenance
+        {
+            let signer = signer_agent_id.trim();
+            if !signer.is_empty() && signer == self.config.agent_id.as_str() {
+                return Ok(DispatchGateOutcome::Proceed);
+            }
+        }
+
         if self.config.network_dispatch == NetworkDispatchPolicy::Off {
             self.block_for_dispatch_refusal(
                 guard,
@@ -741,38 +755,36 @@ where
             }
         };
 
-        // Self-authored provenance: the daemon signed this issue itself when it
-        // created the task through the x0x CRDT tracker. The daemon's own
-        // agent_id is never in its own x0xd contacts, so skip the contacts
-        // lookup — self-authored is local by definition and implicitly trusted.
-        if signer != self.config.agent_id {
-            let trust_level = self.trust_client.trust_level(signer.as_str()).await?;
-            let refusal = if trust_level == TrustLevel::Blocked {
-                Some((
-                    ReleaseReasonCode::BlockedSigner,
-                    format!("network-sourced issue signer {signer} is blocked in x0xd contacts"),
-                ))
-            } else if trust_level == TrustLevel::Unknown {
-                Some((
-                    ReleaseReasonCode::UnknownSigner,
-                    format!("network-sourced issue signer {signer} is unknown to x0xd contacts"),
-                ))
-            } else if trust_level < self.config.required_trust {
-                Some((
-                    ReleaseReasonCode::UntrustedSigner,
-                    format!(
-                        "network-sourced issue signer {signer} has trust {trust_level}; required {}",
-                        self.config.required_trust
-                    ),
-                ))
-            } else {
-                None
-            };
-            if let Some((code, detail)) = refusal {
-                self.block_for_dispatch_refusal(guard, claim, code, detail)
-                    .await?;
-                return Ok(DispatchGateOutcome::Blocked);
-            }
+        // Non-self signers only reach here (the self-authored exception already
+        // returned above), so the trust lookup is unconditional. The daemon's
+        // own agent_id is never in its own x0xd contacts, which is why the
+        // exception must fire before this check.
+        let trust_level = self.trust_client.trust_level(signer.as_str()).await?;
+        let refusal = if trust_level == TrustLevel::Blocked {
+            Some((
+                ReleaseReasonCode::BlockedSigner,
+                format!("network-sourced issue signer {signer} is blocked in x0xd contacts"),
+            ))
+        } else if trust_level == TrustLevel::Unknown {
+            Some((
+                ReleaseReasonCode::UnknownSigner,
+                format!("network-sourced issue signer {signer} is unknown to x0xd contacts"),
+            ))
+        } else if trust_level < self.config.required_trust {
+            Some((
+                ReleaseReasonCode::UntrustedSigner,
+                format!(
+                    "network-sourced issue signer {signer} has trust {trust_level}; required {}",
+                    self.config.required_trust
+                ),
+            ))
+        } else {
+            None
+        };
+        if let Some((code, detail)) = refusal {
+            self.block_for_dispatch_refusal(guard, claim, code, detail)
+                .await?;
+            return Ok(DispatchGateOutcome::Blocked);
         }
 
         match self.config.network_dispatch {
@@ -793,25 +805,24 @@ where
         signer: &AgentId,
     ) -> Result<DispatchGateOutcome> {
         let state = self.tracker.load_approval_state(&issue.id).await?;
-        let now = self
-            .clock
-            .now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        let (signing_client, key_resolver) = if let (Some(signing_client), Some(key_resolver)) =
-            (&self.signing_client, &self.key_resolver)
-        {
-            (signing_client.clone(), key_resolver.clone())
-        } else {
-            // Fail-closed: Approve-policy dispatch requires cryptographic approval
-            // verification. A None verifier means we cannot confirm operator consent
-            // — refuse rather than fall back to the weaker envelope-consistency path.
-            self.block_for_dispatch_refusal(
+        let now = self.now_rfc3339();
+        let Some((signing_client, key_resolver)) =
+            self.require_approval_crypto(guard, claim).await?
+        else {
+            return Ok(DispatchGateOutcome::PendingApproval);
+        };
+
+        let Some(verified_consumed) = self
+            .verified_consumed_records(
                 guard,
                 claim,
-                ReleaseReasonCode::ApprovalVerifierUnconfigured,
-                "approval verifier not configured for Approve-policy dispatch".to_owned(),
+                issue,
+                signing_client.as_ref(),
+                key_resolver.as_ref(),
+                &state.consumed,
             )
-            .await?;
+            .await?
+        else {
             return Ok(DispatchGateOutcome::PendingApproval);
         };
 
@@ -819,7 +830,7 @@ where
         let mut emitted_expired = false;
         for event in &state.events {
             let validity =
-                self.approval_event_validity(event, issue, signer, &now, &state.consumed);
+                self.approval_event_validity(event, issue, signer, &now, &verified_consumed);
             self.emit_approval_expired_once(issue, validity, &mut emitted_expired);
             if validity != ApprovalValidity::Valid {
                 continue;
@@ -854,7 +865,7 @@ where
         }
         let effective_state = ApprovalState {
             events: kept,
-            consumed: state.consumed.clone(),
+            consumed: verified_consumed,
         };
         match approval_decision(
             &effective_state.events,
@@ -865,35 +876,83 @@ where
             &effective_state.consumed,
         ) {
             ApprovalDecision::Approved => {
-                let consumed = self.approval_consumed_event(issue, signer, &now)?;
-                self.tracker.store_consumed(&consumed).await?;
-                Ok(DispatchGateOutcome::Proceed)
-            }
-            ApprovalDecision::Denied => {
-                self.block_for_dispatch_refusal(
+                self.consume_approval_and_proceed(
                     guard,
                     claim,
-                    ReleaseReasonCode::AwaitingApproval,
+                    issue,
+                    signer,
+                    &now,
+                    signing_client.as_ref(),
+                )
+                .await
+            }
+            ApprovalDecision::Denied => {
+                self.park_awaiting_approval(
+                    guard,
+                    claim,
                     format!(
                         "network-sourced dispatch was denied for signer {signer} and current payload"
                     ),
                 )
-                .await?;
-                Ok(DispatchGateOutcome::PendingApproval)
+                .await
             }
             ApprovalDecision::Pending => {
-                self.block_for_dispatch_refusal(
+                self.park_awaiting_approval(
                     guard,
                     claim,
-                    ReleaseReasonCode::AwaitingApproval,
                     format!(
                         "network-sourced dispatch requires a valid approval for signer {signer} and current payload"
                     ),
                 )
-                .await?;
-                Ok(DispatchGateOutcome::PendingApproval)
+                .await
             }
         }
+    }
+
+    /// Current clock time as RFC3339 UTC text with nanosecond precision.
+    fn now_rfc3339(&self) -> String {
+        self.clock
+            .now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    }
+
+    /// Return the configured approval signing client and trusted-key resolver.
+    ///
+    /// Fail-closed: Approve-policy dispatch requires cryptographic approval
+    /// verification. A `None` verifier means operator consent cannot be
+    /// confirmed — the claim is parked (`Ok(None)`) rather than falling back
+    /// to the weaker envelope-consistency path.
+    async fn require_approval_crypto(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+    ) -> Result<Option<(Arc<dyn SigningClient>, Arc<dyn TrustedKeyResolver>)>> {
+        if let (Some(signing_client), Some(key_resolver)) =
+            (&self.signing_client, &self.key_resolver)
+        {
+            Ok(Some((signing_client.clone(), key_resolver.clone())))
+        } else {
+            self.block_for_dispatch_refusal(
+                guard,
+                claim,
+                ReleaseReasonCode::ApprovalVerifierUnconfigured,
+                "approval verifier not configured for Approve-policy dispatch".to_owned(),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+
+    /// Park the claim as blocked/`awaiting_approval` with the given detail.
+    async fn park_awaiting_approval(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        detail: String,
+    ) -> Result<DispatchGateOutcome> {
+        self.block_for_dispatch_refusal(guard, claim, ReleaseReasonCode::AwaitingApproval, detail)
+            .await?;
+        Ok(DispatchGateOutcome::PendingApproval)
     }
 
     fn approval_event_validity(
@@ -957,24 +1016,178 @@ where
         }
     }
 
-    fn approval_consumed_event(
+    /// Mint, sign, and durably store the consumption record for an approved
+    /// dispatch, then let the dispatch proceed.
+    ///
+    /// Fail-closed: the gate never dispatches without a durable signed
+    /// consumption record — an unrecorded dispatch would be replayable the
+    /// next time the approval is evaluated.
+    async fn consume_approval_and_proceed(
         &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        issue: &Issue,
+        signer: &AgentId,
+        now: &str,
+        signing_client: &dyn SigningClient,
+    ) -> Result<DispatchGateOutcome> {
+        let consumed = match self
+            .signed_consumed_event(signing_client, issue, signer, now)
+            .await
+        {
+            Ok(consumed) => consumed,
+            Err(error) => {
+                self.block_for_dispatch_refusal(
+                    guard,
+                    claim,
+                    ReleaseReasonCode::VerifyTransportError,
+                    format!(
+                        "failed to sign approval-consumption record: {error}; refusing dispatch"
+                    ),
+                )
+                .await?;
+                return Ok(DispatchGateOutcome::PendingApproval);
+            }
+        };
+        self.tracker.store_consumed(&consumed).await?;
+        Ok(DispatchGateOutcome::Proceed)
+    }
+
+    /// Verify every stored consumption record before trusting it. Consumption
+    /// state gates replay ("was this approval already spent?"), so a record
+    /// that cannot be cryptographically verified is fail-closed: refuse to
+    /// dispatch rather than guess in either direction — ignoring a genuine
+    /// record would re-dispatch a spent approval, and silently honoring a
+    /// forged one would hide a consent forgery from the operator.
+    ///
+    /// Returns `Ok(None)` when the gate already refused (parked) the claim.
+    async fn verified_consumed_records(
+        &self,
+        guard: &mut HeldClaim<'_, T, R, W>,
+        claim: &Claim,
+        issue: &Issue,
+        signing_client: &dyn SigningClient,
+        key_resolver: &dyn TrustedKeyResolver,
+        consumed_records: &[ApprovalConsumed],
+    ) -> Result<Option<Vec<ApprovalConsumed>>> {
+        let mut verified = Vec::with_capacity(consumed_records.len());
+        for consumed in consumed_records {
+            match self
+                .verify_consumed_signature(signing_client, key_resolver, consumed)
+                .await
+            {
+                CryptoVerify::Valid => verified.push(consumed.clone()),
+                CryptoVerify::Invalid => {
+                    warn!(
+                        issue_id = %issue.id,
+                        nonce = %consumed.nonce,
+                        "approval consumption record failed cryptographic verification; refusing dispatch"
+                    );
+                    self.block_for_dispatch_refusal(
+                        guard,
+                        claim,
+                        ReleaseReasonCode::InvalidSignature,
+                        "approval consumption record failed signature verification; consumption state is unverifiable"
+                            .to_owned(),
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                CryptoVerify::TransportError => {
+                    self.block_for_dispatch_refusal(
+                        guard,
+                        claim,
+                        ReleaseReasonCode::VerifyTransportError,
+                        "approval consumption signature verification transport failed".to_owned(),
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(verified))
+    }
+
+    /// Verify one stored approval-consumption record cryptographically.
+    ///
+    /// Mirrors [`Self::verify_approval_signature`]: envelope consistency is
+    /// checked first, then the signer's trusted key is resolved and the
+    /// detached ML-DSA-65 signature verified under
+    /// [`APPROVAL_CONSUMED_CONTEXT`].
+    async fn verify_consumed_signature(
+        &self,
+        signing_client: &dyn SigningClient,
+        key_resolver: &dyn TrustedKeyResolver,
+        consumed: &ApprovalConsumed,
+    ) -> CryptoVerify {
+        if !consumed.signature_envelope_is_consistent() {
+            return CryptoVerify::Invalid;
+        }
+        let public_key = match key_resolver
+            .resolve(consumed.signature.signer_agent_id.as_str())
+            .await
+        {
+            Ok(public_key) => public_key,
+            Err(source) if signing_error_is_transport(&source) => {
+                return CryptoVerify::TransportError;
+            }
+            Err(_source) => return CryptoVerify::Invalid,
+        };
+        let payload = match consumed.signing_payload_bytes() {
+            Ok(payload) => payload,
+            Err(_source) => return CryptoVerify::Invalid,
+        };
+        let signature_bytes = match BASE64.decode(&consumed.signature.signature_b64) {
+            Ok(signature_bytes) => signature_bytes,
+            Err(_source) => return CryptoVerify::Invalid,
+        };
+        match signing_client
+            .verify(
+                APPROVAL_CONSUMED_CONTEXT,
+                &payload,
+                &signature_bytes,
+                &public_key,
+            )
+            .await
+        {
+            Ok(VerifyOutcome::Valid) => CryptoVerify::Valid,
+            Ok(VerifyOutcome::Invalid(_reason)) => CryptoVerify::Invalid,
+            Ok(VerifyOutcome::TransportError(_reason)) => CryptoVerify::TransportError,
+            Err(source) if signing_error_is_transport(&source) => CryptoVerify::TransportError,
+            Err(_source) => CryptoVerify::Invalid,
+        }
+    }
+
+    /// Build and sign the approval-consumption record for this dispatch.
+    ///
+    /// The record is signed through the x0xd signing client (same pattern as
+    /// approval events) so a replicated writer cannot forge or tamper
+    /// consumption state undetected; [`Self::verify_consumed_signature`]
+    /// re-verifies these signatures before any stored record is trusted.
+    async fn signed_consumed_event(
+        &self,
+        signing_client: &dyn SigningClient,
         issue: &Issue,
         signer: &AgentId,
         consumed_at: &str,
     ) -> Result<ApprovalConsumed> {
         let content_hash = content_hash(issue);
+        // A random component keeps nonces unique even when the binding fields
+        // and timestamp repeat exactly; the signature still binds issue id,
+        // content hash, and signer, so uniqueness no longer depends on input
+        // variety.
+        let entropy: u128 = rand::random();
         let nonce_source = format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{entropy:032x}",
             issue.id, content_hash, signer, consumed_at, self.config.agent_id
         );
         let nonce = sha256_hex(nonce_source.as_bytes());
         let placeholder = SignatureEnvelope::new(
             SIGN_ALGORITHM,
             APPROVAL_CONSUMED_CONTEXT,
-            "eDB4LXN5bXBob255LWxvY2FsLWF0dGVzdGF0aW9u",
-            "cGVuZGluZy1sb2NhbC1hdHRlc3RhdGlvbg==",
-            "placeholder",
+            "",
+            "",
+            "unsigned",
             self.config.agent_id.to_string(),
         );
         let mut consumed = ApprovalConsumed::new(
@@ -985,21 +1198,34 @@ where
             consumed_at.to_owned(),
             placeholder,
         );
-        let payload_sha256 = consumed.signing_payload_sha256()?;
-        let attestation = sha256_hex(
-            format!(
-                "{}:{}:{}",
-                self.config.agent_id, consumed.nonce, payload_sha256
-            )
-            .as_bytes(),
-        );
+        let payload = consumed.signing_payload_bytes()?;
+        let response = signing_client
+            .sign(APPROVAL_CONSUMED_CONTEXT, &payload)
+            .await
+            .map_err(|source| {
+                Error::Core(SymphonyError::Tracker(format!(
+                    "approval-consumption signing failed: {source}"
+                )))
+            })?;
+        if response.algorithm != SIGN_ALGORITHM {
+            return Err(Error::Core(SymphonyError::Tracker(format!(
+                "approval-consumption sign response algorithm {} did not match {SIGN_ALGORITHM}",
+                response.algorithm
+            ))));
+        }
+        if response.context != APPROVAL_CONSUMED_CONTEXT {
+            return Err(Error::Core(SymphonyError::Tracker(format!(
+                "approval-consumption sign response context {} did not match {APPROVAL_CONSUMED_CONTEXT}",
+                response.context
+            ))));
+        }
         consumed.signature = SignatureEnvelope::new(
-            SIGN_ALGORITHM,
-            APPROVAL_CONSUMED_CONTEXT,
-            "eDB4LXN5bXBob255LWxvY2FsLWF0dGVzdGF0aW9u",
-            attestation,
-            payload_sha256,
-            self.config.agent_id.to_string(),
+            response.algorithm,
+            response.context,
+            response.public_key_b64,
+            response.signature_b64,
+            sha256_hex(&payload),
+            response.agent_id,
         );
         Ok(consumed)
     }

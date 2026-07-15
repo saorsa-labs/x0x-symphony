@@ -139,6 +139,7 @@ impl TrustedKeyResolver for MockSigningClient {
 struct InMemoryTracker {
     issues: Mutex<Vec<Issue>>,
     approvals: Mutex<BTreeMap<IssueId, ApprovalState>>,
+    requeues: Mutex<Vec<IssueId>>,
 }
 
 impl InMemoryTracker {
@@ -146,7 +147,12 @@ impl InMemoryTracker {
         Self {
             issues: Mutex::new(issues),
             approvals: Mutex::new(BTreeMap::new()),
+            requeues: Mutex::new(Vec::new()),
         }
+    }
+
+    fn requeued(&self) -> TestResult<Vec<IssueId>> {
+        Ok(self.requeues.lock().map_err(tracker_lock_error)?.clone())
     }
 }
 
@@ -190,6 +196,33 @@ impl Tracker for InMemoryTracker {
     }
 
     async fn handoff(&self, _claim: &Claim, _handoff: Handoff) -> x0x_symphony_core::Result<()> {
+        Ok(())
+    }
+
+    async fn requeue_blocked(
+        &self,
+        issue_id: &IssueId,
+        _reason: ReleaseReason,
+    ) -> x0x_symphony_core::Result<()> {
+        // Mirror the CRDT adapter: the blocked claim blob becomes released,
+        // which reconstructs the issue as `todo` without a blocked_reason.
+        let mut issues = self.issues.lock().map_err(tracker_lock_error)?;
+        let issue = issues
+            .iter_mut()
+            .find(|issue| &issue.id == issue_id)
+            .ok_or_else(|| SymphonyError::Tracker(format!("unknown issue {issue_id}")))?;
+        if issue.state.as_str() != "blocked" {
+            return Err(SymphonyError::Tracker(format!(
+                "issue {issue_id} is not blocked"
+            )));
+        }
+        issue.state = IssueState::new("todo")?;
+        issue.extra.remove("blocked_reason");
+        drop(issues);
+        self.requeues
+            .lock()
+            .map_err(tracker_lock_error)?
+            .push(issue_id.clone());
         Ok(())
     }
 
@@ -518,6 +551,234 @@ async fn get_pending_returns_network_sourced_unapproved() -> TestResult {
     Ok(())
 }
 
+/// Issue #6 defect 1: the dispatch gate parks approval-gated issues as
+/// `blocked` with reason `awaiting_approval`, but the pending scan only
+/// accepted `todo`/`in_progress` — the act of awaiting approval removed the issue
+/// from the very list the operator approves from. Blocked/`awaiting_approval`
+/// issues must appear in pending with their payload hash and signer; blocked
+/// issues with any other reason must not.
+#[tokio::test]
+async fn get_pending_includes_blocked_awaiting_approval() -> TestResult {
+    let awaiting = blocked_awaiting_issue(
+        "XSY-PENDING-BLOCKED",
+        "Parked by the gate",
+        "network-signer-a",
+    )?;
+    let mut retry_exhausted = network_issue(
+        "XSY-PENDING-RETRY-EXHAUSTED",
+        "Blocked for another reason",
+        "blocked",
+        "network-signer-b",
+    )?;
+    retry_exhausted.extra.insert(
+        "blocked_reason".to_owned(),
+        json!({ "code": "retry_exhausted", "message": "runner failed" }),
+    );
+    let tracker = Arc::new(InMemoryTracker::new(vec![
+        awaiting.clone(),
+        retry_exhausted,
+    ]));
+    let server = spawn_approval_server(tracker, Some(mock_signing_client())).await?;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("{}/symphony/approvals/pending", server.base_url))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let pending = response.json::<Vec<PendingApproval>>().await?;
+    let [row] = pending.as_slice() else {
+        return Err(test_error("expected exactly one pending approval row").into());
+    };
+    assert_eq!(row.issue_id, awaiting.id.to_string());
+    assert_eq!(row.state, "blocked");
+    assert_eq!(row.content_hash, content_hash(&awaiting).as_str());
+    assert_eq!(row.signer_agent_id, "network-signer-a");
+    Ok(())
+}
+
+/// Issue #6: approving a blocked/`awaiting_approval` issue must return it to
+/// `todo` so the orchestrator can re-claim it and consume the approval — the
+/// approval alone must not leave the issue parked forever.
+#[tokio::test]
+async fn post_approve_requeues_blocked_awaiting_issue() -> TestResult {
+    let issue_id = "XSY-APPROVE-REQUEUE";
+    let tracker = Arc::new(InMemoryTracker::new(vec![blocked_awaiting_issue(
+        issue_id,
+        "Approve and requeue",
+        "network-signer",
+    )?]));
+    let server = spawn_approval_server(tracker.clone(), Some(mock_signing_client())).await?;
+    let client = reqwest::Client::new();
+
+    let response =
+        post_approval(&server, &client, issue_id, &json!({ "verdict": "approve" })).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let stored = tracker
+        .load_approval_state(&IssueId::new(issue_id)?)
+        .await?;
+    assert_eq!(stored.events.len(), 1, "approval event must be durable");
+    assert_eq!(tracker.requeued()?, vec![IssueId::new(issue_id)?]);
+    let issues = tracker.fetch_by_ids(&[IssueId::new(issue_id)?]).await?;
+    let [issue] = issues.as_slice() else {
+        return Err(test_error("issue should remain in tracker").into());
+    };
+    assert_eq!(issue.state.as_str(), "todo");
+    Ok(())
+}
+
+/// Denials must leave the issue parked: only an approval resumes dispatch.
+#[tokio::test]
+async fn post_deny_does_not_requeue_blocked_awaiting_issue() -> TestResult {
+    let issue_id = "XSY-DENY-NO-REQUEUE";
+    let tracker = Arc::new(InMemoryTracker::new(vec![blocked_awaiting_issue(
+        issue_id,
+        "Deny and stay parked",
+        "network-signer",
+    )?]));
+    let server = spawn_approval_server(tracker.clone(), Some(mock_signing_client())).await?;
+    let client = reqwest::Client::new();
+
+    let response = post_approval(&server, &client, issue_id, &json!({ "verdict": "deny" })).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(tracker.requeued()?.is_empty(), "deny must not requeue");
+    let issues = tracker.fetch_by_ids(&[IssueId::new(issue_id)?]).await?;
+    let [issue] = issues.as_slice() else {
+        return Err(test_error("issue should remain in tracker").into());
+    };
+    assert_eq!(issue.state.as_str(), "blocked");
+    Ok(())
+}
+
+/// Approving an issue that is not parked (still todo) must not attempt a
+/// requeue: pre-approvals are stored and consumed by the gate on first claim.
+#[tokio::test]
+async fn post_approve_on_todo_issue_does_not_requeue() -> TestResult {
+    let issue_id = "XSY-APPROVE-TODO-NO-REQUEUE";
+    let tracker = Arc::new(InMemoryTracker::new(vec![network_issue(
+        issue_id,
+        "Pre-approve me",
+        "todo",
+        "network-signer",
+    )?]));
+    let server = spawn_approval_server(tracker.clone(), Some(mock_signing_client())).await?;
+    let client = reqwest::Client::new();
+
+    let response =
+        post_approval(&server, &client, issue_id, &json!({ "verdict": "approve" })).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(tracker.requeued()?.is_empty());
+    Ok(())
+}
+
+/// Crash recovery (issue #6 review fix 3): the daemon stored a signed approval
+/// but crashed before the requeue, leaving the issue approved-but-parked.
+/// The pending scan must keep surfacing it, and approving again must be
+/// idempotent: the duplicate approval is stored and the requeue finally runs.
+#[tokio::test]
+async fn pending_surfaces_approved_but_still_blocked_issue_and_reapprove_recovers() -> TestResult {
+    let issue_id = "XSY-CRASH-RECOVERY";
+    let issue = blocked_awaiting_issue(
+        issue_id,
+        "Crash between store and requeue",
+        "network-signer",
+    )?;
+    let tracker = Arc::new(InMemoryTracker::new(vec![issue.clone()]));
+    // Simulate the crash aftermath: a fresh, signed, unconsumed approval is
+    // durable while the issue is still parked and no requeue happened.
+    let offline_signer = MockSigningClient::new(OPERATOR);
+    let event = ApprovalEvent::approve(
+        IssueId::new(issue_id)?,
+        content_hash(&issue),
+        AgentId::new("network-signer")?,
+        rfc3339_now(),
+        AgentId::new(OPERATOR)?,
+        None,
+    );
+    let stored = sign_approval_event(&offline_signer, event).await?;
+    tracker.store_approval(&stored).await?;
+
+    let server = spawn_approval_server(tracker.clone(), Some(mock_signing_client())).await?;
+    let client = reqwest::Client::new();
+
+    // Surfaced despite decision == Approved, because it is still parked.
+    let response = client
+        .get(format!("{}/symphony/approvals/pending", server.base_url))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let pending = response.json::<Vec<PendingApproval>>().await?;
+    let [row] = pending.as_slice() else {
+        return Err(test_error("approved-but-parked issue must stay visible in pending").into());
+    };
+    assert_eq!(row.issue_id, issue_id);
+    assert_eq!(row.approval_summary.events, 1);
+
+    // Re-approving recovers: duplicate event stored, requeue runs.
+    let approve =
+        post_approval(&server, &client, issue_id, &json!({ "verdict": "approve" })).await?;
+    assert_eq!(approve.status(), StatusCode::OK);
+    assert_eq!(tracker.requeued()?, vec![IssueId::new(issue_id)?]);
+    let issues = tracker.fetch_by_ids(&[IssueId::new(issue_id)?]).await?;
+    let [recovered] = issues.as_slice() else {
+        return Err(test_error("issue should remain in tracker").into());
+    };
+    assert_eq!(recovered.state.as_str(), "todo");
+
+    // Once requeued, it leaves the pending list.
+    let response = client
+        .get(format!("{}/symphony/approvals/pending", server.base_url))
+        .bearer_auth(API_TOKEN)
+        .send()
+        .await?;
+    let pending = response.json::<Vec<PendingApproval>>().await?;
+    assert!(pending.is_empty(), "requeued issue must leave pending");
+    Ok(())
+}
+
+/// Two concurrent approve calls race on the requeue: exactly one converts the
+/// blocked claim, both report success, and the tracker sees a single requeue
+/// (the gate's consumption then guarantees a single dispatch).
+#[tokio::test]
+async fn concurrent_approves_single_requeue() -> TestResult {
+    let issue_id = "XSY-CONCURRENT-APPROVE";
+    let tracker = Arc::new(InMemoryTracker::new(vec![blocked_awaiting_issue(
+        issue_id,
+        "Race the requeue",
+        "network-signer",
+    )?]));
+    let server = spawn_approval_server(tracker.clone(), Some(mock_signing_client())).await?;
+    let client = reqwest::Client::new();
+    let body = json!({ "verdict": "approve" });
+
+    let (first, second) = tokio::join!(
+        post_approval(&server, &client, issue_id, &body),
+        post_approval(&server, &client, issue_id, &body),
+    );
+    assert_eq!(first?.status(), StatusCode::OK);
+    assert_eq!(second?.status(), StatusCode::OK);
+
+    assert_eq!(
+        tracker.requeued()?,
+        vec![IssueId::new(issue_id)?],
+        "exactly one requeue despite two approvals"
+    );
+    let issues = tracker.fetch_by_ids(&[IssueId::new(issue_id)?]).await?;
+    let [issue] = issues.as_slice() else {
+        return Err(test_error("issue should remain in tracker").into());
+    };
+    assert_eq!(issue.state.as_str(), "todo");
+    Ok(())
+}
+
+fn rfc3339_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
 fn signed_material(context: &str, payload: &[u8]) -> SignedMaterial {
     let digest = sha256_hex(payload);
     SignedMaterial {
@@ -634,6 +895,22 @@ fn unsigned_event(
             None,
         ),
     })
+}
+
+/// Network-sourced issue the dispatch gate parked as blocked/`awaiting_approval`,
+/// exactly as reconstructed from a Blocked claim blob after a daemon restart.
+fn blocked_awaiting_issue(id: &str, title: &str, signer: &str) -> TestResult<Issue> {
+    let mut issue = network_issue(id, title, "blocked", signer)?;
+    issue.extra.insert(
+        "blocked_reason".to_owned(),
+        json!({
+            "code": "awaiting_approval",
+            "message": format!(
+                "network-sourced dispatch requires a valid approval for signer {signer} and current payload"
+            ),
+        }),
+    );
+    Ok(issue)
 }
 
 fn network_issue(id: &str, title: &str, state: &str, signer: &str) -> TestResult<Issue> {

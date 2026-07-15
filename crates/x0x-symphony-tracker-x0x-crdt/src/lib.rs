@@ -52,8 +52,8 @@ use thiserror::Error;
 use tracing::{info, warn};
 use x0x_symphony_core::{
     sha256_hex, shard, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff,
-    Issue, IssueDraft, IssueId, IssueState, PollContext, ReleaseReason, ShardRole,
-    SignatureEnvelope, SignatureProvenance, SymphonyError, Tracker, VerificationNotice,
+    Issue, IssueDraft, IssueId, IssueState, PollContext, ReleaseReason, ReleaseReasonCode,
+    ShardRole, SignatureEnvelope, SignatureProvenance, SymphonyError, Tracker, VerificationNotice,
     VerificationNoticeKind, WorkerCard, CLAIM_CONTEXT, HANDOFF_CONTEXT, ISSUE_PROVENANCE_CONTEXT,
     SIGN_ALGORITHM, WORKER_CARD_CONTEXT, WORKER_CARD_SCHEMA_VERSION,
 };
@@ -1315,6 +1315,49 @@ impl Tracker for X0xCrdtTracker {
         .map_err(SymphonyError::from)
     }
 
+    async fn requeue_blocked(
+        &self,
+        issue_id: &IssueId,
+        reason: ReleaseReason,
+    ) -> x0x_symphony_core::Result<()> {
+        let blob = self
+            .claim_blob_for_task(issue_id.as_str())
+            .await
+            .map_err(SymphonyError::from)?
+            .ok_or_else(|| TrackerError::InvalidClaim {
+                reason: format!("issue {issue_id} has no claim blob"),
+            })
+            .map_err(SymphonyError::from)?;
+        if blob.status != ClaimBlobStatus::Blocked {
+            return Err(SymphonyError::from(TrackerError::InvalidClaim {
+                reason: format!(
+                    "issue {issue_id} claim status is {:?}, not Blocked",
+                    blob.status
+                ),
+            }));
+        }
+        // The requeue capability exists solely to resume approval-parked work.
+        // Enforce that invariant here, in the state transition itself: no
+        // caller may un-park security-blocked or retry-exhausted issues.
+        let reason_code = blob.release_reason.as_ref().map(|reason| &reason.code);
+        if reason_code != Some(&ReleaseReasonCode::AwaitingApproval) {
+            return Err(SymphonyError::from(TrackerError::InvalidClaim {
+                reason: format!(
+                    "issue {issue_id} is blocked with reason {:?}, not awaiting_approval; refusing requeue",
+                    reason_code.map(ReleaseReasonCode::as_str)
+                ),
+            }));
+        }
+        // Releasing the blocked claim reconstructs the issue as `todo`, which
+        // returns it to the orchestrator's candidate scan.
+        self.put_claim_blob(
+            issue_id.as_str(),
+            &ClaimBlob::released(blob.claim, reason, now_utc()),
+        )
+        .await
+        .map_err(SymphonyError::from)
+    }
+
     async fn load_approval_state(
         &self,
         issue_id: &IssueId,
@@ -1598,6 +1641,15 @@ mod tests {
             self.state.lock().await.kv.insert(
                 (store_id_for_list("list-a"), key),
                 encode_claim_blob(&blob)?,
+            );
+            Ok(())
+        }
+
+        async fn seed_provenance(&self, task_id: &str, blob: &ProvenanceBlob) -> TestResult {
+            let key = provenance_key(task_id);
+            self.state.lock().await.kv.insert(
+                (store_id_for_list("list-a"), key),
+                encode_provenance_blob(blob)?,
             );
             Ok(())
         }
@@ -2422,6 +2474,140 @@ mod tests {
         assert_eq!(fetched[0].state, IssueState::new("blocked")?);
         assert!(fetched[0].claim.is_none());
         assert!(fetched[0].extra.contains_key("blocked_reason"));
+        Ok(())
+    }
+
+    /// Issue #6: an operator approval must be able to return a
+    /// blocked/`awaiting_approval` issue to `todo` so the orchestrator re-claims
+    /// it — and the released blob persists in the CRDT store, so the requeued
+    /// state survives a daemon restart.
+    #[tokio::test]
+    async fn requeue_blocked_returns_issue_to_todo() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "requeue", "claimed:agent-a", 3)]).await;
+        let claim = claim_for(ISSUE_A, AGENT_A)?;
+        api.seed_claim(ISSUE_A, claim.clone()).await?;
+        let tracker = tracker(api.clone())?;
+        tracker
+            .block(
+                &claim,
+                ReleaseReason::new(ReleaseReasonCode::AwaitingApproval, "needs approval"),
+            )
+            .await?;
+
+        tracker
+            .requeue_blocked(
+                &IssueId::new(ISSUE_A)?,
+                ReleaseReason::new(ReleaseReasonCode::Other, "approval granted"),
+            )
+            .await?;
+
+        let blob = api.claim_blob(ISSUE_A).await?;
+        assert_eq!(blob.status, ClaimBlobStatus::Released);
+        let fetched = tracker.fetch_by_ids(&[IssueId::new(ISSUE_A)?]).await?;
+        assert_eq!(fetched[0].state, IssueState::new("todo")?);
+        assert!(fetched[0].claim.is_none());
+        assert!(!fetched[0].extra.contains_key("blocked_reason"));
+        Ok(())
+    }
+
+    /// The requeue capability exists solely to resume approval-parked work.
+    /// The invariant lives in the state transition itself: no caller — not
+    /// even a buggy HTTP handler — may un-park security-blocked or
+    /// retry-exhausted issues through it.
+    #[tokio::test]
+    async fn requeue_blocked_refuses_non_awaiting_approval_reason() -> TestResult {
+        for code in [
+            ReleaseReasonCode::RetryExhausted,
+            ReleaseReasonCode::InvalidSignature,
+            ReleaseReasonCode::BlockedSigner,
+        ] {
+            let api =
+                MockApi::with_tasks(vec![task(ISSUE_A, "requeue", "claimed:agent-a", 3)]).await;
+            let claim = claim_for(ISSUE_A, AGENT_A)?;
+            api.seed_claim(ISSUE_A, claim.clone()).await?;
+            let tracker = tracker(api.clone())?;
+            tracker
+                .block(
+                    &claim,
+                    ReleaseReason::new(code.clone(), "not an approval park"),
+                )
+                .await?;
+
+            let result = tracker
+                .requeue_blocked(
+                    &IssueId::new(ISSUE_A)?,
+                    ReleaseReason::new(ReleaseReasonCode::Other, "approval granted"),
+                )
+                .await;
+
+            assert!(
+                result.is_err(),
+                "blocked reason {:?} must not be requeueable",
+                code.as_str()
+            );
+            let blob = api.claim_blob(ISSUE_A).await?;
+            assert_eq!(blob.status, ClaimBlobStatus::Blocked);
+        }
+        Ok(())
+    }
+
+    /// The self-signer dispatch exemption keys off `SignatureProvenance::Verified`
+    /// produced by THIS verification path. An attacker-signed provenance blob
+    /// that merely claims the victim's `signer_agent_id` must come out
+    /// non-Verified: the envelope public key is bound to the trusted key
+    /// resolved for the claimed signer before any signature check runs.
+    #[tokio::test]
+    async fn forged_provenance_claiming_self_signer_is_not_verified() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "forged", "empty", 3)]).await;
+        let payload = issue_provenance_payload(ISSUE_A, "forged", "");
+        // Envelope claims AGENT_A (this daemon) as signer, but carries the
+        // attacker's key/signature. The mock verifier would report Valid, so
+        // only the trusted-key binding can reject this.
+        let envelope = SignatureEnvelope::new(
+            SIGN_ALGORITHM,
+            ISSUE_PROVENANCE_CONTEXT,
+            BASE64.encode(b"attacker-key"),
+            BASE64.encode(b"attacker-signature"),
+            sha256_hex(&payload),
+            AGENT_A,
+        );
+        api.seed_provenance(ISSUE_A, &ProvenanceBlob::new(envelope))
+            .await?;
+        let provider = MockWorkerView::new(vec![worker_snapshot(
+            &["agent-a", "agent-b", "agent-c"],
+            1,
+        )?]);
+        let tracker = required_tracker_with_workers(api, valid_signing(), provider)?;
+
+        let issues = tracker.list_issues().await?;
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].signature_provenance.is_none(),
+            "forged provenance claiming the self signer must not verify; got {:?}",
+            issues[0].signature_provenance
+        );
+        Ok(())
+    }
+
+    /// The requeue capability is scoped to blocked issues only: an active claim
+    /// must never be silently released by the approval path.
+    #[tokio::test]
+    async fn requeue_blocked_refuses_non_blocked_issue() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "requeue", "claimed:agent-a", 3)]).await;
+        let claim = claim_for(ISSUE_A, AGENT_A)?;
+        api.seed_claim(ISSUE_A, claim.clone()).await?;
+        let tracker = tracker(api.clone())?;
+
+        let result = tracker
+            .requeue_blocked(
+                &IssueId::new(ISSUE_A)?,
+                ReleaseReason::new(ReleaseReasonCode::Other, "approval granted"),
+            )
+            .await;
+
+        assert!(result.is_err(), "active claim must not be requeued");
+        let blob = api.claim_blob(ISSUE_A).await?;
+        assert_eq!(blob.status, ClaimBlobStatus::Active);
         Ok(())
     }
 

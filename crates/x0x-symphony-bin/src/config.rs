@@ -267,7 +267,7 @@ impl WorkflowConfig {
     /// Returns [`Error::Invalid`] when required keys are missing or invalid.
     pub fn from_raw(raw: Value, prompt_template: String) -> Result<Self> {
         let mut problems = Vec::new();
-        let warnings = Vec::new();
+        let mut warnings = Vec::new();
         let Some(root) = raw.as_object() else {
             return Err(Error::Invalid {
                 problems: vec!["workflow frontmatter must be a mapping".to_owned()],
@@ -285,6 +285,15 @@ impl WorkflowConfig {
         let security = parse_security(root, &mut problems);
         let retention = parse_retention(root, &mut problems);
         let signing = parse_signing(root, &mut problems);
+        if let (Some(security), Some(signing)) = (&security, &signing) {
+            validate_dispatch_signing_pairing(
+                security,
+                signing,
+                root.contains_key("security"),
+                &mut problems,
+                &mut warnings,
+            );
+        }
         let sharding = parse_sharding(root, &mut problems);
         let workers = parse_workers(root, &mut problems);
         let runner = parse_runner(root, &raw, &mut problems);
@@ -552,6 +561,44 @@ fn parse_security(root: &Map<String, Value>, problems: &mut Vec<String>) -> Opti
         approval_ttl,
         approval_webhook_url,
     })
+}
+
+/// Cross-validate `security.network_dispatch` against `signing.policy`.
+///
+/// Locally created issues only carry verified self-signed provenance when the
+/// tracker signs them (`signing.policy: required`). Without it, every local
+/// issue is reconstructed with no provenance and refused by the dispatch gate:
+///
+/// - under `approve` nothing can ever carry provenance or be approved, so the
+///   configuration is an unrecoverable trap — hard failure;
+/// - under `off` local issues can never dispatch either — loud warning, but
+///   only when a `security:` block was written (mirror/read-only deployments
+///   that never configure security keep a quiet default).
+fn validate_dispatch_signing_pairing(
+    security: &SecurityConfig,
+    signing: &SigningConfig,
+    explicit_security: bool,
+    problems: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if signing.policy == SigningPolicy::Required {
+        return;
+    }
+    match security.network_dispatch {
+        NetworkDispatchPolicy::Approve => problems.push(
+            "security.network_dispatch=approve requires signing.policy=required: without tracker \
+             signing no issue can carry verified provenance, so nothing could ever be approved or \
+             dispatched"
+                .to_owned(),
+        ),
+        NetworkDispatchPolicy::Off if explicit_security => warnings.push(
+            "security.network_dispatch=off with signing.policy!=required: locally created issues \
+             carry no verified self-signed provenance and will be refused by the dispatch gate; \
+             set signing.policy=required to dispatch local issues"
+                .to_owned(),
+        ),
+        NetworkDispatchPolicy::Off | NetworkDispatchPolicy::Auto => {}
+    }
 }
 
 fn parse_network_dispatch_policy(

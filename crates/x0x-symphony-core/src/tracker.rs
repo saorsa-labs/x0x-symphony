@@ -279,6 +279,20 @@ pub trait Tracker: Send + Sync {
         ))
     }
 
+    /// Return a `blocked` issue to `todo` so the orchestrator can re-claim it.
+    ///
+    /// Used when a stored operator approval unblocks an issue the dispatch
+    /// gate parked with `awaiting_approval`; the re-claimed issue re-enters
+    /// the gate, which then finds the valid approval and consumes it.
+    ///
+    /// Adapters that predate this method return [`crate::SymphonyError::Tracker`];
+    /// callers treat the unsupported case as a hard failure.
+    async fn requeue_blocked(&self, _issue_id: &IssueId, _reason: ReleaseReason) -> Result<()> {
+        Err(crate::SymphonyError::Tracker(
+            "tracker does not support requeueing blocked issues".into(),
+        ))
+    }
+
     /// Load stored approval, denial, and consumption events for `issue_id`.
     async fn load_approval_state(&self, _issue_id: &IssueId) -> Result<ApprovalState> {
         Err(crate::SymphonyError::Tracker(

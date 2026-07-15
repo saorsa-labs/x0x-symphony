@@ -59,7 +59,10 @@ Current `main` is a post-M3/M4+ daemon backed by x0xd:
   `security.network_dispatch: approve`, a network-sourced task must first pass
   ML-DSA-65 signature verification and x0xd trust, then wait for a signed,
   payload-bound approval before execution. `auto` skips per-task approval only
-  when `network_dispatch_auto_ack: true` is set deliberately.
+  when `network_dispatch_auto_ack: true` is set deliberately. Locally created
+  issues whose verified provenance is signed by this daemon's own agent id are
+  local by definition and bypass the consent gate under every policy; the
+  exception is cryptographic and cannot be claimed via a source field.
 - **Distributed worker discovery is best-effort observability.** The daemon
   publishes and consumes signed worker cards when worker discovery is configured;
   `/symphony/workers` returns the live verified view, or an empty view when a
@@ -145,6 +148,12 @@ security:
   approval_ttl: "24h"
   required_trust: trusted
 
+# Required for `issue new`: the tracker signs local issues at creation so the
+# dispatch gate can recognise them as self-authored. `approve` refuses to load
+# without it.
+signing:
+  policy: required
+
 runner:
   kind: shell
   command: /bin/sh
@@ -216,12 +225,17 @@ Create a local symphony-owned issue through the daemon-backed tracker:
 # created XSY-0100
 ```
 
-> **Dispatch status:** The daemon now auto-creates the `TaskList` and
-> sidecar `KvStore` on startup, so `issue new` works against a clean x0xd.
-> However, full dispatch (claim → run → handoff) depends on the dispatch
-> gate / issue-provenance signing regression being resolved. Until that
-> lands, the daemon will create the issue but may not dispatch it to a
-> runner.
+> **Dispatch status:** The daemon auto-creates the `TaskList` and sidecar
+> `KvStore` on startup, so `issue new` works against a clean x0xd. With
+> `signing.policy: required` the tracker signs the issue at creation and the
+> dispatch gate recognises the verified self-signature (signer == this
+> daemon's agent id) as local work: the full claim → run → handoff cycle runs
+> under every `security.network_dispatch` policy (`off`, `approve`, `auto`)
+> without entering the network consent gate. Without required signing,
+> locally created issues carry no provenance and are refused fail-closed;
+> `network_dispatch: approve` therefore refuses to load unless
+> `signing.policy: required` is set, and an explicit `off` without it warns
+> at startup.
 
 Watch the daemon claim and hand off the task:
 
@@ -579,6 +593,14 @@ ML-DSA-65 signature and trust gate wait for per-task consent before dispatch
 (see [ADR-0005](../adr/0005-consent-gated-dispatch.md)). The approval or denial
 is itself signed and bound to the issue id, current content hash, and network
 signer; changing the payload or signer voids the decision.
+
+Tasks the gate has already parked show as `blocked` with reason
+`awaiting_approval` and stay visible in `approvals list` (and
+`GET /symphony/approvals/pending`) with their current payload hash and signer.
+Approving one returns it to `todo`; the orchestrator re-claims it and the gate
+verifies and consumes the stored approval, so the task dispatches exactly once.
+Locally created, self-signed issues never appear here — the self-signer
+exception dispatches them without per-task consent.
 
 ```bash
 x0x-symphony approvals list

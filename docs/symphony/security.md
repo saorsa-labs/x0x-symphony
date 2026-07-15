@@ -100,6 +100,69 @@ surfaced, and a valid signed approval must be verified before execution. In
 `auto` mode, signer+trust dispatch is allowed only when
 `network_dispatch_auto_ack: true` is deliberately set.
 
+**Self-authored work is exempt cryptographically.** An issue whose verified
+ML-DSA-65 provenance is signed by this daemon's own agent id is local by
+definition and bypasses the network-dispatch consent gate under every policy.
+The exemption is derived only from the verified signature — never from the
+issue's `issue_source`/`source` metadata, which an adapter or peer could set —
+so it cannot be forged by claiming a `local` marker. Because the exemption
+requires provenance, `security.network_dispatch: approve` fails config
+validation unless `signing.policy: required`, and an explicit `off` without
+required signing warns at startup (locally created issues would otherwise be
+refused fail-closed).
+
+**Approval consumption is signed and verified — and refuses on doubt.** When
+the gate dispatches an approved task it mints an `ApprovalConsumed` record
+signed through x0xd (ML-DSA-65, `x0x-symphony-approval-consumed-v1` context),
+and it cryptographically re-verifies every stored consumption record before
+trusting it on later evaluations. A consumption record that fails verification
+means the replay-protection state is tampered or forged: the gate refuses to
+dispatch (`invalid_signature` block) rather than guessing in either direction.
+Consumption records may only un-park work in one narrow way: the tracker-level
+`requeue_blocked` transition refuses any blocked issue whose reason is not
+`awaiting_approval`, so no Tracker-API path can resurrect security-blocked or
+retry-exhausted work. That invariant holds within the Tracker API; a hostile
+writer inside the replicated tracker group could still mutate raw claim blobs
+directly — replicated-writer integrity is tracked in
+[#10](https://github.com/saorsa-labs/x0x-symphony/issues/10).
+
+**Dispatch/consumption guarantees in v0.1 (read carefully).** The
+approval/consumption store is a per-issue KV blob updated by
+read-modify-write, and claim-blob state transitions are not yet
+integrity-signed; the structural fix is tracked in
+[#10](https://github.com/saorsa-labs/x0x-symphony/issues/10). The actual
+semantics are:
+
+- **Single node, no crash:** exactly-once — dispatch is serialized by the
+  exclusive claim, and each dispatch stores its signed consumption record
+  before the runner starts.
+- **Single node, crash windows:** a crash after the consumption record is
+  stored but before the runner completes yields **zero** executions with the
+  approval already spent. Operator recovery: approve the payload again (a
+  fresh approval mints a fresh consumption) or re-issue the task under a new
+  id.
+- **Concurrent multi-node writers:** the RMW blob update is not a convergent
+  set — two nodes that evaluate the same valid approval concurrently (or
+  reunite after a partition) can each dispatch once, and a racing write can
+  drop an approval or consumption record entirely. Multi-node approval is
+  therefore **best-effort**: runners MUST be idempotent.
+- **Hostile replicated writers:** unsigned claim-blob transitions (status,
+  `release_reason`) mean a hostile writer inside the replicated tracker group
+  can mutate issue state directly, bypassing Tracker-API invariants. Pilot
+  mitigation: run the symphony TaskList/KvStore only within a trusted,
+  closed tracker group (`required_trust`, vetted membership).
+
+**Recovery: dispatch refused with `invalid_signature` consumption state.** A
+garbage or tampered consumption record parks the issue as `blocked` with
+reason code `invalid_signature` and detail "approval consumption record
+failed signature verification". To repair: inspect the approval blob in the
+symphony sidecar store — store `symphony-<list-id>`, key
+`approval-<task-id>` (x0xd `GET /stores/symphony-<list-id>/keys/approval-<task-id>`);
+its `consumed` array holds the offending record(s). Either rewrite that key
+with the corrupted entries removed (keeping only records this daemon signed),
+or — simpler and safer — re-create the issue with `issue new` (a new task id
+starts with empty approval state) and mark the corrupted one done/cancelled.
+
 ---
 
 ## Sandbox profiles (M2/M4)
