@@ -645,7 +645,7 @@ impl V2StoreManager {
         Ok(hash)
     }
 
-    /// Sign an [`ApprovalPayloadV2`]-shaped payload under
+    /// Sign an [`super::events::ApprovalPayloadV2`]-shaped payload under
     /// [`APPROVAL_CONTEXT_V2`] and return the envelope, WITHOUT storing it —
     /// used to build the embedded C6 requeue justification (WP-B2).
     ///

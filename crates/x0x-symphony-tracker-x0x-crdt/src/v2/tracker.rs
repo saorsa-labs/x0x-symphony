@@ -431,7 +431,10 @@ fn project_handoff(issue_id: &IssueId, ev: &HandoffEventV2) -> Handoff {
         match validation_from_v2(v) {
             Ok(result) => handoff = handoff.with_validation(result),
             Err(e) => {
-                warn!(error = %e, "v2 handoff validation entry did not project; dropped from display")
+                warn!(
+                    error = %e,
+                    "v2 handoff validation entry did not project; dropped from display"
+                );
             }
         }
     }
