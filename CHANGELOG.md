@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.1.2] — 2026-07-15
+
+Patch release: makes locally-created issues actually dispatch, plus operator
+UX fixes. Found and fixed during the 2026-07-14 x0x SKILL.md testnet sweep.
+
+### Fixed
+
+- **Locally-created issues now dispatch instead of blocking forever.** Under
+  `signing.policy: required`, every issue read back from the CRDT is stamped
+  `network_sourced` (fail-closed), and the dispatch gate refused any such issue
+  without verified ML-DSA-65 provenance — but `create_issue` never signed local
+  issues, so `x0x-symphony issue new …` produced a task that went straight to
+  `[blocked]` and never released. The tracker now signs a deterministic
+  `{issue_id, title, description}` payload via x0xd `/agent/sign` and persists a
+  provenance blob in the companion store; the read path verifies it and attaches
+  `SignatureProvenance::Verified`. The gate additionally treats `signer == self`
+  as implicitly trusted (a daemon is never in its own x0xd contacts). Unsigned or
+  untrusted non-self signers are still refused. Verified end-to-end against a
+  clean x0xd v0.31.3: `issue new` → `in_progress` → `review` in ~8 s.
+
+- **Daemon auto-creates its tracker surfaces on startup.** A fresh `x0x-symphonyd`
+  against a clean x0xd died with `orphan workspace sweep failed … task list not
+  found`, and `issue new` returned 500 `store not found` while leaving a bare
+  zombie task. Startup now ensures both the `TaskList` and the companion
+  `symphony-<list_id>` `KvStore` exist (idempotent, group-scope aware), and a
+  failed sidecar write during issue creation marks the task terminal instead of
+  leaving a zombie.
+
+- **Rate-limited malformed worker-gossip log spam.** On a shared gossip plane,
+  foreign/older agents' worker cards produced a steady stream of WARN decode
+  failures. Repeats within a 5-minute window per discriminator now drop to DEBUG;
+  genuinely unexpected failures still WARN on first hit.
+
+### Changed
+
+- `docs/symphony/operator.md`: documented the `X0X_API_TOKEN` bearer env, the
+  startup surface-creation step, and the dispatch/provenance interaction.
+
 ## [v0.1.1] — 2026-07-07
 
 Patch release: security fix and the first release with post-quantum archive
