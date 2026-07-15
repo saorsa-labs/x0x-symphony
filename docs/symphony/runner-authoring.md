@@ -87,6 +87,31 @@ named, validated mapping from a `PresetName` to a fully-formed `RunnerSpec`
 
 `Codex`, `ClaudeCode`, `Kimi`, `Glm`, `Minimax`, `Pi`.
 
+### Built-in preset contracts (pinned harness versions)
+
+Each verified preset is pinned to the harness version it was last tested
+against (issue #7 — the v0.1.2 `pi`/`claude_code` argvs failed the installed
+CLIs' argument parsers):
+
+| Preset | Resolved argv | Tested harness version |
+|--------|---------------|------------------------|
+| `claude_code` | `claude --print --output-format stream-json --verbose` | Claude Code 2.1.208 (`--verbose` is mandatory with `--print --output-format stream-json`) |
+| `pi` | `pi --print` | pi 0.80.3 (non-interactive; reads the prompt from stdin. `--stdin` is rejected) |
+| `codex` | `codex exec` | codex-cli 0.144.1 (non-interactive; reads the prompt from stdin. The old `codex app-server` argv speaks JSON-RPC and cannot consume a rendered prompt) |
+| `kimi`, `glm`, `minimax` | `<cmd> --stdin` | **unverified** config-only placeholders — pin their contract before relying on them |
+
+If your installed harness version diverges from the pinned one, do not patch
+the preset ad hoc: override the command/args in `WORKFLOW.md` instead. Both a
+full replacement (`runner.command` + `runner.args`) and a per-preset override
+block (`runner.claude_code.args`, `runner.pi.args`, `runner.codex.args`, …)
+are supported, and stay static argv — the rendered prompt still arrives on
+stdin, never via shell interpolation.
+
+Verify the pinned contracts against the harnesses installed on your machine
+with `just preset-smoke` (gated behind `X0X_SYMPHONY_PRESET_SMOKE=1`; skips
+harnesses that are not on `PATH`, and only fails on argv/usage rejections,
+not on auth or other runtime errors).
+
 To add one:
 
 1. Add the variant to `PresetName` (`preset/mod.rs`), including its

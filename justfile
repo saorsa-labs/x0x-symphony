@@ -32,6 +32,12 @@ test:
 test-verbose:
     RUSTFLAGS="-D warnings" cargo nextest run --workspace --all-features --no-capture
 
+# Live preset contract smoke: spawns installed harnesses (claude, pi, codex)
+# with the built-in preset argv and asserts no argv/usage rejection. Skips any
+# harness not on PATH. Dev-machine recipe; may spend harness tokens.
+preset-smoke:
+    X0X_SYMPHONY_PRESET_SMOKE=1 cargo nextest run -p x0x-symphony-runner-shell --test preset_live_smoke --no-capture
+
 # Build every workspace member with warnings denied.
 build:
     RUSTFLAGS="-D warnings" cargo build --workspace --all-features

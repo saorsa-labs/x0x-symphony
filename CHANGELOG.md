@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Built-in `pi`, `claude_code`, and `codex` presets now match the real CLI
+  contracts** (#7). Verified live against the pinned harness versions
+  Claude Code 2.1.208, pi 0.80.3, and codex-cli 0.144.1:
+  - `pi`: `--stdin` → `--print` (pi 0.80.3 rejects `--stdin`; `--print` runs
+    non-interactively and reads the prompt from stdin).
+  - `claude_code`: added mandatory `--verbose` (Claude Code refuses
+    `--print --output-format stream-json` without it).
+  - `codex`: `app-server` → `exec` (`app-server` speaks JSON-RPC and cannot
+    consume the rendered stdin prompt; `exec` reads it directly).
+  Other harness versions remain supported via the `runner.command`/`runner.args`
+  and per-preset `runner.<preset>.args` overrides in `WORKFLOW.md`.
+
+### Added
+
+- Live preset contract smoke tests
+  (`crates/x0x-symphony-runner-shell/tests/preset_live_smoke.rs`) and a
+  `just preset-smoke` recipe: spawn each installed harness with the preset
+  argv, feed a trivial stdin prompt, and fail only on argv/usage rejection.
+  Gated behind `X0X_SYMPHONY_PRESET_SMOKE=1`; skipped when a harness binary is
+  absent. Pinned preset/harness versions documented in
+  `docs/symphony/runner-authoring.md`.
+
 ## [v0.1.2] — 2026-07-15
 
 Patch release: makes locally-created issues actually dispatch, plus operator

@@ -155,7 +155,7 @@ Adapters:
 | Runner        | Mechanism                                              | Notes                            |
 |---------------|--------------------------------------------------------|----------------------------------|
 | `shell`       | Spawns a child process with prompt on stdin            | Universal fallback. Default.     |
-| `codex`       | Wraps `codex app-server` per Symphony spec             | Optional preset over `shell`.    |
+| `codex`       | Wraps `codex exec` (non-interactive, prompt on stdin)  | Optional preset over `shell`.    |
 | `claude_code` | Wraps `claude` CLI with non-interactive flags          | Preset over `shell`.             |
 | `kimi`/`glm`/`minimax`/`pi` | Configured presets over `shell`          | No bespoke crates.               |
 

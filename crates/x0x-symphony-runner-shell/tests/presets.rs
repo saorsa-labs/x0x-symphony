@@ -7,7 +7,8 @@ fn codex_preset_resolves_expected_command_args_env() -> Result<(), Box<dyn std::
     let spec = preset::resolve(PresetName::Codex)?;
 
     assert_eq!(spec.command, "codex");
-    assert_eq!(spec.args, ["app-server"]);
+    // Pinned against codex-cli 0.144.1: `codex exec` reads the prompt from stdin.
+    assert_eq!(spec.args, ["exec"]);
     assert_eq!(spec.env.get("NO_COLOR").map(String::as_str), Some("1"));
     assert_eq!(spec.env.get("TERM").map(String::as_str), Some("dumb"));
     assert_eq!(spec.preset, None);
@@ -21,7 +22,11 @@ fn claude_code_preset_resolves_expected_command_args_env() -> Result<(), Box<dyn
     let spec = preset::resolve(PresetName::ClaudeCode)?;
 
     assert_eq!(spec.command, "claude");
-    assert_eq!(spec.args, ["--print", "--output-format", "stream-json"]);
+    // Pinned against Claude Code 2.1.208: stream-json under --print requires --verbose.
+    assert_eq!(
+        spec.args,
+        ["--print", "--output-format", "stream-json", "--verbose"]
+    );
     assert_eq!(spec.env.get("NO_COLOR").map(String::as_str), Some("1"));
     assert_eq!(spec.env.get("TERM").map(String::as_str), Some("dumb"));
 
@@ -84,7 +89,9 @@ fn minimax_preset_yaml_resolves_to_runnable_spec() -> Result<(), Box<dyn std::er
 fn pi_preset_yaml_resolves_to_runnable_spec() -> Result<(), Box<dyn std::error::Error>> {
     let spec = config_only_spec("pi")?;
     assert_eq!(spec.command, "pi");
-    assert_eq!(spec.args, ["--stdin"]);
+    // Pinned against pi 0.80.3: `--print` reads the prompt from stdin; `--stdin`
+    // is rejected ("Unknown option: --stdin").
+    assert_eq!(spec.args, ["--print"]);
     assert_eq!(spec.preset, Some(PresetName::Pi));
     Ok(())
 }
@@ -132,7 +139,9 @@ runner:
 "#,
     )?;
 
-    assert_eq!(spec.args, ["--sandbox", "workspace-write", "app-server"]);
+    // Verified against codex-cli 0.144.1: global `--sandbox` is accepted before
+    // the `exec` subcommand.
+    assert_eq!(spec.args, ["--sandbox", "workspace-write", "exec"]);
 
     Ok(())
 }
