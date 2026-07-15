@@ -100,6 +100,17 @@ surfaced, and a valid signed approval must be verified before execution. In
 `auto` mode, signer+trust dispatch is allowed only when
 `network_dispatch_auto_ack: true` is deliberately set.
 
+**Self-authored work is exempt cryptographically.** An issue whose verified
+ML-DSA-65 provenance is signed by this daemon's own agent id is local by
+definition and bypasses the network-dispatch consent gate under every policy.
+The exemption is derived only from the verified signature — never from the
+issue's `issue_source`/`source` metadata, which an adapter or peer could set —
+so it cannot be forged by claiming a `local` marker. Because the exemption
+requires provenance, `security.network_dispatch: approve` fails config
+validation unless `signing.policy: required`, and an explicit `off` without
+required signing warns at startup (locally created issues would otherwise be
+refused fail-closed).
+
 ---
 
 ## Sandbox profiles (M2/M4)

@@ -2456,6 +2456,61 @@ mod tests {
         Ok(())
     }
 
+    /// Issue #6: an operator approval must be able to return a
+    /// blocked/awaiting_approval issue to `todo` so the orchestrator re-claims
+    /// it — and the released blob persists in the CRDT store, so the requeued
+    /// state survives a daemon restart.
+    #[tokio::test]
+    async fn requeue_blocked_returns_issue_to_todo() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "requeue", "claimed:agent-a", 3)]).await;
+        let claim = claim_for(ISSUE_A, AGENT_A)?;
+        api.seed_claim(ISSUE_A, claim.clone()).await?;
+        let tracker = tracker(api.clone())?;
+        tracker
+            .block(
+                &claim,
+                ReleaseReason::new(ReleaseReasonCode::AwaitingApproval, "needs approval"),
+            )
+            .await?;
+
+        tracker
+            .requeue_blocked(
+                &IssueId::new(ISSUE_A)?,
+                ReleaseReason::new(ReleaseReasonCode::Other, "approval granted"),
+            )
+            .await?;
+
+        let blob = api.claim_blob(ISSUE_A).await?;
+        assert_eq!(blob.status, ClaimBlobStatus::Released);
+        let fetched = tracker.fetch_by_ids(&[IssueId::new(ISSUE_A)?]).await?;
+        assert_eq!(fetched[0].state, IssueState::new("todo")?);
+        assert!(fetched[0].claim.is_none());
+        assert!(!fetched[0].extra.contains_key("blocked_reason"));
+        Ok(())
+    }
+
+    /// The requeue capability is scoped to blocked issues only: an active claim
+    /// must never be silently released by the approval path.
+    #[tokio::test]
+    async fn requeue_blocked_refuses_non_blocked_issue() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "requeue", "claimed:agent-a", 3)]).await;
+        let claim = claim_for(ISSUE_A, AGENT_A)?;
+        api.seed_claim(ISSUE_A, claim.clone()).await?;
+        let tracker = tracker(api.clone())?;
+
+        let result = tracker
+            .requeue_blocked(
+                &IssueId::new(ISSUE_A)?,
+                ReleaseReason::new(ReleaseReasonCode::Other, "approval granted"),
+            )
+            .await;
+
+        assert!(result.is_err(), "active claim must not be requeued");
+        let blob = api.claim_blob(ISSUE_A).await?;
+        assert_eq!(blob.status, ClaimBlobStatus::Active);
+        Ok(())
+    }
+
     #[derive(Clone)]
     struct MockSigning {
         verify_outcome: VerifyOutcome,

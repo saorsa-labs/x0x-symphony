@@ -286,7 +286,13 @@ impl WorkflowConfig {
         let retention = parse_retention(root, &mut problems);
         let signing = parse_signing(root, &mut problems);
         if let (Some(security), Some(signing)) = (&security, &signing) {
-            validate_dispatch_signing_pairing(security, signing, &mut problems, &mut warnings);
+            validate_dispatch_signing_pairing(
+                security,
+                signing,
+                root.contains_key("security"),
+                &mut problems,
+                &mut warnings,
+            );
         }
         let sharding = parse_sharding(root, &mut problems);
         let workers = parse_workers(root, &mut problems);
@@ -565,11 +571,13 @@ fn parse_security(root: &Map<String, Value>, problems: &mut Vec<String>) -> Opti
 ///
 /// - under `approve` nothing can ever carry provenance or be approved, so the
 ///   configuration is an unrecoverable trap — hard failure;
-/// - under `off` local issues can never dispatch either — loud warning, since
-///   `off` is the default and mirror/read-only deployments are legitimate.
+/// - under `off` local issues can never dispatch either — loud warning, but
+///   only when a `security:` block was written (mirror/read-only deployments
+///   that never configure security keep a quiet default).
 fn validate_dispatch_signing_pairing(
     security: &SecurityConfig,
     signing: &SigningConfig,
+    explicit_security: bool,
     problems: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
@@ -583,13 +591,13 @@ fn validate_dispatch_signing_pairing(
              dispatched"
                 .to_owned(),
         ),
-        NetworkDispatchPolicy::Off => warnings.push(
+        NetworkDispatchPolicy::Off if explicit_security => warnings.push(
             "security.network_dispatch=off with signing.policy!=required: locally created issues \
              carry no verified self-signed provenance and will be refused by the dispatch gate; \
              set signing.policy=required to dispatch local issues"
                 .to_owned(),
         ),
-        NetworkDispatchPolicy::Auto => {}
+        NetworkDispatchPolicy::Off | NetworkDispatchPolicy::Auto => {}
     }
 }
 

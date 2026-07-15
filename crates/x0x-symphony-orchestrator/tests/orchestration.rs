@@ -4196,3 +4196,105 @@ async fn non_self_unknown_signer_still_refused() -> Result<(), Box<dyn Error>> {
     )?;
     Ok(())
 }
+
+/// Issue #6 defect 2: `network_dispatch: off` blocked locally created
+/// (self-signed) issues with `network_dispatch_disabled`. Self-authored
+/// provenance is local by definition, so the self-signer exception must fire
+/// BEFORE the off policy gate: `issue new` under `off` dispatches.
+#[tokio::test]
+async fn self_signed_provenance_dispatches_under_off_policy() -> Result<(), Box<dyn Error>> {
+    // Signer is "agent-a" — same as the orchestrator's own agent_id.
+    let issue = network_issue("XSY-GATE-SELF-OFF", &["feature"], "agent-a")?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Off,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::default());
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Completed));
+    assert!(spy.counts().0 > 0, "runner should have executed");
+    assert!(
+        trust.calls().is_empty(),
+        "trust lookup must be skipped for self-authored provenance"
+    );
+    assert!(guard(&tracker.releases).is_empty(), "issue must not be blocked");
+    Ok(())
+}
+
+/// Issue #6 defect 1 (self side): `network_dispatch: approve` parked locally
+/// created self-signed issues as awaiting_approval — invisible and unapprovable.
+/// Self-authored issues must bypass the approval gate entirely. Running with NO
+/// approval verifier configured proves the bypass happens before the approval
+/// gate, which would otherwise fail closed with approval_verifier_unconfigured.
+#[tokio::test]
+async fn self_signed_provenance_dispatches_under_approve_without_approval(
+) -> Result<(), Box<dyn Error>> {
+    let issue = network_issue("XSY-GATE-SELF-APPROVE", &["feature"], "agent-a")?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::default());
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Completed));
+    assert!(spy.counts().0 > 0, "runner should have executed");
+    assert!(
+        trust.calls().is_empty(),
+        "trust lookup must be skipped for self-authored provenance"
+    );
+    assert_consumed_count(&tracker, 0);
+    assert!(guard(&tracker.releases).is_empty(), "issue must not be blocked");
+    Ok(())
+}
+
+/// The self-signer exception is cryptographic: only *verified* provenance whose
+/// signer is this daemon's own agent_id qualifies. An issue that merely claims
+/// a `local` source field while carrying a non-self verified signature must
+/// still pass through the full approve gate — it awaits approval instead of
+/// dispatching.
+#[tokio::test]
+async fn forged_local_marker_cannot_claim_self_exception_under_approve(
+) -> Result<(), Box<dyn Error>> {
+    let issue = local_marker_with_provenance(
+        "XSY-GATE-FORGED-LOCAL",
+        &["feature"],
+        Some(SignatureProvenance::verified("remote-agent")),
+    )?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Approve,
+        default_test_proofs_dir(),
+    )?;
+    let trust = Arc::new(MockTrustClient::with_levels([(
+        "remote-agent",
+        TrustLevel::Trusted,
+    )]));
+    let crypto = approval_crypto();
+    let (signing_client, key_resolver) = approval_crypto_clients(&crypto);
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch_with_crypto(
+        issue,
+        config,
+        trust,
+        ApprovalState::default(),
+        signing_client,
+        key_resolver,
+    )
+    .await?;
+
+    assert_eq!(resolution, Some(Resolution::PendingApproval));
+    assert_no_execution_calls(&spy);
+    assert_eq!(trust.calls(), vec!["remote-agent".to_owned()]);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-GATE-FORGED-LOCAL",
+        &ReleaseReasonCode::AwaitingApproval,
+    )?;
+    Ok(())
+}
