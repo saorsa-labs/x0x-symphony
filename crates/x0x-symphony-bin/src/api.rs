@@ -30,8 +30,8 @@ use tokio::{sync::broadcast, time};
 use x0x_symphony_core::{
     approval_decision, constant_time_eq, content_hash, sha256_hex, AgentId, ApprovalDecision,
     ApprovalEvent, ApprovalState, ApprovalVerdict, Claim, Handoff, Issue, IssueDraft, IssueId,
-    IssueSource, SignatureEnvelope, SignatureProvenance, Tracker, VerificationNotice, WorkerCard,
-    APPROVAL_CONTEXT, SIGN_ALGORITHM,
+    IssueSource, ReleaseReason, ReleaseReasonCode, SignatureEnvelope, SignatureProvenance, Tracker,
+    VerificationNotice, WorkerCard, APPROVAL_CONTEXT, SIGN_ALGORITHM,
 };
 use x0x_symphony_signing::SigningClient;
 use x0x_symphony_tracker_x0x_crdt::WorkerViewProvider;
@@ -774,6 +774,24 @@ async fn submit_approval(
         .store_approval(&signed)
         .await
         .map_err(|error| Error::Tracker(error.to_string()))?;
+    // An approved issue that the dispatch gate parked as blocked/awaiting_approval
+    // must return to `todo` so the orchestrator re-claims it; the gate then finds
+    // the stored approval, consumes it, and dispatches exactly once. The approval
+    // event above is already durable, so a requeue failure is retryable by
+    // re-approving (duplicate approve events are harmless).
+    if request.verdict == ApprovalVerdict::Approve && is_blocked_awaiting_approval(&issue) {
+        state
+            .tracker
+            .requeue_blocked(
+                &issue_id,
+                ReleaseReason::new(
+                    ReleaseReasonCode::Other,
+                    "approval granted; requeued for dispatch",
+                ),
+            )
+            .await
+            .map_err(|error| Error::Tracker(error.to_string()))?;
+    }
     state.notify_approval(&signed);
     state.notify_task_changed(issue_id.as_str());
     Ok(Json(signed))
@@ -1083,7 +1101,21 @@ fn approval_summary(approval_state: &ApprovalState) -> ApprovalSummary {
 }
 
 fn is_active_approval_state(issue: &Issue) -> bool {
-    matches!(issue.state.as_str(), "todo" | "in_progress")
+    matches!(issue.state.as_str(), "todo" | "in_progress") || is_blocked_awaiting_approval(issue)
+}
+
+/// The dispatch gate parks approval-gated issues as `blocked` with reason code
+/// `awaiting_approval`. Those issues must stay visible in the pending-approval
+/// scan — the act of awaiting approval must not remove an issue from the very
+/// list the operator approves from.
+fn is_blocked_awaiting_approval(issue: &Issue) -> bool {
+    issue.state.as_str() == "blocked"
+        && issue
+            .extra
+            .get("blocked_reason")
+            .and_then(|reason| reason.get("code"))
+            .and_then(serde_json::Value::as_str)
+            == Some("awaiting_approval")
 }
 
 fn verified_network_signer_for_pending(issue: &Issue) -> Option<AgentId> {

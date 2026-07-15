@@ -56,6 +56,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let bind_addr = api::validate_loopback_bind(&args.bind)?;
     let data_dir = config::expand_tilde_path(&args.data_dir, "data-dir")?;
     let workflow = config::WorkflowConfig::load(&args.config)?;
+    for warning in &workflow.warnings {
+        warn!(%warning, "workflow configuration warning");
+    }
     let workflow_root = workflow_root(&args.config);
     let proofs_dir = workflow_root.join("proofs");
     if args.agent_id != "symphonyd" {

@@ -688,6 +688,21 @@ where
             return Ok(DispatchGateOutcome::Proceed);
         }
 
+        // Self-authored provenance: the daemon signed this issue itself when it
+        // created the task through the x0x CRDT tracker. Self-authored is local
+        // by definition, so it bypasses every network-dispatch policy gate
+        // (off/approve/auto). The exception is cryptographic — it requires
+        // *verified* provenance whose signer is this daemon's own agent_id —
+        // and can never be claimed through an unauthenticated source field.
+        if let Some(SignatureProvenance::Verified { signer_agent_id }) =
+            &issue.signature_provenance
+        {
+            let signer = signer_agent_id.trim();
+            if !signer.is_empty() && signer == self.config.agent_id.as_str() {
+                return Ok(DispatchGateOutcome::Proceed);
+            }
+        }
+
         if self.config.network_dispatch == NetworkDispatchPolicy::Off {
             self.block_for_dispatch_refusal(
                 guard,
@@ -741,38 +756,36 @@ where
             }
         };
 
-        // Self-authored provenance: the daemon signed this issue itself when it
-        // created the task through the x0x CRDT tracker. The daemon's own
-        // agent_id is never in its own x0xd contacts, so skip the contacts
-        // lookup — self-authored is local by definition and implicitly trusted.
-        if signer != self.config.agent_id {
-            let trust_level = self.trust_client.trust_level(signer.as_str()).await?;
-            let refusal = if trust_level == TrustLevel::Blocked {
-                Some((
-                    ReleaseReasonCode::BlockedSigner,
-                    format!("network-sourced issue signer {signer} is blocked in x0xd contacts"),
-                ))
-            } else if trust_level == TrustLevel::Unknown {
-                Some((
-                    ReleaseReasonCode::UnknownSigner,
-                    format!("network-sourced issue signer {signer} is unknown to x0xd contacts"),
-                ))
-            } else if trust_level < self.config.required_trust {
-                Some((
-                    ReleaseReasonCode::UntrustedSigner,
-                    format!(
-                        "network-sourced issue signer {signer} has trust {trust_level}; required {}",
-                        self.config.required_trust
-                    ),
-                ))
-            } else {
-                None
-            };
-            if let Some((code, detail)) = refusal {
-                self.block_for_dispatch_refusal(guard, claim, code, detail)
-                    .await?;
-                return Ok(DispatchGateOutcome::Blocked);
-            }
+        // Non-self signers only reach here (the self-authored exception already
+        // returned above), so the trust lookup is unconditional. The daemon's
+        // own agent_id is never in its own x0xd contacts, which is why the
+        // exception must fire before this check.
+        let trust_level = self.trust_client.trust_level(signer.as_str()).await?;
+        let refusal = if trust_level == TrustLevel::Blocked {
+            Some((
+                ReleaseReasonCode::BlockedSigner,
+                format!("network-sourced issue signer {signer} is blocked in x0xd contacts"),
+            ))
+        } else if trust_level == TrustLevel::Unknown {
+            Some((
+                ReleaseReasonCode::UnknownSigner,
+                format!("network-sourced issue signer {signer} is unknown to x0xd contacts"),
+            ))
+        } else if trust_level < self.config.required_trust {
+            Some((
+                ReleaseReasonCode::UntrustedSigner,
+                format!(
+                    "network-sourced issue signer {signer} has trust {trust_level}; required {}",
+                    self.config.required_trust
+                ),
+            ))
+        } else {
+            None
+        };
+        if let Some((code, detail)) = refusal {
+            self.block_for_dispatch_refusal(guard, claim, code, detail)
+                .await?;
+            return Ok(DispatchGateOutcome::Blocked);
         }
 
         match self.config.network_dispatch {

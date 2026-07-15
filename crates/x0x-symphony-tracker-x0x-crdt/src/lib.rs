@@ -1315,6 +1315,37 @@ impl Tracker for X0xCrdtTracker {
         .map_err(SymphonyError::from)
     }
 
+    async fn requeue_blocked(
+        &self,
+        issue_id: &IssueId,
+        reason: ReleaseReason,
+    ) -> x0x_symphony_core::Result<()> {
+        let blob = self
+            .claim_blob_for_task(issue_id.as_str())
+            .await
+            .map_err(SymphonyError::from)?
+            .ok_or_else(|| TrackerError::InvalidClaim {
+                reason: format!("issue {issue_id} has no claim blob"),
+            })
+            .map_err(SymphonyError::from)?;
+        if blob.status != ClaimBlobStatus::Blocked {
+            return Err(SymphonyError::from(TrackerError::InvalidClaim {
+                reason: format!(
+                    "issue {issue_id} claim status is {:?}, not Blocked",
+                    blob.status
+                ),
+            }));
+        }
+        // Releasing the blocked claim reconstructs the issue as `todo`, which
+        // returns it to the orchestrator's candidate scan.
+        self.put_claim_blob(
+            issue_id.as_str(),
+            &ClaimBlob::released(blob.claim, reason, now_utc()),
+        )
+        .await
+        .map_err(SymphonyError::from)
+    }
+
     async fn load_approval_state(
         &self,
         issue_id: &IssueId,
