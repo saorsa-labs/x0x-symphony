@@ -24,6 +24,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use reqwest::StatusCode;
 
 use x0x_symphony_signing::{SigningClient, SigningError};
@@ -35,8 +36,104 @@ use super::events::{
 };
 use super::fold::{AuthorStream, FoldInput, StoreRecord};
 use super::identity::decode_b64;
-use crate::client::{ClientError, KvValue, StoreCreateOutcome, X0xdApi, X0xdClient};
+use crate::client::{
+    ClientError, KvKeyEntry, KvValue, StoreCreateOutcome, StoreDetailEntry, X0xdApi, X0xdClient,
+};
 use x0x_symphony_core::sha256_hex;
+
+/// The x0xd REST surface the v2 store manager depends on. A trait so tests
+/// can drive the manager against an in-memory daemon double.
+#[async_trait]
+pub trait V2StoreApi: Send + Sync {
+    /// `POST /stores` with an optional access-policy flag.
+    async fn create_kv_store_with_policy(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: Option<&str>,
+    ) -> std::result::Result<StoreCreateOutcome, ClientError>;
+
+    /// `POST /stores/:topic/join` with a required owner anchor.
+    async fn join_kv_store(
+        &self,
+        topic: &str,
+        expected_owner: &str,
+    ) -> std::result::Result<(), ClientError>;
+
+    /// `GET /stores` filtered to one topic (owner + policy detail).
+    async fn kv_store_detail(
+        &self,
+        topic: &str,
+    ) -> std::result::Result<Option<StoreDetailEntry>, ClientError>;
+
+    /// `GET /stores/:topic/keys`.
+    async fn list_kv_keys(&self, topic: &str) -> std::result::Result<Vec<KvKeyEntry>, ClientError>;
+
+    /// `GET /stores/:topic/:key`.
+    async fn get_kv(
+        &self,
+        topic: &str,
+        key: &str,
+    ) -> std::result::Result<Option<KvValue>, ClientError>;
+
+    /// `PUT /stores/:topic/:key`.
+    async fn put_kv(
+        &self,
+        topic: &str,
+        key: &str,
+        value: &[u8],
+        content_type: &str,
+    ) -> std::result::Result<(), ClientError>;
+}
+
+#[async_trait]
+impl V2StoreApi for X0xdClient {
+    async fn create_kv_store_with_policy(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: Option<&str>,
+    ) -> std::result::Result<StoreCreateOutcome, ClientError> {
+        Self::create_kv_store_with_policy(self, name, topic, policy).await
+    }
+
+    async fn join_kv_store(
+        &self,
+        topic: &str,
+        expected_owner: &str,
+    ) -> std::result::Result<(), ClientError> {
+        Self::join_kv_store(self, topic, expected_owner).await
+    }
+
+    async fn kv_store_detail(
+        &self,
+        topic: &str,
+    ) -> std::result::Result<Option<StoreDetailEntry>, ClientError> {
+        Self::kv_store_detail(self, topic).await
+    }
+
+    async fn list_kv_keys(&self, topic: &str) -> std::result::Result<Vec<KvKeyEntry>, ClientError> {
+        X0xdApi::list_kv_keys(self, topic).await
+    }
+
+    async fn get_kv(
+        &self,
+        topic: &str,
+        key: &str,
+    ) -> std::result::Result<Option<KvValue>, ClientError> {
+        X0xdApi::get_kv(self, topic, key).await
+    }
+
+    async fn put_kv(
+        &self,
+        topic: &str,
+        key: &str,
+        value: &[u8],
+        content_type: &str,
+    ) -> std::result::Result<(), ClientError> {
+        X0xdApi::put_kv(self, topic, key, value, content_type).await
+    }
+}
 
 /// Content type for v2 envelope records.
 pub const V2_ENVELOPE_CONTENT_TYPE: &str = "application/x0x-symphony-v2+json";
@@ -150,7 +247,7 @@ pub struct OwnEventStore {
 /// transitions. All writes are signed through x0xd's `/agent/sign`; all
 /// *state* reads flow to the pure fold ([`super::fold::fold_v2`]).
 pub struct V2StoreManager {
-    api: Arc<X0xdClient>,
+    api: Arc<dyn V2StoreApi>,
     signer: Arc<dyn SigningClient>,
     mode: StorePolicyMode,
 }
@@ -159,7 +256,7 @@ impl V2StoreManager {
     /// Construct a manager.
     #[must_use]
     pub fn new(
-        api: Arc<X0xdClient>,
+        api: Arc<dyn V2StoreApi>,
         signer: Arc<dyn SigningClient>,
         mode: StorePolicyMode,
     ) -> Self {
@@ -212,28 +309,39 @@ impl V2StoreManager {
             .create_kv_store_with_policy(&topic, &topic, requested_policy)
             .await;
         match outcome {
-            Ok(StoreCreateOutcome { policy, .. }) => {
-                if self.mode == StorePolicyMode::AppendOnly
-                    && policy.as_deref() != Some("append_only")
-                {
-                    return Err(V2StoreError::PolicyNotHonored {
-                        topic,
-                        actual: policy,
-                    });
-                }
-                if self.mode == StorePolicyMode::SignedFallback {
-                    tracing::warn!(
-                        topic = %topic,
-                        "v2 event store created with interim signed policy; \
-                         append-only guarantees (design r2 C1) are NOT active \
-                         (TODO x0x WP-X / x0x-symphony#10)"
-                    );
-                }
-            }
-            // Already exists (created by an earlier run) — proceed; the
-            // card-self consistency check below still anchors identity.
+            Ok(StoreCreateOutcome { .. }) => {}
+            // Already exists (created by an earlier run or an older daemon) —
+            // proceed to the policy verification below, which applies to the
+            // reused store exactly as it does to a fresh one.
             Err(ClientError::Http { status, .. }) if status == StatusCode::CONFLICT => {}
             Err(e) => return Err(e.into()),
+        }
+
+        // Verify the effective policy on EVERY open, not just creation: a
+        // store created earlier (or by an older daemon that silently ignored
+        // the policy field) as mutable `signed` must never masquerade as
+        // append-only. The daemon-reported detail is the source of truth;
+        // silence (no policy field, or store missing from the listing) is
+        // NOT acceptance.
+        match self.mode {
+            StorePolicyMode::AppendOnly => {
+                let actual = self
+                    .api
+                    .kv_store_detail(&topic)
+                    .await?
+                    .and_then(|detail| detail.policy);
+                if actual.as_deref() != Some("append_only") {
+                    return Err(V2StoreError::PolicyNotHonored { topic, actual });
+                }
+            }
+            StorePolicyMode::SignedFallback => {
+                tracing::warn!(
+                    topic = %topic,
+                    "v2 event store opened with interim signed policy; \
+                     append-only guarantees (design r2 C1) are NOT active \
+                     (TODO x0x WP-X / x0x-symphony#10)"
+                );
+            }
         }
 
         // Publish card-self exactly once (first key each author writes).
@@ -597,7 +705,293 @@ fn base64_std(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use saorsa_pqc::{MlDsa65, MlDsaOperations, MlDsaSecretKey};
+    use tokio::sync::Mutex;
+    use x0x_symphony_signing::{AgentInfo, SignResponse, VerifyOutcome};
+
     use super::*;
+    use crate::v2::identity::{assemble_external_dst, derive_agent_id_hex};
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    struct MockSigner {
+        agent_id: String,
+        public_key_b64: String,
+        sk: MlDsaSecretKey,
+    }
+
+    impl MockSigner {
+        fn generate() -> TestResult<Self> {
+            let (pk, sk) = MlDsa65::new().generate_keypair()?;
+            Ok(Self {
+                agent_id: derive_agent_id_hex(pk.as_bytes()),
+                public_key_b64: BASE64.encode(pk.as_bytes()),
+                sk,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SigningClient for MockSigner {
+        async fn sign(
+            &self,
+            context: &str,
+            payload: &[u8],
+        ) -> std::result::Result<SignResponse, SigningError> {
+            let canonical = assemble_external_dst(context, payload);
+            let sig = MlDsa65::new()
+                .sign(&self.sk, &canonical)
+                .map_err(|e| SigningError::InvalidResponse(format!("{e}")))?;
+            Ok(SignResponse {
+                agent_id: self.agent_id.clone(),
+                public_key_b64: self.public_key_b64.clone(),
+                signature_b64: BASE64.encode(sig.as_bytes()),
+                algorithm: "x0x.agent-sign.v2.ml-dsa-65".to_owned(),
+                context: context.to_owned(),
+            })
+        }
+
+        async fn verify(
+            &self,
+            _context: &str,
+            _payload: &[u8],
+            _signature: &[u8],
+            _public_key: &[u8],
+        ) -> std::result::Result<VerifyOutcome, SigningError> {
+            Ok(VerifyOutcome::Valid)
+        }
+
+        async fn agent_identity(&self) -> std::result::Result<AgentInfo, SigningError> {
+            Ok(AgentInfo {
+                agent_id: self.agent_id.clone(),
+            })
+        }
+    }
+
+    /// What the mock's `GET /stores` reports for the topic.
+    #[derive(Clone)]
+    enum MockDetail {
+        /// Store is not in the listing at all.
+        NotListed,
+        /// Listed, but the daemon predates the policy field.
+        NoPolicyField,
+        /// Listed with this policy string.
+        Policy(&'static str),
+    }
+
+    /// In-memory daemon double for the store manager.
+    struct MockApi {
+        /// `create` returns 409 when true (store pre-exists).
+        store_exists: bool,
+        detail: MockDetail,
+        kv: Mutex<BTreeMap<(String, String), Vec<u8>>>,
+    }
+
+    impl MockApi {
+        fn new(store_exists: bool, detail: MockDetail) -> Self {
+            Self {
+                store_exists,
+                detail,
+                kv: Mutex::new(BTreeMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl V2StoreApi for MockApi {
+        async fn create_kv_store_with_policy(
+            &self,
+            _name: &str,
+            topic: &str,
+            _policy: Option<&str>,
+        ) -> std::result::Result<StoreCreateOutcome, ClientError> {
+            if self.store_exists {
+                return Err(ClientError::Http {
+                    status: StatusCode::CONFLICT,
+                    body: "store already exists".to_owned(),
+                });
+            }
+            // An old daemon ignores the policy field and reports nothing.
+            Ok(StoreCreateOutcome {
+                id: topic.to_owned(),
+                policy: None,
+            })
+        }
+
+        async fn join_kv_store(
+            &self,
+            _topic: &str,
+            _expected_owner: &str,
+        ) -> std::result::Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn kv_store_detail(
+            &self,
+            topic: &str,
+        ) -> std::result::Result<Option<StoreDetailEntry>, ClientError> {
+            Ok(match &self.detail {
+                MockDetail::NotListed => None,
+                MockDetail::NoPolicyField => Some(StoreDetailEntry {
+                    id: topic.to_owned(),
+                    owner: None,
+                    policy: None,
+                }),
+                MockDetail::Policy(policy) => Some(StoreDetailEntry {
+                    id: topic.to_owned(),
+                    owner: None,
+                    policy: Some((*policy).to_owned()),
+                }),
+            })
+        }
+
+        async fn list_kv_keys(
+            &self,
+            topic: &str,
+        ) -> std::result::Result<Vec<KvKeyEntry>, ClientError> {
+            let kv = self.kv.lock().await;
+            Ok(kv
+                .keys()
+                .filter(|(t, _)| t == topic)
+                .map(|(_, key)| KvKeyEntry {
+                    key: key.clone(),
+                    content_type: None,
+                    content_hash: None,
+                    size: 0,
+                    updated_at: None,
+                })
+                .collect())
+        }
+
+        async fn get_kv(
+            &self,
+            topic: &str,
+            key: &str,
+        ) -> std::result::Result<Option<KvValue>, ClientError> {
+            let kv = self.kv.lock().await;
+            Ok(kv
+                .get(&(topic.to_owned(), key.to_owned()))
+                .map(|value| KvValue {
+                    key: key.to_owned(),
+                    value: value.clone(),
+                    content_type: None,
+                    content_hash: None,
+                    created_at: None,
+                    updated_at: None,
+                }))
+        }
+
+        async fn put_kv(
+            &self,
+            topic: &str,
+            key: &str,
+            value: &[u8],
+            _content_type: &str,
+        ) -> std::result::Result<(), ClientError> {
+            let mut kv = self.kv.lock().await;
+            kv.insert((topic.to_owned(), key.to_owned()), value.to_vec());
+            Ok(())
+        }
+    }
+
+    fn manager(api: MockApi, signer: MockSigner, mode: StorePolicyMode) -> V2StoreManager {
+        V2StoreManager::new(Arc::new(api), Arc::new(signer), mode)
+    }
+
+    /// FIX 1 (Codex review of PR #11): a store that ALREADY EXISTS as
+    /// mutable `signed` must be refused in append-only mode — reuse must
+    /// never silently defeat C1.
+    #[tokio::test]
+    async fn reused_mutable_store_is_refused_in_append_only_mode() -> TestResult {
+        let mgr = manager(
+            MockApi::new(true, MockDetail::Policy("signed")),
+            MockSigner::generate()?,
+            StorePolicyMode::AppendOnly,
+        );
+        let result = mgr.ensure_own_store("list-1").await;
+        assert!(matches!(
+            result,
+            Err(V2StoreError::PolicyNotHonored {
+                actual: Some(ref p),
+                ..
+            }) if p == "signed"
+        ));
+        Ok(())
+    }
+
+    /// Silence is not acceptance: an existing store whose listing omits the
+    /// policy field entirely (pre-policy daemon) is refused too.
+    #[tokio::test]
+    async fn reused_store_with_absent_policy_is_refused() -> TestResult {
+        let mgr = manager(
+            MockApi::new(true, MockDetail::NoPolicyField),
+            MockSigner::generate()?,
+            StorePolicyMode::AppendOnly,
+        );
+        assert!(matches!(
+            mgr.ensure_own_store("list-1").await,
+            Err(V2StoreError::PolicyNotHonored { actual: None, .. })
+        ));
+        // Store 409s on create but is missing from GET /stores: also refused.
+        let mgr = manager(
+            MockApi::new(true, MockDetail::NotListed),
+            MockSigner::generate()?,
+            StorePolicyMode::AppendOnly,
+        );
+        assert!(matches!(
+            mgr.ensure_own_store("list-1").await,
+            Err(V2StoreError::PolicyNotHonored { actual: None, .. })
+        ));
+        Ok(())
+    }
+
+    /// A fresh create against an old daemon that ignored the policy flag is
+    /// refused by the same post-create verification.
+    #[tokio::test]
+    async fn fresh_create_on_policy_ignoring_daemon_is_refused() -> TestResult {
+        let mgr = manager(
+            MockApi::new(false, MockDetail::Policy("signed")),
+            MockSigner::generate()?,
+            StorePolicyMode::AppendOnly,
+        );
+        assert!(matches!(
+            mgr.ensure_own_store("list-1").await,
+            Err(V2StoreError::PolicyNotHonored { .. })
+        ));
+        Ok(())
+    }
+
+    /// Honored `append_only` (fresh or reused) proceeds and publishes card-self.
+    #[tokio::test]
+    async fn honored_append_only_store_proceeds_and_publishes_card_self() -> TestResult {
+        let signer = MockSigner::generate()?;
+        let expected_agent = signer.agent_id.clone();
+        let mgr = manager(
+            MockApi::new(true, MockDetail::Policy("append_only")),
+            signer,
+            StorePolicyMode::AppendOnly,
+        );
+        let own = mgr.ensure_own_store("list-1").await?;
+        assert_eq!(own.agent_id, expected_agent);
+        assert_eq!(own.policy, StorePolicyMode::AppendOnly);
+        Ok(())
+    }
+
+    /// The explicit interim fallback still works against mutable stores.
+    #[tokio::test]
+    async fn signed_fallback_mode_accepts_mutable_store() -> TestResult {
+        let mgr = manager(
+            MockApi::new(true, MockDetail::Policy("signed")),
+            MockSigner::generate()?,
+            StorePolicyMode::SignedFallback,
+        );
+        let own = mgr.ensure_own_store("list-1").await?;
+        assert_eq!(own.policy, StorePolicyMode::SignedFallback);
+        Ok(())
+    }
 
     #[test]
     fn policy_mode_config_parsing() {

@@ -454,6 +454,44 @@ impl X0xdClient {
         let _response: serde_json::Value = self.post_json(&path, &request).await?;
         Ok(())
     }
+
+    /// Fetch the daemon-reported detail entry (owner, policy) for one store
+    /// topic from `GET /stores`, or `None` when the store is not registered.
+    ///
+    /// Tracker v2 re-validates the access policy of an ALREADY-EXISTING event
+    /// store through this call on every open: a store created by an older
+    /// daemon (or an earlier run) as mutable `signed` must not silently
+    /// masquerade as append-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport or HTTP failures.
+    pub async fn kv_store_detail(&self, topic: &str) -> Result<Option<StoreDetailEntry>> {
+        let response: StoreDetailListResponse = self.get_json("/stores").await?;
+        let (StoreDetailListResponse::Wrapped { stores } | StoreDetailListResponse::Bare(stores)) =
+            response;
+        Ok(stores.into_iter().find(|entry| entry.id == topic))
+    }
+}
+
+/// Detail entry from `GET /stores`, keeping only the fields v2 validates.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct StoreDetailEntry {
+    /// Store id (currently the topic).
+    pub id: String,
+    /// Hex-encoded anchored owner, when known.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Access policy string reported by the daemon, when present.
+    #[serde(default)]
+    pub policy: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoreDetailListResponse {
+    Wrapped { stores: Vec<StoreDetailEntry> },
+    Bare(Vec<StoreDetailEntry>),
 }
 
 /// Outcome of `POST /stores`, including the daemon-reported access policy so

@@ -790,10 +790,20 @@ fn chain_author(
     }
 }
 
-/// Apply the lamport future-dating cap (C7): walk candidates in ascending
-/// lamport order, admitting an event only when its lamport is within
-/// [`LAMPORT_MAX_SKEW`] of the running admitted maximum. A rejected event
-/// also truncates its author's chain (prefix-only admission).
+/// Apply the lamport future-dating cap (C7), evaluated to a **fixpoint** so
+/// that only events admitted in the FINAL surviving set contribute to the
+/// running maximum — a rejected (or truncated) event contributes nothing.
+///
+/// Each pass walks the surviving candidates in ascending
+/// `(lamport, author, event_hash)` order with `running_max` starting at 0:
+/// an event whose lamport exceeds `running_max + LAMPORT_MAX_SKEW` is marked
+/// rejected (and truncates its author's chain from that `author_seq` —
+/// prefix-only admission); admitted events raise `running_max`. Marked
+/// events are then removed and the pass repeats on the smaller set, until a
+/// pass removes nothing. Because each pass is a pure function of the
+/// surviving set and the set only shrinks, the result is deterministic and
+/// independent of input order, and no event that was later rejected can have
+/// widened the horizon for anyone else.
 fn apply_lamport_cap(
     mut candidates: Vec<Admitted>,
     rejections: &mut Vec<Rejection>,
@@ -805,53 +815,54 @@ fn apply_lamport_cap(
             &b.event_hash,
         ))
     });
-    let mut running_max = 0u64;
-    let mut truncated_authors: BTreeMap<String, u64> = BTreeMap::new();
-    let mut kept: Vec<Admitted> = Vec::new();
-    for cand in candidates {
-        if let Some(from_seq) = truncated_authors.get(&cand.author) {
-            if cand.event.author_seq >= *from_seq {
+    let mut survivors = candidates;
+    loop {
+        // Side-effect-free pass: mark, never mutate while walking.
+        let mut running_max = 0u64;
+        let mut lamport_rejected: Vec<bool> = vec![false; survivors.len()];
+        let mut truncate_from: BTreeMap<String, u64> = BTreeMap::new();
+        for (idx, cand) in survivors.iter().enumerate() {
+            if cand.event.lamport > running_max.saturating_add(LAMPORT_MAX_SKEW) {
+                lamport_rejected[idx] = true;
+                let entry = truncate_from
+                    .entry(cand.author.clone())
+                    .or_insert(cand.event.author_seq);
+                *entry = (*entry).min(cand.event.author_seq);
+            } else {
+                running_max = running_max.max(cand.event.lamport);
+            }
+        }
+        if truncate_from.is_empty() {
+            return survivors;
+        }
+        // Remove marked events plus every event of a truncated author at or
+        // after the truncation seq, then re-evaluate on the smaller set.
+        let mut next: Vec<Admitted> = Vec::with_capacity(survivors.len());
+        for (idx, cand) in survivors.into_iter().enumerate() {
+            if lamport_rejected[idx] {
                 rejections.push(admission_rejection(
                     &cand.author,
                     &cand.key,
-                    "author chain truncated by an earlier lamport rejection".to_owned(),
+                    format!(
+                        "lamport {} exceeds admitted maximum + {LAMPORT_MAX_SKEW}",
+                        cand.event.lamport
+                    ),
                 ));
-                continue;
+            } else if truncate_from
+                .get(&cand.author)
+                .is_some_and(|from_seq| cand.event.author_seq >= *from_seq)
+            {
+                rejections.push(admission_rejection(
+                    &cand.author,
+                    &cand.key,
+                    "author chain truncated by a lamport rejection".to_owned(),
+                ));
+            } else {
+                next.push(cand);
             }
         }
-        if cand.event.lamport > running_max.saturating_add(LAMPORT_MAX_SKEW) {
-            rejections.push(admission_rejection(
-                &cand.author,
-                &cand.key,
-                format!(
-                    "lamport {} exceeds admitted maximum {running_max} + {LAMPORT_MAX_SKEW}",
-                    cand.event.lamport
-                ),
-            ));
-            let entry = truncated_authors
-                .entry(cand.author.clone())
-                .or_insert(cand.event.author_seq);
-            *entry = (*entry).min(cand.event.author_seq);
-            continue;
-        }
-        running_max = running_max.max(cand.event.lamport);
-        kept.push(cand);
+        survivors = next;
     }
-    // Second pass: drop chain suffixes of authors truncated after some of
-    // their later-seq events were already kept (possible when a smaller
-    // lamport carries a larger seq).
-    kept.retain(|cand| match truncated_authors.get(&cand.author) {
-        Some(from_seq) if cand.event.author_seq >= *from_seq => {
-            rejections.push(admission_rejection(
-                &cand.author,
-                &cand.key,
-                "author chain truncated by an earlier lamport rejection".to_owned(),
-            ));
-            false
-        }
-        _ => true,
-    });
-    kept
 }
 
 /// Phase 2: apply one admitted transition to the issue map. Returns an error

@@ -25,9 +25,13 @@ A v2 task list is a set of **per-author, append-only event stores**:
     stores (`StorePolicyMode::SignedFallback`, loud TODO in
     `v2/store.rs`). In that mode the C1 deletion residual is NOT closed.
     The default mode requires `append_only` and **fails loudly**
-    (`V2StoreError::PolicyNotHonored`) when the daemon ignores the flag —
-    older daemons silently drop unknown JSON fields, so the create response's
-    `policy` field is re-checked; silence is not acceptance.
+    (`V2StoreError::PolicyNotHonored`) when the daemon does not honor it.
+    Because older daemons silently drop unknown JSON fields — and because a
+    store may pre-exist from an earlier run or an older daemon as mutable
+    `signed` — the effective policy is re-verified from `GET /stores` on
+    **every** `ensure_own_store()` open, creation and reuse alike; a missing
+    policy field, a missing listing, or any value other than `append_only`
+    is refused. Silence is not acceptance.
 - Readers join peer stores via `POST /stores/<topic>/join
   {"expected_owner": <author-id>}` and read keys. Store ids are never
   computed client-side; topics are the addressing.
@@ -170,15 +174,22 @@ An `ev-*` record is admissible iff ALL of:
    same seq) additionally surfaces `ForkEvidence {author, seq, hashes}` —
    two signed events with one seq are self-authenticating proof of
    equivocation.
-8. **Lamport cap (C7)**: candidates surviving 1–7 are walked in ascending
-   `(lamport, author, event_hash)` order with `running_max` starting at 0;
-   an event is admitted iff `lamport ≤ running_max + 64`, and admission
-   raises `running_max`. A lamport-rejected event also truncates its
-   author's chain from that seq (prefix-only admission is preserved). The
-   rule is a function of the candidate multiset only ⇒ order-independent.
-   Withheld-event semantics are unchanged from r2: a withheld event can
-   re-order a winner only within the documented partition window; chains
-   make silent rewriting of one's own history detectable.
+8. **Lamport cap (C7)**: evaluated to a **fixpoint** over the surviving
+   candidate set so that only events admitted in the FINAL set contribute to
+   the horizon — a rejected or truncated event contributes nothing. Each
+   pass walks the surviving candidates in ascending
+   `(lamport, author, event_hash)` order with `running_max` starting at 0:
+   an event with `lamport > running_max + 64` is marked rejected (and marks
+   its author's chain truncated from that `author_seq` — prefix-only
+   admission); admitted events raise `running_max`. Marked events are then
+   removed and the pass repeats on the smaller set until a pass removes
+   nothing; the final pass is therefore a clean walk in which every
+   survivor is admitted against a horizon built only from survivors. Each
+   pass is a pure function of the surviving set and the set only shrinks,
+   so the fixpoint is reached in ≤ n passes and is independent of input
+   order. Withheld-event semantics are unchanged from r2: a withheld event
+   can re-order a winner only within the documented partition window;
+   chains make silent rewriting of one's own history detectable.
 
 Every rejection is surfaced in `FoldOutput.rejections` (phase, author, key,
 reason) — hostile input is visible, never silently dropped. Rejections and

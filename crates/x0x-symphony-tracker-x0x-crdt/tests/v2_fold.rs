@@ -1555,3 +1555,128 @@ fn fold_is_order_independent_under_random_shuffles() -> TestResult {
     }
     Ok(())
 }
+
+/// FIX 2 (Codex review of PR #11): a later-rejected event must not have
+/// widened the lamport horizon for anyone else. Under the pre-fix
+/// single-pass cap, A's chain-valid pair (seq1 lamport=200, seq2 lamport=60)
+/// let B's lamport=120 ride on a horizon that collapsed once A's seq1 was
+/// rejected and A's chain truncated. The fixpoint must reject ALL of them:
+/// with only survivors contributing, no event here fits within 0 + 64.
+#[test]
+fn lamport_rejected_events_do_not_widen_the_horizon_for_others() -> TestResult {
+    let a = Author::generate()?;
+    let b = Author::generate()?;
+    let fixture = make_genesis(&a, "list-l2", &[&a, &b])?;
+
+    let mut chain_a = Chain::new(&a, &fixture);
+    let (_, r_high_first) = chain_a.next(
+        0,
+        "i1",
+        200,
+        TransitionKind::Open {
+            title: "t".to_owned(),
+            spec: "s".to_owned(),
+        },
+    )?;
+    let (_, r_low_second) = chain_a.next(
+        0,
+        "i1",
+        60,
+        TransitionKind::Claim {
+            claim_nonce: "na".to_owned(),
+        },
+    )?;
+    let mut chain_b = Chain::new(&b, &fixture);
+    let (_, r_other_author) = chain_b.next(
+        0,
+        "i2",
+        120,
+        TransitionKind::Open {
+            title: "t".to_owned(),
+            spec: "s".to_owned(),
+        },
+    )?;
+
+    let base_streams = vec![
+        stream(
+            &a,
+            vec![fixture.genesis_record.clone(), r_high_first, r_low_second],
+        ),
+        stream(&b, vec![r_other_author]),
+    ];
+    let reference = fold(&fixture, &a, base_streams.clone()).map_err(|e| err(e.to_string()))?;
+    assert!(
+        reference.issues.is_empty(),
+        "no event may survive: {:?}",
+        reference.issues
+    );
+    assert_eq!(reference.max_admitted_lamport, 0);
+    assert_some_reason_contains(&reference, "exceeds admitted maximum")?;
+    assert_some_reason_contains(&reference, "truncated by a lamport rejection")?;
+
+    // The fixpoint outcome must be order-independent too.
+    let reference_json = serde_json::to_value(&reference)?;
+    for seed in 0..5u64 {
+        let mut streams = base_streams.clone();
+        lcg_shuffle(&mut streams, seed);
+        for s in &mut streams {
+            lcg_shuffle(&mut s.records, seed.wrapping_add(3));
+        }
+        let shuffled = fold(&fixture, &a, streams).map_err(|e| err(e.to_string()))?;
+        assert_eq!(
+            serde_json::to_value(&shuffled)?,
+            reference_json,
+            "fixpoint diverged for shuffle seed {seed}"
+        );
+    }
+    Ok(())
+}
+
+/// The reviewer's direct counterexample shape: two future-dated authors must
+/// both be rejected — A's rejected lamport=100 contributes nothing, so
+/// B's lamport=200 has no horizon to ride on.
+#[test]
+fn cross_author_future_dating_rejects_both_authors() -> TestResult {
+    let a = Author::generate()?;
+    let b = Author::generate()?;
+    let fixture = make_genesis(&a, "list-l3", &[&a, &b])?;
+
+    let mut chain_a = Chain::new(&a, &fixture);
+    let (_, r_a) = chain_a.next(
+        0,
+        "i1",
+        100,
+        TransitionKind::Open {
+            title: "t".to_owned(),
+            spec: "s".to_owned(),
+        },
+    )?;
+    let mut chain_b = Chain::new(&b, &fixture);
+    let (_, r_b) = chain_b.next(
+        0,
+        "i2",
+        200,
+        TransitionKind::Open {
+            title: "t".to_owned(),
+            spec: "s".to_owned(),
+        },
+    )?;
+
+    let out = fold(
+        &fixture,
+        &a,
+        vec![
+            stream(&a, vec![fixture.genesis_record.clone(), r_a]),
+            stream(&b, vec![r_b]),
+        ],
+    )
+    .map_err(|e| err(e.to_string()))?;
+    assert!(out.issues.is_empty());
+    assert_eq!(out.max_admitted_lamport, 0);
+    let lamport_rejections = rejection_reasons(&out)
+        .iter()
+        .filter(|r| r.contains("exceeds admitted maximum"))
+        .count();
+    assert_eq!(lamport_rejections, 2);
+    Ok(())
+}
