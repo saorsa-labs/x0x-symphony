@@ -439,9 +439,9 @@ fn auto_network_dispatch_without_ack_aborts_config_load() -> Result<(), Box<dyn 
 }
 
 /// Issue #6 defect 3: `network_dispatch: approve` with tracker signing
-/// disabled is an unrecoverable trap — locally created issues can never carry
+/// disabled is an unrecoverable trap: locally created issues can never carry
 /// verified provenance, so nothing could ever be approved or dispatched. The
-/// pairing must be rejected at config load, mirroring the auto+auto_ack gate.
+/// pairing must be rejected at config load, mirroring the auto+`auto_ack` gate.
 #[test]
 fn approve_without_required_signing_aborts_config_load() -> Result<(), Box<dyn Error>> {
     let workflow = workflow_with_security("  network_dispatch: approve\n");

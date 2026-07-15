@@ -2457,7 +2457,7 @@ mod tests {
     }
 
     /// Issue #6: an operator approval must be able to return a
-    /// blocked/awaiting_approval issue to `todo` so the orchestrator re-claims
+    /// blocked/`awaiting_approval` issue to `todo` so the orchestrator re-claims
     /// it — and the released blob persists in the CRDT store, so the requeued
     /// state survives a daemon restart.
     #[tokio::test]

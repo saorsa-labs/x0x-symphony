@@ -553,8 +553,8 @@ async fn get_pending_returns_network_sourced_unapproved() -> TestResult {
 
 /// Issue #6 defect 1: the dispatch gate parks approval-gated issues as
 /// `blocked` with reason `awaiting_approval`, but the pending scan only
-/// accepted todo/in_progress — the act of awaiting approval removed the issue
-/// from the very list the operator approves from. Blocked/awaiting_approval
+/// accepted `todo`/`in_progress` — the act of awaiting approval removed the issue
+/// from the very list the operator approves from. Blocked/`awaiting_approval`
 /// issues must appear in pending with their payload hash and signer; blocked
 /// issues with any other reason must not.
 #[tokio::test]
@@ -598,7 +598,7 @@ async fn get_pending_includes_blocked_awaiting_approval() -> TestResult {
     Ok(())
 }
 
-/// Issue #6: approving a blocked/awaiting_approval issue must return it to
+/// Issue #6: approving a blocked/`awaiting_approval` issue must return it to
 /// `todo` so the orchestrator can re-claim it and consume the approval — the
 /// approval alone must not leave the issue parked forever.
 #[tokio::test]
@@ -654,7 +654,7 @@ async fn post_deny_does_not_requeue_blocked_awaiting_issue() -> TestResult {
 }
 
 /// Approving an issue that is not parked (still todo) must not attempt a
-/// requeue — pre-approvals are stored and consumed by the gate on first claim.
+/// requeue: pre-approvals are stored and consumed by the gate on first claim.
 #[tokio::test]
 async fn post_approve_on_todo_issue_does_not_requeue() -> TestResult {
     let issue_id = "XSY-APPROVE-TODO-NO-REQUEUE";
@@ -792,7 +792,7 @@ fn unsigned_event(
     })
 }
 
-/// Network-sourced issue the dispatch gate parked as blocked/awaiting_approval,
+/// Network-sourced issue the dispatch gate parked as blocked/`awaiting_approval`,
 /// exactly as reconstructed from a Blocked claim blob after a daemon restart.
 fn blocked_awaiting_issue(id: &str, title: &str, signer: &str) -> TestResult<Issue> {
     let mut issue = network_issue(id, title, "blocked", signer)?;

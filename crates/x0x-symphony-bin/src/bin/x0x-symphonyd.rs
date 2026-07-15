@@ -55,10 +55,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run(args: Args) -> anyhow::Result<()> {
     let bind_addr = api::validate_loopback_bind(&args.bind)?;
     let data_dir = config::expand_tilde_path(&args.data_dir, "data-dir")?;
-    let workflow = config::WorkflowConfig::load(&args.config)?;
-    for warning in &workflow.warnings {
-        warn!(%warning, "workflow configuration warning");
-    }
+    let workflow = load_workflow_logging_warnings(&args.config)?;
     let workflow_root = workflow_root(&args.config);
     let proofs_dir = workflow_root.join("proofs");
     if args.agent_id != "symphonyd" {
@@ -453,6 +450,16 @@ fn workflow_root(config_path: &Path) -> PathBuf {
     config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// Load the workflow config and surface its non-fatal validation warnings
+/// (e.g. `network_dispatch=off` without required signing) loudly at startup.
+fn load_workflow_logging_warnings(config_path: &Path) -> anyhow::Result<config::WorkflowConfig> {
+    let workflow = config::WorkflowConfig::load(config_path)?;
+    for warning in &workflow.warnings {
+        warn!(%warning, "workflow configuration warning");
+    }
+    Ok(workflow)
 }
 
 fn spawn_dispatch_event_forwarder(

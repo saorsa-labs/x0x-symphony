@@ -4228,10 +4228,10 @@ async fn self_signed_provenance_dispatches_under_off_policy() -> Result<(), Box<
 }
 
 /// Issue #6 defect 1 (self side): `network_dispatch: approve` parked locally
-/// created self-signed issues as awaiting_approval — invisible and unapprovable.
+/// created self-signed issues as `awaiting_approval` — invisible and unapprovable.
 /// Self-authored issues must bypass the approval gate entirely. Running with NO
 /// approval verifier configured proves the bypass happens before the approval
-/// gate, which would otherwise fail closed with approval_verifier_unconfigured.
+/// gate, which would otherwise fail closed with `approval_verifier_unconfigured`.
 #[tokio::test]
 async fn self_signed_provenance_dispatches_under_approve_without_approval(
 ) -> Result<(), Box<dyn Error>> {
@@ -4260,7 +4260,7 @@ async fn self_signed_provenance_dispatches_under_approve_without_approval(
 }
 
 /// The self-signer exception is cryptographic: only *verified* provenance whose
-/// signer is this daemon's own agent_id qualifies. An issue that merely claims
+/// signer is this daemon's own `agent_id` qualifies. An issue that merely claims
 /// a `local` source field while carrying a non-self verified signature must
 /// still pass through the full approve gate — it awaits approval instead of
 /// dispatching.
