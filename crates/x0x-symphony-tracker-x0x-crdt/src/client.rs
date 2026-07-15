@@ -409,6 +409,61 @@ impl X0xdClient {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
+
+    /// Create a `KvStore`, optionally requesting an access policy (tracker
+    /// v2 uses `Some("append_only")` per the x0x WP-X REST contract).
+    ///
+    /// Daemons predating the `policy` flag ignore unknown JSON fields, so
+    /// callers MUST check [`StoreCreateOutcome::policy`] instead of assuming
+    /// the request was honored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport or HTTP failures (including 409
+    /// when the store already exists).
+    pub async fn create_kv_store_with_policy(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: Option<&str>,
+    ) -> Result<StoreCreateOutcome> {
+        let request = CreateStoreWithPolicyRequest {
+            name: name.to_owned(),
+            topic: topic.to_owned(),
+            policy: policy.map(str::to_owned),
+        };
+        let response: StoreCreateResponse = self.post_json("/stores", &request).await?;
+        Ok(StoreCreateOutcome {
+            id: response.id,
+            policy: response.policy,
+        })
+    }
+
+    /// Join a peer's `KvStore` replica by topic with a required
+    /// `expected_owner` anchor (hex agent id, supplied out-of-band).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport or HTTP failures (including 409
+    /// when the store is already joined).
+    pub async fn join_kv_store(&self, topic: &str, expected_owner: &str) -> Result<()> {
+        let path = format!("/stores/{topic}/join");
+        let request = JoinStoreRequest {
+            expected_owner: expected_owner.to_owned(),
+        };
+        let _response: serde_json::Value = self.post_json(&path, &request).await?;
+        Ok(())
+    }
+}
+
+/// Outcome of `POST /stores`, including the daemon-reported access policy so
+/// callers can verify a requested policy was actually honored.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreCreateOutcome {
+    /// Store id (currently the topic).
+    pub id: String,
+    /// Access policy reported by the daemon, when present.
+    pub policy: Option<String>,
 }
 
 #[async_trait]
@@ -589,6 +644,26 @@ impl X0xdApi for X0xdClient {
 struct CreateNamedResourceRequest {
     name: String,
     topic: String,
+}
+
+#[derive(Serialize)]
+struct CreateStoreWithPolicyRequest {
+    name: String,
+    topic: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JoinStoreRequest {
+    expected_owner: String,
+}
+
+#[derive(Deserialize)]
+struct StoreCreateResponse {
+    id: String,
+    #[serde(default)]
+    policy: Option<String>,
 }
 
 #[derive(Serialize)]
