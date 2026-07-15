@@ -263,7 +263,9 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
         &mut rejections,
         &mut forks,
     );
-    let latest_roster_epoch = u64::try_from(rosters.len()).unwrap_or(u64::MAX).saturating_sub(1);
+    let latest_roster_epoch = u64::try_from(rosters.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(1);
 
     // ---- Phase 1: per-stream candidate admission ---------------------------
     let mut per_author: BTreeMap<String, Vec<Admitted>> = BTreeMap::new();
@@ -316,7 +318,11 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
     // ---- Phase 2: deterministic state machine ------------------------------
     let mut ordered = admitted;
     ordered.sort_by(|a, b| {
-        (a.event.lamport, &a.author, &a.event_hash).cmp(&(b.event.lamport, &b.author, &b.event_hash))
+        (a.event.lamport, &a.author, &a.event_hash).cmp(&(
+            b.event.lamport,
+            &b.author,
+            &b.event_hash,
+        ))
     });
     let mut issues: BTreeMap<String, IssueStateV2> = BTreeMap::new();
     for adm in &ordered {
@@ -331,9 +337,7 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
     }
 
     // Canonical diagnostic order: independent of input order.
-    rejections.sort_by(|a, b| {
-        (&a.author, &a.key, &a.reason).cmp(&(&b.author, &b.key, &b.reason))
-    });
+    rejections.sort_by(|a, b| (&a.author, &a.key, &a.reason).cmp(&(&b.author, &b.key, &b.reason)));
     rejections.dedup();
     forks.sort_by(|a, b| (&a.author, a.author_seq).cmp(&(&b.author, b.author_seq)));
     forks.dedup();
@@ -498,10 +502,11 @@ fn build_roster_chain(
             Ok((roster, hash))
         })();
         match verified {
-            Ok((roster, hash)) => by_epoch
-                .entry(roster.roster_epoch)
-                .or_default()
-                .push((record.key.clone(), roster, hash)),
+            Ok((roster, hash)) => by_epoch.entry(roster.roster_epoch).or_default().push((
+                record.key.clone(),
+                roster,
+                hash,
+            )),
             Err(reason) => {
                 rejections.push(admission_rejection(creator, &record.key, reason));
             }
@@ -636,8 +641,8 @@ fn admit_event(
     }
 
     // Roster membership at the event's named epoch.
-    let epoch = usize::try_from(event.roster_epoch)
-        .map_err(|_| "roster epoch out of range".to_owned())?;
+    let epoch =
+        usize::try_from(event.roster_epoch).map_err(|_| "roster epoch out of range".to_owned())?;
     let roster = rosters
         .get(epoch)
         .ok_or_else(|| format!("event names unknown roster epoch {}", event.roster_epoch))?;
@@ -655,10 +660,14 @@ fn admit_event(
             .verify(APPROVAL_CONTEXT_V2)
             .map_err(|e| format!("requeue approval envelope: {e}"))?;
         if approval_hash != justification.approval_event_hash {
-            return Err("requeue approval event hash does not match the embedded record".to_owned());
+            return Err(
+                "requeue approval event hash does not match the embedded record".to_owned(),
+            );
         }
         if approval_hash != justification.approval_payload_sha256 {
-            return Err("requeue approval payload hash does not match the embedded record".to_owned());
+            return Err(
+                "requeue approval payload hash does not match the embedded record".to_owned(),
+            );
         }
         let approval: ApprovalPayloadV2 = serde_json::from_slice(&approval_payload)
             .map_err(|e| format!("approval decode failed: {e}"))?;
@@ -785,9 +794,16 @@ fn chain_author(
 /// lamport order, admitting an event only when its lamport is within
 /// [`LAMPORT_MAX_SKEW`] of the running admitted maximum. A rejected event
 /// also truncates its author's chain (prefix-only admission).
-fn apply_lamport_cap(mut candidates: Vec<Admitted>, rejections: &mut Vec<Rejection>) -> Vec<Admitted> {
+fn apply_lamport_cap(
+    mut candidates: Vec<Admitted>,
+    rejections: &mut Vec<Rejection>,
+) -> Vec<Admitted> {
     candidates.sort_by(|a, b| {
-        (a.event.lamport, &a.author, &a.event_hash).cmp(&(b.event.lamport, &b.author, &b.event_hash))
+        (a.event.lamport, &a.author, &a.event_hash).cmp(&(
+            b.event.lamport,
+            &b.author,
+            &b.event_hash,
+        ))
     });
     let mut running_max = 0u64;
     let mut truncated_authors: BTreeMap<String, u64> = BTreeMap::new();

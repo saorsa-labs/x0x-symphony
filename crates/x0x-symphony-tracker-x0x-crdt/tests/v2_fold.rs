@@ -400,10 +400,7 @@ fn missing_or_mismatched_card_self_rejects_stream() -> TestResult {
     let out = fold(
         &fixture,
         &a,
-        vec![
-            stream(&a, vec![fixture.genesis_record.clone()]),
-            bare,
-        ],
+        vec![stream(&a, vec![fixture.genesis_record.clone()]), bare],
     )
     .map_err(|e| err(e.to_string()))?;
     assert!(out.issues.is_empty());
@@ -418,10 +415,7 @@ fn missing_or_mismatched_card_self_rejects_stream() -> TestResult {
     let out = fold(
         &fixture,
         &a,
-        vec![
-            stream(&a, vec![fixture.genesis_record.clone()]),
-            wrong_card,
-        ],
+        vec![stream(&a, vec![fixture.genesis_record.clone()]), wrong_card],
     )
     .map_err(|e| err(e.to_string()))?;
     assert!(out.issues.is_empty());
@@ -547,13 +541,23 @@ fn author_chain_gap_rejects_from_gap() -> TestResult {
             spec: "s".to_owned(),
         },
     )?;
-    let (_, _skipped) = chain.next(0, "i1", 2, TransitionKind::Claim {
-        claim_nonce: "n1".to_owned(),
-    })?;
-    let (_, r3) = chain.next(0, "i1", 3, TransitionKind::Release {
-        claim_nonce: "n1".to_owned(),
-        claimed_event_hash: "x".to_owned(),
-    })?;
+    let (_, _skipped) = chain.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: "n1".to_owned(),
+        },
+    )?;
+    let (_, r3) = chain.next(
+        0,
+        "i1",
+        3,
+        TransitionKind::Release {
+            claim_nonce: "n1".to_owned(),
+            claimed_event_hash: "x".to_owned(),
+        },
+    )?;
     // Withhold seq 2 — seq 3 must be inadmissible (gap).
     let out = fold(
         &fixture,
@@ -585,19 +589,34 @@ fn author_chain_fork_surfaces_evidence_and_rejects_from_fork() -> TestResult {
     // Two conflicting seq-2 events (a fork of b's own history).
     let saved_seq = chain.seq;
     let saved_prev = chain.prev.clone();
-    let (_, r2x) = chain.next(0, "i1", 2, TransitionKind::Claim {
-        claim_nonce: "nx".to_owned(),
-    })?;
+    let (_, r2x) = chain.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: "nx".to_owned(),
+        },
+    )?;
     chain.seq = saved_seq;
     chain.prev = saved_prev;
-    let (_, r2y) = chain.next(0, "i1", 3, TransitionKind::Claim {
-        claim_nonce: "ny".to_owned(),
-    })?;
+    let (_, r2y) = chain.next(
+        0,
+        "i1",
+        3,
+        TransitionKind::Claim {
+            claim_nonce: "ny".to_owned(),
+        },
+    )?;
     // A continuation after the fork must also be inadmissible.
-    let (_, r3) = chain.next(0, "i1", 4, TransitionKind::Release {
-        claim_nonce: "ny".to_owned(),
-        claimed_event_hash: "x".to_owned(),
-    })?;
+    let (_, r3) = chain.next(
+        0,
+        "i1",
+        4,
+        TransitionKind::Release {
+            claim_nonce: "ny".to_owned(),
+            claimed_event_hash: "x".to_owned(),
+        },
+    )?;
 
     let out = fold(
         &fixture,
@@ -633,14 +652,24 @@ fn lamport_future_dating_is_capped() -> TestResult {
         },
     )?;
     // 65 == 1 + LAMPORT_MAX_SKEW: exactly at the boundary, admitted.
-    let (_, r2) = chain.next(0, "i1", 65, TransitionKind::Claim {
-        claim_nonce: "n".to_owned(),
-    })?;
+    let (_, r2) = chain.next(
+        0,
+        "i1",
+        65,
+        TransitionKind::Claim {
+            claim_nonce: "n".to_owned(),
+        },
+    )?;
     // 1_000_000: far beyond the cap, rejected (and truncates the chain).
-    let (_, r3) = chain.next(0, "i2", 1_000_000, TransitionKind::Open {
-        title: "t".to_owned(),
-        spec: "s".to_owned(),
-    })?;
+    let (_, r3) = chain.next(
+        0,
+        "i2",
+        1_000_000,
+        TransitionKind::Open {
+            title: "t".to_owned(),
+            spec: "s".to_owned(),
+        },
+    )?;
     let out = fold(
         &fixture,
         &a,
@@ -711,10 +740,7 @@ fn cross_list_replay_of_byte_identical_event_is_rejected() -> TestResult {
     let out = fold(
         &fixture3,
         &a,
-        vec![stream(
-            &a,
-            vec![fixture3.genesis_record.clone(), record],
-        )],
+        vec![stream(&a, vec![fixture3.genesis_record.clone(), record])],
     )
     .map_err(|e| err(e.to_string()))?;
     assert!(out.issues.is_empty());
@@ -771,13 +797,23 @@ fn concurrent_claims_pick_deterministic_winner_in_both_orders() -> TestResult {
     )?;
     // Same lamport, different authors: winner = smaller (author, hash).
     let mut chain_b = Chain::new(&b, &fixture);
-    let (hash_b, r_claim_b) = chain_b.next(0, "i1", 2, TransitionKind::Claim {
-        claim_nonce: "nb".to_owned(),
-    })?;
+    let (hash_b, r_claim_b) = chain_b.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: "nb".to_owned(),
+        },
+    )?;
     let mut chain_c = Chain::new(&c, &fixture);
-    let (hash_c, r_claim_c) = chain_c.next(0, "i1", 2, TransitionKind::Claim {
-        claim_nonce: "nc".to_owned(),
-    })?;
+    let (hash_c, r_claim_c) = chain_c.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: "nc".to_owned(),
+        },
+    )?;
     let expected_winner = if (b.id.clone(), hash_b.clone()) < (c.id.clone(), hash_c.clone()) {
         b.id.clone()
     } else {
@@ -818,18 +854,33 @@ fn stale_claimants_release_is_ineffective() -> TestResult {
             spec: "s".to_owned(),
         },
     )?;
-    let (winning_claim_hash, r_claim_a) = chain_a.next(0, "i1", 2, TransitionKind::Claim {
-        claim_nonce: "na".to_owned(),
-    })?;
+    let (winning_claim_hash, r_claim_a) = chain_a.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: "na".to_owned(),
+        },
+    )?;
     // b claims later (loses), then tries to release with its own nonce.
     let mut chain_b = Chain::new(&b, &fixture);
-    let (losing_claim_hash, r_claim_b) = chain_b.next(0, "i1", 3, TransitionKind::Claim {
-        claim_nonce: "nb".to_owned(),
-    })?;
-    let (_, r_release_b) = chain_b.next(0, "i1", 4, TransitionKind::Release {
-        claim_nonce: "nb".to_owned(),
-        claimed_event_hash: losing_claim_hash,
-    })?;
+    let (losing_claim_hash, r_claim_b) = chain_b.next(
+        0,
+        "i1",
+        3,
+        TransitionKind::Claim {
+            claim_nonce: "nb".to_owned(),
+        },
+    )?;
+    let (_, r_release_b) = chain_b.next(
+        0,
+        "i1",
+        4,
+        TransitionKind::Release {
+            claim_nonce: "nb".to_owned(),
+            claimed_event_hash: losing_claim_hash,
+        },
+    )?;
 
     let out = fold(
         &fixture,
@@ -887,14 +938,24 @@ fn requeue_scenario(list: &str) -> TestResult<RequeueScenario> {
     )?;
     let mut chain_w = Chain::new(&worker, &fixture);
     let claim_nonce = "nonce-w".to_owned();
-    let (claim_hash, r_claim) = chain_w.next(0, "i1", 2, TransitionKind::Claim {
-        claim_nonce: claim_nonce.clone(),
-    })?;
-    let (block_hash, r_block) = chain_w.next(0, "i1", 3, TransitionKind::Block {
-        claim_nonce: claim_nonce.clone(),
-        claimed_event_hash: claim_hash,
-        reason: BlockReason::AwaitingApproval,
-    })?;
+    let (claim_hash, r_claim) = chain_w.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: claim_nonce.clone(),
+        },
+    )?;
+    let (block_hash, r_block) = chain_w.next(
+        0,
+        "i1",
+        3,
+        TransitionKind::Block {
+            claim_nonce: claim_nonce.clone(),
+            claimed_event_hash: claim_hash,
+            reason: BlockReason::AwaitingApproval,
+        },
+    )?;
     Ok(RequeueScenario {
         records_creator: vec![fixture.genesis_record.clone(), r_open],
         records_worker: vec![r_claim, r_block],
@@ -1025,14 +1086,20 @@ fn requeue_justification_violations_are_rejected_one_by_one() -> TestResult {
     let mut j = valid.clone();
     j.approval_event_hash = "0".repeat(64);
     let out = fold_scenario(&scenario, requeue_event(&scenario, j)?)?;
-    assert!(matches!(status_of(&out, "i1")?, IssueStatusV2::Blocked { .. }));
+    assert!(matches!(
+        status_of(&out, "i1")?,
+        IssueStatusV2::Blocked { .. }
+    ));
     assert_some_reason_contains(&out, "approval event hash")?;
 
     // (2) Wrong approval payload hash.
     let mut j = valid.clone();
     j.approval_payload_sha256 = "0".repeat(64);
     let out = fold_scenario(&scenario, requeue_event(&scenario, j)?)?;
-    assert!(matches!(status_of(&out, "i1")?, IssueStatusV2::Blocked { .. }));
+    assert!(matches!(
+        status_of(&out, "i1")?,
+        IssueStatusV2::Blocked { .. }
+    ));
     assert_some_reason_contains(&out, "approval payload hash")?;
 
     // (3) Tampered approval payload (signature must fail).
@@ -1045,7 +1112,10 @@ fn requeue_justification_violations_are_rejected_one_by_one() -> TestResult {
     tampered.payload_b64 = BASE64.encode(&bytes);
     j.approval = tampered;
     let out = fold_scenario(&scenario, requeue_event(&scenario, j)?)?;
-    assert!(matches!(status_of(&out, "i1")?, IssueStatusV2::Blocked { .. }));
+    assert!(matches!(
+        status_of(&out, "i1")?,
+        IssueStatusV2::Blocked { .. }
+    ));
     assert_some_reason_contains(&out, "requeue approval envelope")?;
 
     // (4) Approver not in roster: approval signed by an outsider.
@@ -1073,7 +1143,10 @@ fn requeue_justification_violations_are_rejected_one_by_one() -> TestResult {
         approval: envelope,
     };
     let out = fold_scenario(&scenario, requeue_event(&scenario, j)?)?;
-    assert!(matches!(status_of(&out, "i1")?, IssueStatusV2::Blocked { .. }));
+    assert!(matches!(
+        status_of(&out, "i1")?,
+        IssueStatusV2::Blocked { .. }
+    ));
     assert_some_reason_contains(&out, "is not a roster member")?;
 
     // (5) Consistent justification naming the WRONG block: passes admission
@@ -1095,7 +1168,10 @@ fn requeue_justification_violations_are_rejected_one_by_one() -> TestResult {
         approval: approval_wrong,
     };
     let out = fold_scenario(&scenario, requeue_event(&scenario, j)?)?;
-    assert!(matches!(status_of(&out, "i1")?, IssueStatusV2::Blocked { .. }));
+    assert!(matches!(
+        status_of(&out, "i1")?,
+        IssueStatusV2::Blocked { .. }
+    ));
     assert_some_reason_contains(&out, "not the current block")?;
 
     // (6) Consistent justification naming the wrong claim nonce.
@@ -1115,7 +1191,10 @@ fn requeue_justification_violations_are_rejected_one_by_one() -> TestResult {
         approval: approval_wn,
     };
     let out = fold_scenario(&scenario, requeue_event(&scenario, j)?)?;
-    assert!(matches!(status_of(&out, "i1")?, IssueStatusV2::Blocked { .. }));
+    assert!(matches!(
+        status_of(&out, "i1")?,
+        IssueStatusV2::Blocked { .. }
+    ));
     assert_some_reason_contains(&out, "does not match the parked claim")?;
     Ok(())
 }
@@ -1138,17 +1217,27 @@ fn non_approval_blocks_are_never_requeueable() -> TestResult {
         },
     )?;
     let mut chain_w = Chain::new(&worker, &fixture);
-    let (claim_hash, r_claim) = chain_w.next(0, "i1", 2, TransitionKind::Claim {
-        claim_nonce: "n".to_owned(),
-    })?;
-    // Security block (reason: Other) — terminal for this claim.
-    let (block_hash, r_block) = chain_w.next(0, "i1", 3, TransitionKind::Block {
-        claim_nonce: "n".to_owned(),
-        claimed_event_hash: claim_hash,
-        reason: BlockReason::Other {
-            detail: "security".to_owned(),
+    let (claim_hash, r_claim) = chain_w.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: "n".to_owned(),
         },
-    })?;
+    )?;
+    // Security block (reason: Other) — terminal for this claim.
+    let (block_hash, r_block) = chain_w.next(
+        0,
+        "i1",
+        3,
+        TransitionKind::Block {
+            claim_nonce: "n".to_owned(),
+            claimed_event_hash: claim_hash,
+            reason: BlockReason::Other {
+                detail: "security".to_owned(),
+            },
+        },
+    )?;
 
     let scenario = RequeueScenario {
         records_creator: vec![fixture.genesis_record.clone(), r_open],
@@ -1224,13 +1313,23 @@ fn full_happy_path_open_claim_block_requeue_reclaim_complete() -> TestResult {
         seq: scenario.worker_chain_seq + 1,
         prev: requeue_payload_hash,
     };
-    let (claim2_hash, r_claim2) = chain_w.next(0, "i1", 5, TransitionKind::Claim {
-        claim_nonce: "nonce-2".to_owned(),
-    })?;
-    let (_, r_complete) = chain_w.next(0, "i1", 6, TransitionKind::Complete {
-        claim_nonce: "nonce-2".to_owned(),
-        claimed_event_hash: claim2_hash,
-    })?;
+    let (claim2_hash, r_claim2) = chain_w.next(
+        0,
+        "i1",
+        5,
+        TransitionKind::Claim {
+            claim_nonce: "nonce-2".to_owned(),
+        },
+    )?;
+    let (_, r_complete) = chain_w.next(
+        0,
+        "i1",
+        6,
+        TransitionKind::Complete {
+            claim_nonce: "nonce-2".to_owned(),
+            claimed_event_hash: claim2_hash,
+        },
+    )?;
 
     let mut worker_records = scenario.records_worker.clone();
     worker_records.extend([requeue, r_claim2, r_complete]);
@@ -1245,7 +1344,10 @@ fn full_happy_path_open_claim_block_requeue_reclaim_complete() -> TestResult {
     )
     .map_err(|e| err(e.to_string()))?;
     let IssueStatusV2::Done { completed_by, .. } = status_of(&out, "i1")? else {
-        return Err(err(format!("expected done, got {:?}", status_of(&out, "i1")?)));
+        return Err(err(format!(
+            "expected done, got {:?}",
+            status_of(&out, "i1")?
+        )));
     };
     assert_eq!(completed_by, &scenario.worker.id);
     // Every state change is on the applied log.
@@ -1273,27 +1375,50 @@ fn release_reopens_and_allows_reclaim_by_other_author() -> TestResult {
             spec: "s".to_owned(),
         },
     )?;
-    let (claim_hash, r_claim) = chain_a.next(0, "i1", 2, TransitionKind::Claim {
-        claim_nonce: "na".to_owned(),
-    })?;
-    let (_, r_release) = chain_a.next(0, "i1", 3, TransitionKind::Release {
-        claim_nonce: "na".to_owned(),
-        claimed_event_hash: claim_hash,
-    })?;
+    let (claim_hash, r_claim) = chain_a.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: "na".to_owned(),
+        },
+    )?;
+    let (_, r_release) = chain_a.next(
+        0,
+        "i1",
+        3,
+        TransitionKind::Release {
+            claim_nonce: "na".to_owned(),
+            claimed_event_hash: claim_hash,
+        },
+    )?;
     let mut chain_b = Chain::new(&b, &fixture);
-    let (claim_b_hash, r_claim_b) = chain_b.next(0, "i1", 4, TransitionKind::Claim {
-        claim_nonce: "nb".to_owned(),
-    })?;
-    let (_, r_complete_b) = chain_b.next(0, "i1", 5, TransitionKind::Complete {
-        claim_nonce: "nb".to_owned(),
-        claimed_event_hash: claim_b_hash,
-    })?;
+    let (claim_b_hash, r_claim_b) = chain_b.next(
+        0,
+        "i1",
+        4,
+        TransitionKind::Claim {
+            claim_nonce: "nb".to_owned(),
+        },
+    )?;
+    let (_, r_complete_b) = chain_b.next(
+        0,
+        "i1",
+        5,
+        TransitionKind::Complete {
+            claim_nonce: "nb".to_owned(),
+            claimed_event_hash: claim_b_hash,
+        },
+    )?;
 
     let out = fold(
         &fixture,
         &a,
         vec![
-            stream(&a, vec![fixture.genesis_record.clone(), r_open, r_claim, r_release]),
+            stream(
+                &a,
+                vec![fixture.genesis_record.clone(), r_open, r_claim, r_release],
+            ),
             stream(&b, vec![r_claim_b, r_complete_b]),
         ],
     )
@@ -1310,6 +1435,7 @@ fn release_reopens_and_allows_reclaim_by_other_author() -> TestResult {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)] // One rich scenario keeps the shuffles meaningful.
 fn fold_is_order_independent_under_random_shuffles() -> TestResult {
     // Rich scenario: 3 authors, roster update, competing claims, a chain
     // fork, a lamport outlier, and a completed issue.
@@ -1338,32 +1464,62 @@ fn fold_is_order_independent_under_random_shuffles() -> TestResult {
         },
     )?;
     let mut chain_b = Chain::new(&b, &fixture);
-    let (hb, r3) = chain_b.next(0, "i1", 3, TransitionKind::Claim {
-        claim_nonce: "nb".to_owned(),
-    })?;
+    let (hb, r3) = chain_b.next(
+        0,
+        "i1",
+        3,
+        TransitionKind::Claim {
+            claim_nonce: "nb".to_owned(),
+        },
+    )?;
     let mut chain_c = Chain::new(&c, &fixture);
-    let (_, r4) = chain_c.next(0, "i1", 3, TransitionKind::Claim {
-        claim_nonce: "nc".to_owned(),
-    })?;
-    let (_, r5) = chain_b.next(0, "i1", 4, TransitionKind::Complete {
-        claim_nonce: "nb".to_owned(),
-        claimed_event_hash: hb.clone(),
-    })?;
+    let (_, r4) = chain_c.next(
+        0,
+        "i1",
+        3,
+        TransitionKind::Claim {
+            claim_nonce: "nc".to_owned(),
+        },
+    )?;
+    let (_, r5) = chain_b.next(
+        0,
+        "i1",
+        4,
+        TransitionKind::Complete {
+            claim_nonce: "nb".to_owned(),
+            claimed_event_hash: hb.clone(),
+        },
+    )?;
     // c forks its own chain at seq 2.
     let saved_seq = chain_c.seq;
     let saved_prev = chain_c.prev.clone();
-    let (_, r6) = chain_c.next(0, "i2", 5, TransitionKind::Claim {
-        claim_nonce: "nc2".to_owned(),
-    })?;
+    let (_, r6) = chain_c.next(
+        0,
+        "i2",
+        5,
+        TransitionKind::Claim {
+            claim_nonce: "nc2".to_owned(),
+        },
+    )?;
     chain_c.seq = saved_seq;
     chain_c.prev = saved_prev;
-    let (_, r7) = chain_c.next(0, "i2", 6, TransitionKind::Claim {
-        claim_nonce: "nc3".to_owned(),
-    })?;
+    let (_, r7) = chain_c.next(
+        0,
+        "i2",
+        6,
+        TransitionKind::Claim {
+            claim_nonce: "nc3".to_owned(),
+        },
+    )?;
     // a future-dates an event far beyond the cap.
-    let (_, r8) = chain_a.next(0, "i2", 9_999_999, TransitionKind::Claim {
-        claim_nonce: "na".to_owned(),
-    })?;
+    let (_, r8) = chain_a.next(
+        0,
+        "i2",
+        9_999_999,
+        TransitionKind::Claim {
+            claim_nonce: "na".to_owned(),
+        },
+    )?;
 
     let base_streams = vec![
         stream(&a, vec![fixture.genesis_record.clone(), r1, r2, r8]),

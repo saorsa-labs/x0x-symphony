@@ -245,9 +245,11 @@ mod tests {
 
     #[test]
     fn malformed_key_and_signature_lengths_rejected() {
-        let err = verify_external_signature("c", b"p", &[0u8; 10], &[0u8; ML_DSA_65_PUBLIC_KEY_SIZE]);
+        let err =
+            verify_external_signature("c", b"p", &[0u8; 10], &[0u8; ML_DSA_65_PUBLIC_KEY_SIZE]);
         assert!(matches!(err, Err(SignatureCheckError::BadSignature(_))));
-        let err = verify_external_signature("c", b"p", &[0u8; ML_DSA_65_SIGNATURE_SIZE], &[0u8; 10]);
+        let err =
+            verify_external_signature("c", b"p", &[0u8; ML_DSA_65_SIGNATURE_SIZE], &[0u8; 10]);
         assert!(matches!(err, Err(SignatureCheckError::BadPublicKey(_))));
     }
 }

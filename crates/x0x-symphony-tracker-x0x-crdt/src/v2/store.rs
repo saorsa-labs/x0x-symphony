@@ -158,7 +158,11 @@ pub struct V2StoreManager {
 impl V2StoreManager {
     /// Construct a manager.
     #[must_use]
-    pub fn new(api: Arc<X0xdClient>, signer: Arc<dyn SigningClient>, mode: StorePolicyMode) -> Self {
+    pub fn new(
+        api: Arc<X0xdClient>,
+        signer: Arc<dyn SigningClient>,
+        mode: StorePolicyMode,
+    ) -> Self {
         Self { api, signer, mode }
     }
 
@@ -184,8 +188,8 @@ impl V2StoreManager {
             .signer
             .sign(BOOTSTRAP_CONTEXT_V2, b"x0x-symphony-v2-key-bootstrap")
             .await?;
-        let public_key = decode_b64("public_key_b64", &sign.public_key_b64)
-            .map_err(V2StoreError::Invalid)?;
+        let public_key =
+            decode_b64("public_key_b64", &sign.public_key_b64).map_err(V2StoreError::Invalid)?;
         let derived = super::identity::derive_agent_id_hex(&public_key);
         if derived != sign.agent_id {
             return Err(V2StoreError::SignerMismatch(format!(
@@ -460,7 +464,12 @@ impl V2StoreManager {
     /// claim: `SHA-256(author:seq:lamport:issue:claim)`. Uniqueness follows
     /// from the strictly increasing `author_seq` in the author's chain.
     #[must_use]
-    pub fn derive_claim_nonce(author: &str, author_seq: u64, lamport: u64, issue_id: &str) -> String {
+    pub fn derive_claim_nonce(
+        author: &str,
+        author_seq: u64,
+        lamport: u64,
+        issue_id: &str,
+    ) -> String {
         sha256_hex(format!("{author}:{author_seq}:{lamport}:{issue_id}:claim").as_bytes())
     }
 
