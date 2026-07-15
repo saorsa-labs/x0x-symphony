@@ -437,6 +437,34 @@ admission bindings each violated; TTL explicitly NOT a fold input; denial
 masking; non-winner consume losing + winner effective; duplicate consumes →
 deterministic first-in-fold-order winner with the loser flagged, shuffled
 order agreeing; consume of an unknown approval losing).
+WP-B2: `tests/v2_tracker.rs` drives the REAL `Tracker` trait over an
+in-memory double implementing both API surfaces — v2 happy path
+(open→claim→handoff→complete), block/requeue C6 gating, deterministic
+claim-race loser errors, the v1 approval-bridge round-trip, and
+consume-then-confirm failing closed under a staged divergent-claim heal —
+plus parity scenarios written once against `&dyn Tracker` and executed on
+BOTH the v1 and v2 trackers.
+
+WP-C: `tests/v2_two_daemon_race.rs` is the LIVE harness — it spawns two
+isolated loopback x0xd daemons (`X0XD_TEST_BINARY` or PATH,
+`--no-hard-coded-bootstrap`, `[update] enabled=false`, ephemeral ports)
+and proves, per scenario: (i) the v1 RMW blob loses records under the
+concurrent approval/consume interleave (the documented defect); (ii) the
+same interleave on v2 loses nothing — exactly-once effective consume,
+duplicate surfaced in `losing_consumes` on both daemons; (iii) hostile
+un-park (fence-violating release, C6-violating requeue) and forged
+authorship are rejected everywhere while the issue stays blocked;
+(iv) divergent claims raced inside the gossip window heal to one
+deterministic winner on both daemons, and author equivocation surfaces
+`ForkEvidence` everywhere; (v) crash-after-consume keeps the approval
+spent across a SIGKILL/restart and recovers via re-approval, exactly once
+per approval; (vi) genesis-less v2 lists are refused with no v1 fallback
+and the `append_only` policy gate refuses loudly in both directions.
+`X0X_V2_APPEND_ONLY=1` switches the harness from the interim
+`SignedFallback` mode to the full `AppendOnly` matrix (adds the WP-X REST
+contract assertions: reported policy + PUT-to-existing refusal); run via
+`just test-v2-race`.
+
 `tests/v2_gate.rs` drives `V2ApprovalGate` over an in-memory daemon double
 that honors the append-only contract and can release "concurrently
 arriving" peer records after the local consume write: happy path exactly

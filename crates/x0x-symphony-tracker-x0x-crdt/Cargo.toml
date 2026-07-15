@@ -29,7 +29,7 @@ x0x-symphony-core = { path = "../x0x-symphony-core", version = "0.1.0" }
 x0x-symphony-signing = { path = "../x0x-symphony-signing", version = "0.1.0" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true
