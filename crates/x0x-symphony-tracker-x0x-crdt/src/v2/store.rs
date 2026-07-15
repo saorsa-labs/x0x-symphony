@@ -30,11 +30,11 @@ use reqwest::StatusCode;
 use x0x_symphony_signing::{SigningClient, SigningError};
 
 use super::events::{
-    approval_key, consume_key, event_key, event_store_topic, heartbeat_store_topic,
+    approval_key, consume_key, event_key, event_store_topic, handoff_key, heartbeat_store_topic,
     ApprovalEventV2, ConsumeEventV2, EventEnvelope, GenesisManifestV2, GenesisPolicy,
-    RosterEventV2, TransitionEventV2, APPROVAL_CONTEXT_V2, BOOTSTRAP_CONTEXT_V2, CARD_SELF_KEY,
-    CONSUME_CONTEXT_V2, GENESIS_CONTEXT_V2, GENESIS_KEY, ROSTER_CONTEXT_V2, TRANSITION_CONTEXT_V2,
-    V2_SCHEMA,
+    HandoffEventV2, RosterEventV2, TransitionEventV2, APPROVAL_CONTEXT_V2, BOOTSTRAP_CONTEXT_V2,
+    CARD_SELF_KEY, CONSUME_CONTEXT_V2, GENESIS_CONTEXT_V2, GENESIS_KEY, HANDOFF_CONTEXT_V2,
+    ROSTER_CONTEXT_V2, TRANSITION_CONTEXT_V2, V2_SCHEMA,
 };
 use super::fold::{AuthorStream, FoldInput, StoreRecord};
 use super::identity::decode_b64;
@@ -645,6 +645,55 @@ impl V2StoreManager {
         Ok(hash)
     }
 
+    /// Sign an [`ApprovalPayloadV2`]-shaped payload under
+    /// [`APPROVAL_CONTEXT_V2`] and return the envelope, WITHOUT storing it —
+    /// used to build the embedded C6 requeue justification (WP-B2).
+    ///
+    /// # Errors
+    ///
+    /// Returns signing errors and [`V2StoreError::SignerMismatch`].
+    pub async fn sign_approval_payload(
+        &self,
+        own: &OwnEventStore,
+        payload: &[u8],
+    ) -> Result<EventEnvelope> {
+        self.sign_envelope(own, APPROVAL_CONTEXT_V2, payload).await
+    }
+
+    /// Sign and append a WP-B2 handoff to the local author's store at
+    /// `ho-<issue-id>-<event-hash>`. Returns the payload hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V2StoreError::Invalid`] when the event does not name this
+    /// store's author/list, plus signing/client errors.
+    pub async fn append_handoff(
+        &self,
+        own: &OwnEventStore,
+        event: &HandoffEventV2,
+    ) -> Result<String> {
+        if event.actor != own.agent_id {
+            return Err(V2StoreError::Invalid(format!(
+                "handoff actor {} is not the local author {}",
+                event.actor, own.agent_id
+            )));
+        }
+        if event.list_uuid != own.list_uuid {
+            return Err(V2StoreError::Invalid(format!(
+                "handoff names list {} but this store serves {}",
+                event.list_uuid, own.list_uuid
+            )));
+        }
+        let payload = event.to_signed_bytes().map_err(V2StoreError::Invalid)?;
+        let hash = sha256_hex(&payload);
+        let envelope = self
+            .sign_envelope(own, HANDOFF_CONTEXT_V2, &payload)
+            .await?;
+        let key = handoff_key(&event.issue_id, &hash);
+        self.put_once(&own.topic, &key, &envelope).await?;
+        Ok(hash)
+    }
+
     /// Derive a deterministic, per-claim-unique fencing nonce for a new
     /// claim: `SHA-256(author:seq:lamport:issue:claim)`. Uniqueness follows
     /// from the strictly increasing `author_seq` in the author's chain.
@@ -772,6 +821,39 @@ impl V2StoreManager {
             .put_kv(&topic, &key, heartbeat_at.as_bytes(), "text/plain")
             .await?;
         Ok(())
+    }
+
+    /// Best-effort read of `author`'s heartbeat for `issue_id` from their
+    /// mutable heartbeat companion store. Returns `None` on any failure —
+    /// heartbeats are non-authoritative liveness hints, never fold inputs.
+    pub async fn read_heartbeat(
+        &self,
+        list_uuid: &str,
+        author_agent_id: &str,
+        issue_id: &str,
+    ) -> Option<String> {
+        let topic = heartbeat_store_topic(list_uuid, author_agent_id);
+        let key = format!("hb-{issue_id}");
+        match self.api.get_kv(&topic, &key).await {
+            Ok(Some(KvValue { value, .. })) => String::from_utf8(value).ok(),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// Best-effort join of `author`'s heartbeat companion store so future
+    /// [`Self::read_heartbeat`] calls can see it. 409 (already joined) is
+    /// success; other failures are reported but callers may ignore them.
+    ///
+    /// # Errors
+    ///
+    /// Returns client errors other than 409.
+    pub async fn join_peer_heartbeats(&self, list_uuid: &str, peer_agent_id: &str) -> Result<()> {
+        let topic = heartbeat_store_topic(list_uuid, peer_agent_id);
+        match self.api.join_kv_store(&topic, peer_agent_id).await {
+            Ok(()) => Ok(()),
+            Err(ClientError::Http { status, .. }) if status == StatusCode::CONFLICT => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

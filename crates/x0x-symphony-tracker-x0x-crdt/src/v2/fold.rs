@@ -25,12 +25,13 @@ use serde::{Deserialize, Serialize};
 
 use super::events::{
     ApprovalEventV2, ApprovalPayloadV2, ApprovalVerdictV2, BlockReason, ConsumeEventV2,
-    EventEnvelope, GenesisManifestV2, RosterEventV2, TransitionEventV2, TransitionKind,
-    APPROVAL_CONTEXT_V2, APPROVAL_KEY_PREFIX, CARD_SELF_KEY, CONSUME_CONTEXT_V2,
-    CONSUME_KEY_PREFIX, EVENT_KEY_PREFIX, GENESIS_CONTEXT_V2, GENESIS_KEY, ROSTER_CONTEXT_V2,
-    ROSTER_KEY_PREFIX, TRANSITION_CONTEXT_V2, V2_SCHEMA,
+    EventEnvelope, GenesisManifestV2, HandoffEventV2, RosterEventV2, TransitionEventV2,
+    TransitionKind, APPROVAL_CONTEXT_V2, APPROVAL_KEY_PREFIX, CARD_SELF_KEY, CONSUME_CONTEXT_V2,
+    CONSUME_KEY_PREFIX, EVENT_KEY_PREFIX, GENESIS_CONTEXT_V2, GENESIS_KEY, HANDOFF_CONTEXT_V2,
+    HANDOFF_KEY_PREFIX, ROSTER_CONTEXT_V2, ROSTER_KEY_PREFIX, TRANSITION_CONTEXT_V2, V2_SCHEMA,
 };
 use super::identity::derive_agent_id_hex;
+use x0x_symphony_core::sha256_hex;
 
 /// Admission cap on lamport future-dating: an event whose lamport exceeds the
 /// running admitted maximum by more than this constant is inadmissible
@@ -209,9 +210,22 @@ pub struct FoldOutput {
     /// Diagnostics: consume attempts that lost (duplicate, unfenced, or
     /// referencing an unknown approval), in fold order.
     pub losing_consumes: Vec<ConsumeDiagnostic>,
+    /// Recorded handoffs (WP-B2), keyed by issue id, in fold order. A
+    /// handoff is recorded only when fenced by the fold-winning claim at
+    /// its fold position; it never changes issue status.
+    pub handoffs: BTreeMap<String, Vec<HandoffRecordV2>>,
     /// Per-author chain tips over the ADMITTED set: highest `author_seq` and
     /// that event's hash. Appenders use [`FoldOutput::next_chain_link`].
     pub author_chain_tips: BTreeMap<String, ChainTipV2>,
+}
+
+/// A recorded (fold-fenced) handoff (WP-B2).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HandoffRecordV2 {
+    /// Payload hash of the handoff event.
+    pub event_hash: String,
+    /// The handoff payload.
+    pub handoff: HandoffEventV2,
 }
 
 /// Tip of one author's admitted hash chain.
@@ -307,6 +321,7 @@ enum ChainedPayload {
     Transition(TransitionEventV2),
     Approval(ApprovalEventV2),
     Consume(ConsumeEventV2),
+    Handoff(HandoffEventV2),
 }
 
 /// An admitted chained candidate flowing from phase 1 to phase 2. Common
@@ -449,6 +464,7 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
     let mut approvals: BTreeMap<String, AdmittedApprovalV2> = BTreeMap::new();
     let mut effective_consumes: BTreeMap<String, EffectiveConsumeV2> = BTreeMap::new();
     let mut losing_consumes: Vec<ConsumeDiagnostic> = Vec::new();
+    let mut handoffs: BTreeMap<String, Vec<HandoffRecordV2>> = BTreeMap::new();
     for adm in &ordered {
         match &adm.payload {
             ChainedPayload::Transition(event) => {
@@ -492,6 +508,25 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
                     }),
                 }
             }
+            ChainedPayload::Handoff(handoff) => {
+                // WP-B2: a handoff is recorded only when fenced by the
+                // fold-winning claim at this position; it never changes
+                // issue status.
+                match handoff_fence(&issues, handoff) {
+                    Ok(()) => handoffs.entry(handoff.issue_id.clone()).or_default().push(
+                        HandoffRecordV2 {
+                            event_hash: adm.event_hash.clone(),
+                            handoff: handoff.clone(),
+                        },
+                    ),
+                    Err(reason) => rejections.push(Rejection {
+                        author: adm.author.clone(),
+                        key: adm.key.clone(),
+                        phase: RejectionPhase::StateMachine,
+                        reason,
+                    }),
+                }
+            }
         }
     }
 
@@ -512,8 +547,26 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
         approvals,
         effective_consumes,
         losing_consumes,
+        handoffs,
         author_chain_tips,
     })
+}
+
+/// Phase 2 (WP-B2): a handoff is recorded iff its issue is Claimed at this
+/// fold position and the handoff's actor/nonce/claim-hash all fence.
+fn handoff_fence(
+    issues: &BTreeMap<String, IssueStateV2>,
+    handoff: &HandoffEventV2,
+) -> Result<(), String> {
+    let Some(issue) = issues.get(&handoff.issue_id) else {
+        return Err("handoff on an issue that does not exist".to_owned());
+    };
+    check_claim_fence(
+        issue,
+        &handoff.actor,
+        &handoff.claim_nonce,
+        &handoff.claimed_event_hash,
+    )
 }
 
 /// Merge and canonicalize input streams by owner; sort records by key.
@@ -745,6 +798,7 @@ fn event_records(stream: &AuthorStream) -> impl Iterator<Item = &StoreRecord> {
         r.key.starts_with(EVENT_KEY_PREFIX)
             || r.key.starts_with(APPROVAL_KEY_PREFIX)
             || r.key.starts_with(CONSUME_KEY_PREFIX)
+            || r.key.starts_with(HANDOFF_KEY_PREFIX)
     })
 }
 
@@ -841,9 +895,56 @@ fn admit_event(
         admit_approval(record, owner, card, list_uuid, genesis_hash, rosters)
     } else if record.key.starts_with(CONSUME_KEY_PREFIX) {
         admit_consume(record, owner, card, list_uuid, genesis_hash, rosters)
+    } else if record.key.starts_with(HANDOFF_KEY_PREFIX) {
+        admit_handoff(record, owner, card, list_uuid, genesis_hash, rosters)
     } else {
         Err("not a chained record".to_owned())
     }
+}
+
+/// Admit a WP-B2 handoff: envelope under [`HANDOFF_CONTEXT_V2`], four-way
+/// binding, C8 bindings, roster-at-epoch. The claim fence is phase-2 (it
+/// depends on issue state at the handoff's fold position).
+fn admit_handoff(
+    record: &StoreRecord,
+    owner: &str,
+    card: &[u8],
+    list_uuid: &str,
+    genesis_hash: &str,
+    rosters: &[BTreeSet<String>],
+) -> Result<Admitted, String> {
+    let envelope = EventEnvelope::decode(&record.value)?;
+    let (payload, event_hash) = envelope.verify(HANDOFF_CONTEXT_V2)?;
+    check_envelope_key(&envelope, owner, card)?;
+    let event = HandoffEventV2::decode(&payload)?;
+    if event.kind != "handoff" {
+        return Err(format!("handoff record kind {} != handoff", event.kind));
+    }
+    let expected_key = super::events::handoff_key(&event.issue_id, &event_hash);
+    check_chained_common(
+        &ChainedBindings {
+            record_key: &record.key,
+            expected_key: &expected_key,
+            schema: event.schema,
+            event_list_uuid: &event.list_uuid,
+            event_genesis: &event.genesis_manifest_hash,
+            roster_epoch: event.roster_epoch,
+            actor: &event.actor,
+        },
+        owner,
+        list_uuid,
+        genesis_hash,
+        rosters,
+    )?;
+    Ok(Admitted {
+        author: owner.to_owned(),
+        key: record.key.clone(),
+        event_hash,
+        lamport: event.lamport,
+        author_seq: event.author_seq,
+        prev_own_event_hash: event.prev_own_event_hash.clone(),
+        payload: ChainedPayload::Handoff(event),
+    })
 }
 
 /// Admit a WP-B dispatch approval: envelope under [`APPROVAL_CONTEXT_V2`],
@@ -974,6 +1075,23 @@ fn admit_transition(
         genesis_hash,
         rosters,
     )?;
+
+    // WP-B2: Open content bindings — the v1-provenance-parity digests must
+    // match the carried content exactly.
+    if let TransitionKind::Open {
+        title,
+        spec,
+        title_sha256,
+        spec_sha256,
+    } = &event.kind
+    {
+        if *title_sha256 != sha256_hex(title.as_bytes()) {
+            return Err("open title_sha256 does not match the carried title".to_owned());
+        }
+        if *spec_sha256 != sha256_hex(spec.as_bytes()) {
+            return Err("open spec_sha256 does not match the carried spec".to_owned());
+        }
+    }
 
     // C6: requeue justification is verified at admission.
     if let TransitionKind::Requeue { justification } = &event.kind {
@@ -1250,7 +1368,7 @@ fn apply_transition(
     event: &TransitionEventV2,
 ) -> Result<(), String> {
     match &event.kind {
-        TransitionKind::Open { title, spec } => {
+        TransitionKind::Open { title, spec, .. } => {
             if issues.contains_key(&event.issue_id) {
                 return Err("issue already exists".to_owned());
             }

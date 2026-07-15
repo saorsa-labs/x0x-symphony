@@ -117,6 +117,10 @@ pub struct TrackerConfig {
     pub active_states: Vec<String>,
     /// Terminal states used for blocker resolution.
     pub terminal_states: Vec<String>,
+    /// v2 event-store policy for `symphony2:` lists: `append_only`
+    /// (default, requires x0x >= 0.33.0) or `signed` (interim fallback,
+    /// weaker guarantees). Ignored for v1 lists.
+    pub v2_store_policy: Option<String>,
 }
 
 /// Poll-loop configuration.
@@ -447,12 +451,21 @@ fn parse_tracker(root: &Map<String, Value>, problems: &mut Vec<String>) -> Optio
     if list_id.is_none() {
         problems.push("missing required key `tracker.list_id`".to_owned());
     }
+    let v2_store_policy = optional_non_empty_string(tracker, "tracker.v2_store_policy", problems);
+    if let Some(policy) = &v2_store_policy {
+        if !matches!(policy.as_str(), "append_only" | "signed") {
+            problems.push(format!(
+                "tracker.v2_store_policy must be `append_only` or `signed` (got `{policy}`)"
+            ));
+        }
+    }
     Some(TrackerConfig {
         kind,
         list_id: list_id?,
         group,
         active_states,
         terminal_states,
+        v2_store_policy,
     })
 }
 

@@ -306,10 +306,7 @@ impl GateWorld {
             lamport: 1,
             author_seq: 1,
             prev_own_event_hash: genesis_hash.clone(),
-            kind: TransitionKind::Open {
-                title: "t".to_owned(),
-                spec: "s".to_owned(),
-            },
+            kind: TransitionKind::open("t".to_owned(), "s".to_owned()),
         };
         let open_payload = open.to_signed_bytes().map_err(err)?;
         let open_hash = sha256_hex(&open_payload);
@@ -379,6 +376,7 @@ impl GateWorld {
             verdict,
             entropy: format!("approver-entropy-{}", self.approver_seq),
             approved_at,
+            v1_record_json: String::new(),
         }
     }
 
@@ -518,6 +516,7 @@ async fn competing_consume_after_partition_heal_aborts_without_executing() -> Te
         claim_nonce: "nonce-comp".to_owned(),
         claimed_event_hash: comp_claim_hash.clone(),
         entropy: "comp-entropy".to_owned(),
+        v1_record_json: String::new(),
     };
     let consume_payload = comp_consume.to_signed_bytes().map_err(err)?;
     let comp_consume_hash = sha256_hex(&consume_payload);

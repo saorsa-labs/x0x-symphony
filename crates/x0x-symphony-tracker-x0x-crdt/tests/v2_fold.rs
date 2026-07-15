@@ -175,6 +175,7 @@ impl Chain<'_> {
             verdict,
             entropy: format!("entropy-{}", self.seq),
             approved_at,
+            v1_record_json: String::new(),
         };
         let payload = event.to_signed_bytes().map_err(err)?;
         let hash = sha256_hex(&payload);
@@ -214,6 +215,7 @@ impl Chain<'_> {
             claim_nonce: claim_nonce.to_owned(),
             claimed_event_hash: claimed_event_hash.to_owned(),
             entropy: format!("entropy-{}", self.seq),
+            v1_record_json: String::new(),
         };
         let payload = event.to_signed_bytes().map_err(err)?;
         let hash = sha256_hex(&payload);
@@ -364,10 +366,7 @@ fn event_signed_by_wrong_key_is_rejected() -> TestResult {
         lamport: 1,
         author_seq: 1,
         prev_own_event_hash: fixture.genesis_hash.clone(),
-        kind: TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        kind: TransitionKind::open("t".to_owned(), "s".to_owned()),
     };
     let payload = event.to_signed_bytes().map_err(err)?;
     let hash = sha256_hex(&payload);
@@ -398,10 +397,7 @@ fn event_in_wrong_store_is_rejected() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let out = fold(
         &fixture,
@@ -431,10 +427,7 @@ fn actor_field_mismatch_is_rejected() -> TestResult {
         lamport: 1,
         author_seq: 1,
         prev_own_event_hash: fixture.genesis_hash.clone(),
-        kind: TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        kind: TransitionKind::open("t".to_owned(), "s".to_owned()),
     };
     let payload = event.to_signed_bytes().map_err(err)?;
     let hash = sha256_hex(&payload);
@@ -462,10 +455,7 @@ fn missing_or_mismatched_card_self_rejects_stream() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
 
     // No card-self at all.
@@ -515,10 +505,7 @@ fn non_roster_author_is_rejected() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let out = fold(
         &fixture,
@@ -561,29 +548,20 @@ fn roster_update_admits_new_member_at_new_epoch_only() -> TestResult {
         1,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     // Same author, epoch 0 (b was not a member then) and epoch 7 (unknown).
     let (_, bad_epoch0) = chain_b.next(
         0,
         "i2",
         2,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let (_, bad_epoch7) = chain_b.next(
         7,
         "i3",
         3,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
 
     let out = fold(
@@ -613,10 +591,7 @@ fn author_chain_gap_rejects_from_gap() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let (_, _skipped) = chain.next(
         0,
@@ -658,10 +633,7 @@ fn author_chain_fork_surfaces_evidence_and_rejects_from_fork() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     // Two conflicting seq-2 events (a fork of b's own history).
     let saved_seq = chain.seq;
@@ -723,10 +695,7 @@ fn lamport_future_dating_is_capped() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     // 65 == 1 + LAMPORT_MAX_SKEW: exactly at the boundary, admitted.
     let (_, r2) = chain.next(
@@ -742,10 +711,7 @@ fn lamport_future_dating_is_capped() -> TestResult {
         0,
         "i2",
         1_000_000,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let out = fold(
         &fixture,
@@ -793,10 +759,7 @@ fn cross_list_replay_of_byte_identical_event_is_rejected() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
 
     // Replayed byte-identically into list 2: genesis binding must reject it.
@@ -834,10 +797,7 @@ fn record_stored_under_wrong_key_is_rejected() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     record.key = event_key("i1", &"0".repeat(64));
     let out = fold(
@@ -867,10 +827,7 @@ fn concurrent_claims_pick_deterministic_winner_in_both_orders() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     // Same lamport, different authors: winner = smaller (author, hash).
     let mut chain_b = Chain::new(&b, &fixture);
@@ -926,10 +883,7 @@ fn stale_claimants_release_is_ineffective() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let (winning_claim_hash, r_claim_a) = chain_a.next(
         0,
@@ -1008,10 +962,7 @@ fn requeue_scenario(list: &str) -> TestResult<RequeueScenario> {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let mut chain_w = Chain::new(&worker, &fixture);
     let claim_nonce = "nonce-w".to_owned();
@@ -1288,10 +1239,7 @@ fn non_approval_blocks_are_never_requeueable() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let mut chain_w = Chain::new(&worker, &fixture);
     let (claim_hash, r_claim) = chain_w.next(
@@ -1447,10 +1395,7 @@ fn release_reopens_and_allows_reclaim_by_other_author() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let (claim_hash, r_claim) = chain_a.next(
         0,
@@ -1526,19 +1471,13 @@ fn fold_is_order_independent_under_random_shuffles() -> TestResult {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t1".to_owned(),
-            spec: "s1".to_owned(),
-        },
+        TransitionKind::open("t1".to_owned(), "s1".to_owned()),
     )?;
     let (_, r2) = chain_a.next(
         0,
         "i2",
         2,
-        TransitionKind::Open {
-            title: "t2".to_owned(),
-            spec: "s2".to_owned(),
-        },
+        TransitionKind::open("t2".to_owned(), "s2".to_owned()),
     )?;
     let mut chain_b = Chain::new(&b, &fixture);
     let (hb, r3) = chain_b.next(
@@ -1650,10 +1589,7 @@ fn lamport_rejected_events_do_not_widen_the_horizon_for_others() -> TestResult {
         0,
         "i1",
         200,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let (_, r_low_second) = chain_a.next(
         0,
@@ -1668,10 +1604,7 @@ fn lamport_rejected_events_do_not_widen_the_horizon_for_others() -> TestResult {
         0,
         "i2",
         120,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
 
     let base_streams = vec![
@@ -1723,20 +1656,14 @@ fn cross_author_future_dating_rejects_both_authors() -> TestResult {
         0,
         "i1",
         100,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let mut chain_b = Chain::new(&b, &fixture);
     let (_, r_b) = chain_b.next(
         0,
         "i2",
         200,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
 
     let out = fold(
@@ -1787,10 +1714,7 @@ fn wpb_scenario(list: &str) -> TestResult<WpbScenario> {
         0,
         "i1",
         1,
-        TransitionKind::Open {
-            title: "t".to_owned(),
-            spec: "s".to_owned(),
-        },
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
     )?;
     let mut chain_w = Chain::new(&worker, &fixture);
     let claim_nonce = "nonce-w".to_owned();
@@ -1895,6 +1819,7 @@ fn approval_admission_bindings_each_violated() -> TestResult {
         verdict: ApprovalVerdictV2::Approve,
         entropy: "e".to_owned(),
         approved_at: 100,
+        v1_record_json: String::new(),
     };
     let payload = bad_kind.to_signed_bytes().map_err(err)?;
     let hash = sha256_hex(&payload);

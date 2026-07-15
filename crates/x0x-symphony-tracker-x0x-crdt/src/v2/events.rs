@@ -47,6 +47,9 @@ pub const BOOTSTRAP_CONTEXT_V2: &str = "x0x-symphony-bootstrap-v2";
 /// `x0x-symphony-approval-consumed-v1`).
 pub const CONSUME_CONTEXT_V2: &str = "x0x-symphony-consume-v2";
 
+/// Domain-separation context for v2 handoff records (WP-B2).
+pub const HANDOFF_CONTEXT_V2: &str = "x0x-symphony-handoff-v2";
+
 /// Prefix marking a v2 list reference (disjoint namespace, design r2 Q5).
 pub const V2_LIST_REF_PREFIX: &str = "symphony2:";
 
@@ -67,6 +70,9 @@ pub const APPROVAL_KEY_PREFIX: &str = "ap-";
 
 /// Key prefix for consumption events.
 pub const CONSUME_KEY_PREFIX: &str = "cs-";
+
+/// Key prefix for handoff events (WP-B2).
+pub const HANDOFF_KEY_PREFIX: &str = "ho-";
 
 /// Return the per-author event-store topic for `(list_uuid, agent_id)`.
 ///
@@ -109,6 +115,12 @@ pub fn approval_key(issue_id: &str, event_hash_hex: &str) -> String {
 #[must_use]
 pub fn consume_key(issue_id: &str, event_hash_hex: &str) -> String {
     format!("{CONSUME_KEY_PREFIX}{issue_id}-{event_hash_hex}")
+}
+
+/// Return the KV key for a handoff event: `ho-<issue-id>-<event-hash>`.
+#[must_use]
+pub fn handoff_key(issue_id: &str, event_hash_hex: &str) -> String {
+    format!("{HANDOFF_KEY_PREFIX}{issue_id}-{event_hash_hex}")
 }
 
 /// Validate a v2 list uuid: lowercase `[a-z0-9-]`, 1..=64 chars.
@@ -419,6 +431,12 @@ pub enum TransitionKind {
         title: String,
         /// Issue body/spec.
         spec: String,
+        /// `SHA-256(title)`, lowercase hex — the digest v1 issue-creation
+        /// provenance signed, kept so v1/v2 cross-checking stays
+        /// digest-for-digest (WP-B2). Verified at admission.
+        title_sha256: String,
+        /// `SHA-256(spec)`, lowercase hex. Verified at admission.
+        spec_sha256: String,
     },
     /// Claim an issue for exclusive work.
     Claim {
@@ -457,6 +475,23 @@ pub enum TransitionKind {
 }
 
 impl TransitionKind {
+    /// Build an `Open` with its WP-B2 content bindings computed from the
+    /// carried content (`title_sha256`/`spec_sha256` — the digests v1
+    /// issue-creation provenance signed).
+    #[must_use]
+    pub fn open(title: impl Into<String>, spec: impl Into<String>) -> Self {
+        let title = title.into();
+        let spec = spec.into();
+        let title_sha256 = sha256_hex(title.as_bytes());
+        let spec_sha256 = sha256_hex(spec.as_bytes());
+        Self::Open {
+            title,
+            spec,
+            title_sha256,
+            spec_sha256,
+        }
+    }
+
     /// Stable lowercase name of this kind (matches the serde tag).
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -573,6 +608,13 @@ pub struct ApprovalEventV2 {
     pub entropy: String,
     /// Approval time (seconds since epoch); gate-time TTL input only.
     pub approved_at: u64,
+    /// v1-interop carrier (WP-B2): the verbatim v1 `ApprovalEvent` JSON
+    /// (including its v1 signature envelope) when this record was written
+    /// through the v1 `Tracker::store_approval` bridge. Opaque to the fold
+    /// — NEVER a fold input — but integrity-covered by this record's own
+    /// signature. Empty = absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub v1_record_json: String,
 }
 
 impl ApprovalEventV2 {
@@ -636,6 +678,12 @@ pub struct ConsumeEventV2 {
     pub claimed_event_hash: String,
     /// Uniqueness entropy.
     pub entropy: String,
+    /// v1-interop carrier (WP-B2): the verbatim v1 `ApprovalConsumed` JSON
+    /// (with its mandatory v1 signature envelope) when written through the
+    /// v1 `Tracker::store_consumed` bridge. Opaque to the fold. Empty =
+    /// absent (e.g. gate-minted consumes).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub v1_record_json: String,
 }
 
 impl ConsumeEventV2 {
@@ -655,6 +703,84 @@ impl ConsumeEventV2 {
     /// Returns a serialization error message (unreachable for plain data).
     pub fn to_signed_bytes(&self) -> Result<Vec<u8>, String> {
         serde_json::to_vec(self).map_err(|e| format!("consume encode failed: {e}"))
+    }
+}
+
+/// One validation entry of a v2 handoff — the semantic triple v1's
+/// `ValidationResult` carries (command, status, exit code), flattened to
+/// plain data so the signed v2 wire shape does not depend on v1 serde.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HandoffValidationV2 {
+    /// Command or check that ran.
+    pub command: String,
+    /// Status string (v1 `ValidationStatus` `snake_case` spelling).
+    pub status: String,
+    /// Process exit code when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+/// WP-B2 handoff record, signed under [`HANDOFF_CONTEXT_V2`] and stored at
+/// [`handoff_key`] in the AUTHOR's own event store. Participates in the
+/// author's per-author hash chain. Carries the v1 handoff payload's semantic
+/// fields plus full C8 bindings and the claim fence it was produced under.
+/// A handoff never changes issue status — the `complete` transition does.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HandoffEventV2 {
+    /// Always [`V2_SCHEMA`].
+    pub schema: u32,
+    /// Record discriminator; always `"handoff"`.
+    pub kind: String,
+    /// List uuid binding (C8).
+    pub list_uuid: String,
+    /// Genesis manifest hash binding (C8).
+    pub genesis_manifest_hash: String,
+    /// Roster epoch the author claims membership at.
+    pub roster_epoch: u64,
+    /// Issue the handoff belongs to.
+    pub issue_id: String,
+    /// Author agent id; must satisfy the four-way author binding.
+    pub actor: String,
+    /// Lamport timestamp (global fold ordering).
+    pub lamport: u64,
+    /// Per-author chain sequence (shared numbering with transitions).
+    pub author_seq: u64,
+    /// Previous own-event hash in the author's chain.
+    pub prev_own_event_hash: String,
+    /// Fencing nonce of the author's fold-winning claim.
+    pub claim_nonce: String,
+    /// Payload hash of the author's fold-winning claim event.
+    pub claimed_event_hash: String,
+    /// Handoff summary (v1 semantic field).
+    pub summary: String,
+    /// Files changed (v1 semantic field).
+    pub files_changed: Vec<String>,
+    /// Validation results (v1 semantic field, flattened).
+    pub validation: Vec<HandoffValidationV2>,
+    /// Follow-up items (v1 semantic field).
+    pub follow_up: Vec<String>,
+    /// Proofs directory (v1 semantic field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proofs_dir: Option<String>,
+}
+
+impl HandoffEventV2 {
+    /// Decode from exact signed bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptive reason when the bytes do not parse.
+    pub fn decode(payload: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(payload).map_err(|e| format!("handoff decode failed: {e}"))
+    }
+
+    /// Serialize to the exact bytes to be signed and stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error message (unreachable for plain data).
+    pub fn to_signed_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|e| format!("handoff encode failed: {e}"))
     }
 }
 

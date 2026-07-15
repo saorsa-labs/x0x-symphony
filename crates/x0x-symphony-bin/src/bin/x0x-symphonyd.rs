@@ -234,14 +234,18 @@ fn build_tracker(
     signing_client: Arc<X0xdClient>,
     worker_view: Arc<dyn WorkerViewProvider>,
 ) -> anyhow::Result<Arc<X0xCrdtTracker>> {
-    // Downgrade defense (tracker-integrity v2, design r2 Q5): a
-    // `symphony2:`-prefixed list reference addresses the v2 event-store
-    // namespace and must NEVER be silently treated as a v1 TaskList topic.
-    // The v2 dispatch path (WP-B fold + gate, `x0x_symphony_tracker_x0x_crdt::v2`)
-    // is not wired into the daemon yet, so refuse loudly instead.
-    if x0x_symphony_tracker_x0x_crdt::v2::V2ListRef::is_v2_namespace(&workflow.tracker.list_id) {
+    // Tracker-integrity v2 routing (design r2 Q5 + WP-B2): a `symphony2:`
+    // list id builds the v2 engine inside `X0xCrdtTracker`; every trait
+    // call delegates to the fold-backed v2 path. A v2-prefixed reference
+    // that fails to parse, or a v2 list without required signing, is
+    // REFUSED at build time — never silently treated as a v1 TaskList.
+    let is_v2 =
+        x0x_symphony_tracker_x0x_crdt::v2::V2ListRef::is_v2_namespace(&workflow.tracker.list_id);
+    if is_v2 && workflow.signing.policy != SigningPolicy::Required {
         anyhow::bail!(
-            "tracker.list_id {} addresses the tracker-integrity v2 namespace;              v2 dispatch wiring is not yet enabled in x0x-symphonyd              (x0x-symphony#10 WP-B) — refusing rather than downgrading to v1",
+            "tracker.list_id {} addresses the tracker-integrity v2 namespace, which \
+             requires signing.policy = \"required\" (every v2 mutation is an \
+             ML-DSA-signed chained event)",
             workflow.tracker.list_id
         );
     }
@@ -254,6 +258,18 @@ fn build_tracker(
     .replication_factor(workflow.sharding.replication_factor);
     if let Some(group) = &workflow.tracker.group {
         tracker_builder = tracker_builder.group(group.clone());
+    }
+    if is_v2 {
+        let mode = match workflow.tracker.v2_store_policy.as_deref() {
+            None => x0x_symphony_tracker_x0x_crdt::v2::StorePolicyMode::default(),
+            Some(value) => {
+                x0x_symphony_tracker_x0x_crdt::v2::StorePolicyMode::from_config_value(value)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("tracker.v2_store_policy `{value}` is not a known mode")
+                    })?
+            }
+        };
+        tracker_builder = tracker_builder.v2_store_policy(mode);
     }
     if workflow.signing.policy == SigningPolicy::Required {
         let signing: Arc<dyn SigningClient> = signing_client.clone();

@@ -104,10 +104,7 @@ async fn live_own_store_genesis_and_fold_roundtrip() -> TestResult {
         lamport: 1,
         author_seq: 1,
         prev_own_event_hash: genesis_hash,
-        kind: TransitionKind::Open {
-            title: "live v2 issue".to_owned(),
-            spec: "roundtrip".to_owned(),
-        },
+        kind: TransitionKind::open("live v2 issue".to_owned(), "roundtrip".to_owned()),
     };
     manager.append_transition(&own, &event).await?;
 

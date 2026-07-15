@@ -190,6 +190,9 @@ impl<'m> V2ApprovalGate<'m> {
             entropy: sha256_hex(
                 format!("{}:{author_seq}:{entropy_seed}:consume", own.agent_id).as_bytes(),
             ),
+            // Gate-minted consumes carry no v1 record (spec §2.6: the fold,
+            // not the v1 projection, is the authority on spent approvals).
+            v1_record_json: String::new(),
         };
         let my_consume_hash = self.manager.append_consume(own, &consume).await?;
 
