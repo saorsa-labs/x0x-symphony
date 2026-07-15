@@ -694,8 +694,7 @@ where
         // (off/approve/auto). The exception is cryptographic — it requires
         // *verified* provenance whose signer is this daemon's own agent_id —
         // and can never be claimed through an unauthenticated source field.
-        if let Some(SignatureProvenance::Verified { signer_agent_id }) =
-            &issue.signature_provenance
+        if let Some(SignatureProvenance::Verified { signer_agent_id }) = &issue.signature_provenance
         {
             let signer = signer_agent_id.trim();
             if !signer.is_empty() && signer == self.config.agent_id.as_str() {

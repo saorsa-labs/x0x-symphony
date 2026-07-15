@@ -401,8 +401,9 @@ fn unknown_network_dispatch_policy_aborts_config_load() -> Result<(), Box<dyn Er
 
 #[test]
 fn legacy_network_dispatch_enabled_true_maps_to_approve() -> Result<(), Box<dyn Error>> {
-    let workflow =
-        with_required_signing(&workflow_with_security("  network_dispatch_enabled: true\n"));
+    let workflow = with_required_signing(&workflow_with_security(
+        "  network_dispatch_enabled: true\n",
+    ));
 
     let config = WorkflowConfig::from_markdown(&workflow)?;
 
@@ -448,10 +449,8 @@ fn approve_without_required_signing_aborts_config_load() -> Result<(), Box<dyn E
     let problems = invalid_workflow_problems(&workflow)?;
 
     assert!(
-        problems
-            .iter()
-            .any(|problem| problem
-                .starts_with("security.network_dispatch=approve requires signing.policy=required")),
+        problems.iter().any(|problem| problem
+            .starts_with("security.network_dispatch=approve requires signing.policy=required")),
         "problems were: {problems:?}"
     );
     Ok(())
@@ -459,8 +458,7 @@ fn approve_without_required_signing_aborts_config_load() -> Result<(), Box<dyn E
 
 #[test]
 fn approve_with_required_signing_loads() -> Result<(), Box<dyn Error>> {
-    let workflow =
-        with_required_signing(&workflow_with_security("  network_dispatch: approve\n"));
+    let workflow = with_required_signing(&workflow_with_security("  network_dispatch: approve\n"));
 
     let config = WorkflowConfig::from_markdown(&workflow)?;
 

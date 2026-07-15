@@ -4220,7 +4220,10 @@ async fn self_signed_provenance_dispatches_under_off_policy() -> Result<(), Box<
         trust.calls().is_empty(),
         "trust lookup must be skipped for self-authored provenance"
     );
-    assert!(guard(&tracker.releases).is_empty(), "issue must not be blocked");
+    assert!(
+        guard(&tracker.releases).is_empty(),
+        "issue must not be blocked"
+    );
     Ok(())
 }
 
@@ -4249,7 +4252,10 @@ async fn self_signed_provenance_dispatches_under_approve_without_approval(
         "trust lookup must be skipped for self-authored provenance"
     );
     assert_consumed_count(&tracker, 0);
-    assert!(guard(&tracker.releases).is_empty(), "issue must not be blocked");
+    assert!(
+        guard(&tracker.releases).is_empty(),
+        "issue must not be blocked"
+    );
     Ok(())
 }
 

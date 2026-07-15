@@ -574,7 +574,10 @@ async fn get_pending_includes_blocked_awaiting_approval() -> TestResult {
         "blocked_reason".to_owned(),
         json!({ "code": "retry_exhausted", "message": "runner failed" }),
     );
-    let tracker = Arc::new(InMemoryTracker::new(vec![awaiting.clone(), retry_exhausted]));
+    let tracker = Arc::new(InMemoryTracker::new(vec![
+        awaiting.clone(),
+        retry_exhausted,
+    ]));
     let server = spawn_approval_server(tracker, Some(mock_signing_client())).await?;
     let client = reqwest::Client::new();
 
