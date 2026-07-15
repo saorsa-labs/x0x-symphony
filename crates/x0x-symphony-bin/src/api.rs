@@ -690,15 +690,23 @@ async fn approvals_pending(
             .load_approval_state(&issue.id)
             .await
             .map_err(|error| Error::Tracker(error.to_string()))?;
-        if approval_decision(
+        let decision = approval_decision(
             &approval_state.events,
             &issue,
             &network_signer,
             &now,
             state.approval_ttl,
             &approval_state.consumed,
-        ) == ApprovalDecision::Pending
-        {
+        );
+        // `Approved` while still parked means a prior approval's requeue was
+        // lost (e.g. daemon crash between approval store and requeue). Keep
+        // the issue visible so the operator can approve again — submit_approval
+        // is idempotent in this state and re-runs the requeue. Auto-requeueing
+        // from here is deliberately avoided: this scan does not
+        // cryptographically verify approvals; the dispatch gate does.
+        let surface = decision == ApprovalDecision::Pending
+            || (decision == ApprovalDecision::Approved && is_blocked_awaiting_approval(&issue));
+        if surface {
             pending.push(pending_approval_from_issue(
                 &issue,
                 &network_signer,
@@ -780,7 +788,7 @@ async fn submit_approval(
     // event above is already durable, so a requeue failure is retryable by
     // re-approving (duplicate approve events are harmless).
     if request.verdict == ApprovalVerdict::Approve && is_blocked_awaiting_approval(&issue) {
-        state
+        let requeue_result = state
             .tracker
             .requeue_blocked(
                 &issue_id,
@@ -789,8 +797,22 @@ async fn submit_approval(
                     "approval granted; requeued for dispatch",
                 ),
             )
-            .await
-            .map_err(|error| Error::Tracker(error.to_string()))?;
+            .await;
+        if let Err(error) = requeue_result {
+            // Concurrent approves race on the requeue: exactly one converts
+            // the blocked claim. If another call (or a crash-recovery retry)
+            // already returned the issue to `todo`, this approval is still
+            // fully recorded — treat the request as successful.
+            let refetched = state
+                .tracker
+                .fetch_by_ids(std::slice::from_ref(&issue_id))
+                .await
+                .map_err(|fetch_error| Error::Tracker(fetch_error.to_string()))?;
+            let still_parked = refetched.first().is_none_or(is_blocked_awaiting_approval);
+            if still_parked {
+                return Err(Error::Tracker(error.to_string()));
+            }
+        }
     }
     state.notify_approval(&signed);
     state.notify_task_changed(issue_id.as_str());

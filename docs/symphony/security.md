@@ -111,6 +111,30 @@ validation unless `signing.policy: required`, and an explicit `off` without
 required signing warns at startup (locally created issues would otherwise be
 refused fail-closed).
 
+**Approval consumption is signed and verified — and refuses on doubt.** When
+the gate dispatches an approved task it mints an `ApprovalConsumed` record
+signed through x0xd (ML-DSA-65, `x0x-symphony-approval-consumed-v1` context),
+and it cryptographically re-verifies every stored consumption record before
+trusting it on later evaluations. A consumption record that fails verification
+means the replay-protection state is tampered or forged: the gate refuses to
+dispatch (`invalid_signature` block) rather than guessing in either direction.
+Consumption records may only un-park work in one narrow way: the tracker-level
+`requeue_blocked` transition refuses any blocked issue whose reason is not
+`awaiting_approval`, so approvals can never resurrect security-blocked or
+retry-exhausted work.
+
+**Concurrent multi-node approval is at-least-once, not exactly-once.** The
+approval/consumption store is a per-issue KV blob updated by read-modify-write;
+two nodes that concurrently evaluate the same valid approval (or reunite after
+a partition) can each consume and dispatch once, and a racing write can drop a
+consumption record (see
+[#10](https://github.com/saorsa-labs/x0x-symphony/issues/10)). Within one node,
+dispatch is serialized by the exclusive claim and the approve-requeue path is
+idempotent. The operational guarantee is therefore **at-least-once dispatch
+with convergent deduplication** under concurrent multi-node approval — keep
+runner side effects idempotent, exactly as required for retry semantics
+elsewhere in this pilot.
+
 ---
 
 ## Sandbox profiles (M2/M4)
