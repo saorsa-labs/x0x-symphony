@@ -50,7 +50,7 @@ End-state v1.0 invariants:
 | Issue state                | TaskItem checkbox + LWW metadata register                            |
 | Issue claim                | Signed CRDT claim record with TTL heartbeat                          |
 | Per-issue workspace        | Per-task isolated workspace under runner-controlled root             |
-| Codex app-server runner    | Pluggable runner trait with `shell`, `codex`, `claude_code` impls    |
+| Codex runner (upstream Symphony concept) | Pluggable runner trait with `shell`, `codex`, `claude_code` impls |
 | Tracker polling            | x0xd TaskList polling now; gossip pubsub on TaskList topic later      |
 | Status/logging             | x0xd REST + WebSocket + per-issue `proofs/` artefact tree            |
 | Handoff state              | Signed handoff payload in TaskItem metadata + linked artefact dir    |
