@@ -1,6 +1,7 @@
 # Tracker Integrity v2 — Fold Specification (design r2)
 
-Status: WP-0 + WP-A implemented (`crates/x0x-symphony-tracker-x0x-crdt/src/v2/`).
+Status: WP-0 + WP-A + WP-B + WP-B2 implemented
+(`crates/x0x-symphony-tracker-x0x-crdt/src/v2/`).
 Tracks x0x-symphony issue #10. Incorporates the Codex design review of r1
 (verdict: UNSOUND as specified; findings C1–C8, all resolved below).
 Companion x0x work: WP-X `AccessPolicy::AppendOnly` (x0x v0.33.0, branch
@@ -57,6 +58,20 @@ transitions, so approval/consume history is equivocation-evident too):
 | `ap-<issue-id>-<event-hash>` | `ApprovalEventV2` (kind `dispatch_approval`) | `x0x-symphony-approval-v2` |
 | `cs-<issue-id>-<event-hash>` | `ConsumeEventV2` (kind `consume`) | `x0x-symphony-consume-v2` |
 
+WP-B2 adds one more chained record type (same per-author hash chain and
+`author_seq` numbering):
+
+| Key | Content | Signed context |
+|---|---|---|
+| `ho-<issue-id>-<event-hash>` | `HandoffEventV2` (kind `handoff`) | `x0x-symphony-handoff-v2` |
+
+`HandoffEventV2` carries the v1 handoff payload's semantic fields (`summary`,
+`files_changed`, `validation` command/status/exit-code triples, `follow_up`,
+`proofs_dir`) plus the full C8 binding set (schema, list, genesis, epoch,
+issue) and the claim fence it was produced under (`claim_nonce`,
+`claimed_event_hash`). A handoff never changes issue status — the `complete`
+transition does; the handoff is the work artifact attached to it.
+
 `ApprovalEventV2` binds (C8): schema, list, genesis, epoch, issue,
 `open_event_hash` (the issue's exact content — v2 analogue of v1's
 `content_hash`), verdict (approve/deny), entropy, `approved_at` (gate TTL
@@ -103,6 +118,14 @@ bindings (`claim_nonce`, plus `claimed_event_hash` for post-claim
 transitions), `actor`, `lamport`, `author_seq`, `prev_own_event_hash`.
 An event is admissible only in the exact list+genesis+epoch it names; a
 byte-identical replay anywhere else fails admission.
+
+**Open-event content bindings (WP-B2).** `Open` additionally carries
+`title_sha256` and `spec_sha256` — the same title/description digests v1's
+issue-creation provenance signed — verified at admission
+(`title_sha256 == SHA-256(title)`, `spec_sha256 == SHA-256(spec)`, lowercase
+hex). They are redundant with the signed payload itself; they exist so v1
+provenance records and v2 open events stay cross-checkable digest-for-digest
+without re-serializing either side's payload.
 
 ## 2. The fold
 
@@ -260,6 +283,17 @@ approvals for the issue's current content, minus effective consumes, minus
 everything when an admitted denial covers that content (denials terminal,
 v1 parity). TTL is NOT applied there (C3).
 
+**Handoff ledger (WP-B2).** `ho-*` records pass the same phase-1 admission
+as every chained record (envelope under `x0x-symphony-handoff-v2`, four-way
+author binding, C8 bindings, content-addressed key, roster-at-epoch, chain,
+lamport cap). In the ordered phase-2 walk a handoff is **recorded** for its
+issue iff it is fenced by the fold-winning claim at its fold position
+(`actor == claimant`, `claim_nonce` and `claimed_event_hash` both match) —
+identical fencing to release/block/complete. A non-fencing handoff is a
+phase-2 rejection and attaches to nothing. Recorded handoffs accumulate in
+`FoldOutput.handoffs[issue_id]` in fold order; they never change issue
+status.
+
 ### 2.5 The dispatch gate (WP-B, `v2::gate`)
 
 Consume-then-execute, failing toward zero executions:
@@ -279,6 +313,86 @@ Consume-then-execute, failing toward zero executions:
    recovery = re-approval. Trust (`required_trust`) is deliberately NOT
    checked in the gate — it stays the caller's dispatch-time policy (C2),
    exactly as in the v1 orchestrator flow (checked before the gate).
+
+## 2.6 The v2 Tracker surface (WP-B2)
+
+`v2::tracker::V2Tracker` maps the `x0x_symphony_core::Tracker` trait — the
+exact surface the orchestrator consumes — onto the v2 model. Two invariants
+govern every method: **every mutation is a signed chained event appended to
+the local author's own append-only store** (no new mutable KV keys; the sole
+mutable companion remains the existing `symphony2-hb-*` heartbeat store),
+and **every read is fold output** (no blob reads, no cached state).
+
+Routing: `X0xCrdtTracker` detects a `symphony2:` `list_id` at build time and
+delegates every trait method to an internal `V2Tracker` engine; v1 lists are
+untouched. This replaces the interim bin-boundary refusal. A v2 list
+requires a configured signing client (`signing.policy = "required"`) —
+building a v2 tracker without one fails loudly. Worker cards remain v1
+gossip records (out of WP-B2 scope, unchanged).
+
+| Trait method | v2 mapping |
+|---|---|
+| `create_issue(draft)` | `Open` transition (title/spec + `title_sha256`/`spec_sha256`), issue id = fresh uuid. Also creates the display TaskList item (§2.7). |
+| `list_issues` / `fetch_by_ids` / `fetch_candidates` / `fetch_claimed` | fold → `Issue` projection (below). Candidate filtering/sorting matches v1 (active states, terminal blockers — v2 issues have no blockers — priority then id). |
+| `claim(id, agent)` | requires `agent` == the local author; fold → require `Open` → append `Claim` (nonce from `derive_claim_nonce`) → confirming re-fold: if the fold winner is not our claim, the claim FAILED (deterministic loser, surfaced as an error). |
+| `heartbeat(claim)` | fold-fence check (we hold the winning claim), then `hb-<issue>` write in the mutable heartbeat companion store. Never a fold input. |
+| `release(claim, reason)` | fold-fence → append `Release`. The v1 release `reason` is local diagnostics only (logged), NOT a fold input — except that the orchestrator's `block()` carries it (next row). |
+| `block(claim, reason)` | fold-fence → append `Block` with `reason = AwaitingApproval` when the v1 code is `awaiting_approval`, else `Other{detail}` (never requeue-able, C6). |
+| `handoff(claim, handoff)` | fold-fence → append `HandoffEventV2` (chained) then `Complete` (chained, next seq). Crash between the two leaves a fenced handoff on a still-claimed issue; re-delivery appends a fresh pair (handoffs are append-only artifacts, `Complete` is idempotent-by-fence). |
+| `requeue_blocked(id, reason)` | fold → require `Blocked{AwaitingApproval}` → the LOCAL agent signs an `ApprovalPayloadV2` (kind `"approval"`) binding the current block hash + parked nonce, embeds it as the C6 justification, appends `Requeue`. Any other block reason is refused (v1 parity, and the fold would reject it anyway). |
+| `load_approval_state(id)` | fold ledger read: admitted approvals for the issue → v1 `ApprovalEvent`s, effective consumes → v1 `ApprovalConsumed`s, via the v1-interop carrier (below). |
+| `store_approval(event)` | requires `event.approver_agent_id` == the local author (v2 records are author-signed; a foreign approver's record cannot be minted into our store — that is the point). Appends an `ApprovalEventV2` binding the issue's current `open_event_hash`, carrying the verbatim v1 event in the carrier field. |
+| `store_consumed(event)` | consume-then-confirm through the SAME path as the WP-B gate: fold → require the local fold-winning claim → pick the first unconsumed approval in fold order → append `ConsumeEventV2` (carrying the verbatim v1 record) → re-fold → if our consume is not THE effective consume, return an ERROR (fail closed: the orchestrator does not dispatch). |
+
+**Issue projection.** `IssueStateV2` → `Issue`: `id`/`identifier` =
+issue id, `title`, `description` = spec, states `Open→todo`,
+`Claimed→in_progress`, `Blocked→blocked`, `Done→review` when a recorded
+handoff exists else `done` (v1 parity: a completed issue with a handoff
+reads as `review`). An active claim projects to a v1 `Claim`
+(`by` = claimant, `shard_role = manual_m1`, times from the claimant's
+heartbeat companion key when readable, else the Unix epoch — heartbeat
+times are non-authoritative liveness hints). `signature_provenance` is
+`Verified{opened_by}`: the fold admitted the `Open` event only after full
+ML-DSA verification, so provenance is real, not asserted. The latest
+recorded handoff projects to `Issue.handoff`. Timestamps on the projection
+(`created_at`/`updated_at`) are derived from heartbeat data when present
+and are display metadata only — folded state never depends on them.
+
+**v1-interop carrier.** `ApprovalEventV2` and `ConsumeEventV2` carry an
+optional opaque field `v1_record_json` (empty = absent; excluded from
+serialization when empty). The fold ignores it entirely — it is NOT a fold
+input; it rides inside the signed v2 payload so it is integrity-covered by
+the author's signature. `load_approval_state` round-trips it so the
+orchestrator's existing v1 signature verification (approval events signed
+under the v1 context, consumption records with mandatory envelopes) keeps
+working unmodified over v2 storage. A v2 record without a carrier (e.g. a
+consume minted by the WP-B gate directly) projects to nothing on the v1
+surface; the v2 fold, not the v1 projection, is the authority on whether an
+approval is spent — `store_consumed`'s consume-then-confirm makes the v1
+flow inherit that authority.
+
+**Bootstrap (`ensure_surfaces`).** Bind the local author store (WP-X policy
+gate applies). When the local agent IS the list creator and no genesis
+exists, publish a genesis with roster `[self]` (multi-member rosters are
+published via `V2StoreManager::publish_genesis`/`publish_roster_update` by
+the operator/harness; a config surface for initial rosters is deliberately
+deferred). Join every roster peer's event store. Ensure the display
+TaskList (§2.7).
+
+## 2.7 TaskItem display projection (WP-B2, non-authoritative)
+
+Each v2 list keeps a v1-style x0xd TaskList (topic
+`symphony2-display-<list-uuid>`) purely as a human-visible mirror:
+
+- `create_issue` adds a task item (best effort, after the `Open` event is
+  durably appended — the event store is the source of truth).
+- Only the **fold-winning claimant** reconciles the checkbox: `claim` →
+  x0xd `claim` action; `handoff` → `complete` action, each attempted only
+  after the corresponding chained event is durable and confirmed.
+- Display writes that fail are logged and NEVER fail the tracker
+  operation; a disagreement between the TaskList and the fold **always
+  resolves toward fold state** — no reader may treat the TaskList as
+  authoritative for v2 lists.
 
 ## 3. What is deliberately NOT in the fold
 
