@@ -1529,10 +1529,14 @@ fn fold_is_order_independent_under_random_shuffles() -> TestResult {
     let reference = fold(&fixture, &a, base_streams.clone()).map_err(|e| err(e.to_string()))?;
     let reference_json = serde_json::to_value(&reference)?;
 
-    // Sanity on the reference outcome itself.
+    // Sanity on the reference outcome itself. The b-vs-c lamport tie on i1
+    // is broken by (author, hash), which depends on the generated keypairs:
+    // if b wins, b's complete lands (Done); if c wins, b's complete is
+    // correctly fenced out (Claimed by c). Both are legitimate — the point
+    // of THIS test is that shuffles agree, not who wins.
     assert!(matches!(
         status_of(&reference, "i1")?,
-        IssueStatusV2::Done { .. }
+        IssueStatusV2::Done { .. } | IssueStatusV2::Claimed { .. }
     ));
     assert_eq!(reference.forks.len(), 1);
 
