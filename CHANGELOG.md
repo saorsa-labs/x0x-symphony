@@ -5,10 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v0.1.3] — 2026-07-15
+
+Patch release closing the two v0.1.2 pilot blockers (#6, #7) found in the
+2026-07-15 external release review, plus security hardening of the approval
+pipeline from the adversarial Codex review of the fix.
 
 ### Fixed
 
+- **The safe local approval flow works end to end** (#6). Locally-created,
+  self-signed issues (`SignatureProvenance::Verified` with the daemon's own
+  signer, established cryptographically — never from a source field) now
+  bypass the network-dispatch consent gate under all `network_dispatch`
+  policies. Genuinely network-sourced issues under `approve` now actually
+  appear in `GET /symphony/approvals/pending` (the awaiting-approval parked
+  state is included in the scan, across restarts), can be approved, and
+  dispatch exactly once on the happy path via signed, re-verified consumption
+  records. Denials keep the issue parked; non-self tasks remain
+  signature-, trust-, and consent-gated.
+- **`network_dispatch: approve` without `signing.policy: required` is now a
+  hard config-load failure** (previously an unrecoverable silent trap: nothing
+  could ever carry provenance, so every issue blocked with no pending record).
 - **Built-in `pi`, `claude_code`, and `codex` presets now match the real CLI
   contracts** (#7). Verified live against the pinned harness versions
   Claude Code 2.1.208, pi 0.80.3, and codex-cli 0.144.1:
@@ -30,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Gated behind `X0X_SYMPHONY_PRESET_SMOKE=1`; skipped when a harness binary is
   absent. Pinned preset/harness versions documented in
   `docs/symphony/runner-authoring.md`.
+- `ApprovalConsumed` records are now ML-DSA-65-signed and re-verified before
+  the dispatch gate trusts them; unverifiable consumption state refuses
+  dispatch (fail-closed), and consumption nonces carry random entropy.
+- `Tracker::requeue_blocked` enforces `release_reason == awaiting_approval`
+  inside the state transition itself — no Tracker-API path can un-park
+  security-blocked or retry-exhausted work.
+- Crash recovery: approved-but-still-parked issues (crash between approval
+  storage and requeue) resurface in the pending scan and re-approval is
+  idempotent.
+
+### Documentation
+
+- `docs/symphony/security.md` now states the actual delivery guarantees
+  (single-node no-crash: exactly-once; crash windows and concurrent
+  multi-node writers: best-effort — runners must be idempotent) and the
+  `invalid_signature` recovery procedure. Structural replicated-tracker
+  integrity work is tracked in #10.
 
 ## [v0.1.2] — 2026-07-15
 
