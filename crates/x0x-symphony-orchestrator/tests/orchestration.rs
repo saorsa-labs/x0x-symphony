@@ -4138,3 +4138,61 @@ async fn budget_slot_released_on_workspace_create_error() -> Result<(), Box<dyn 
     );
     Ok(())
 }
+
+/// Locally-created issues carry provenance signed by the daemon's own agent.
+/// The daemon's `agent_id` is never in its own x0xd contacts, so the gate MUST
+/// treat `signer == self.agent_id` as implicitly trusted and skip the contacts
+/// lookup — self-authored is local by definition.
+#[tokio::test]
+async fn self_signed_provenance_dispatches_without_trust_lookup() -> Result<(), Box<dyn Error>> {
+    // Signer is "agent-a" — same as the orchestrator's own agent_id.
+    let issue = network_issue("XSY-GATE-SELF", &["feature"], "agent-a")?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Auto,
+        default_test_proofs_dir(),
+    )?;
+    // Trust client has NO entry for "agent-a" — would return Unknown if called.
+    let trust = Arc::new(MockTrustClient::default());
+
+    let (resolution, spy, _tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    // Must dispatch successfully — self-authored provenance is implicitly trusted.
+    assert_ne!(resolution, Some(Resolution::Blocked));
+    assert!(spy.counts().0 > 0, "runner should have executed");
+    // Trust client was never consulted for self-agent.
+    assert!(
+        trust.calls().is_empty(),
+        "trust lookup must be skipped for self-authored provenance"
+    );
+    Ok(())
+}
+
+/// A non-self signer that is unknown to x0xd contacts MUST still be refused.
+/// This proves the trust check is only skipped for the daemon's own `agent_id`,
+/// not for any verified signer.
+#[tokio::test]
+async fn non_self_unknown_signer_still_refused() -> Result<(), Box<dyn Error>> {
+    // Signer is "remote-agent" — NOT the orchestrator's own agent_id.
+    let issue = network_issue("XSY-GATE-REMOTE", &["feature"], "remote-agent")?;
+    let config = network_config(
+        TrustLevel::Trusted,
+        NetworkDispatchPolicy::Auto,
+        default_test_proofs_dir(),
+    )?;
+    // Trust client has no entry for "remote-agent" → Unknown.
+    let trust = Arc::new(MockTrustClient::default());
+
+    let (resolution, spy, tracker, trust) = run_spy_dispatch(issue, config, trust).await?;
+
+    assert_eq!(resolution, Some(Resolution::Blocked));
+    assert_no_execution_calls(&spy);
+    // Trust client WAS consulted for the non-self signer.
+    assert_eq!(trust.calls(), vec!["remote-agent".to_owned()]);
+    assert_blocked_with_code(
+        &tracker,
+        "XSY-GATE-REMOTE",
+        &ReleaseReasonCode::UnknownSigner,
+    )?;
+    Ok(())
+}

@@ -6,12 +6,12 @@
 //! symphony-owned issues and freezes their shard slate.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context};
@@ -20,7 +20,7 @@ use chrono::{SecondsFormat, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::RwLock, task::JoinHandle, time::sleep};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use x0x_symphony_core::{
     sha256_hex, AgentId, PlatformInfo, SignatureEnvelope, WorkerCard, SIGN_ALGORITHM,
     WORKER_CARD_CONTEXT, WORKER_CARD_SCHEMA_VERSION,
@@ -186,6 +186,7 @@ impl WorkerDiscovery {
                 key_resolver: Arc::clone(&self.key_resolver),
                 x0xd: self.x0xd.clone(),
                 view: Arc::clone(&self.view),
+                decode_failures: Arc::new(Mutex::new(DecodeFailureTracker::new())),
             };
             let _consumer = tokio::spawn(async move {
                 task.consume_loop(Some(subscription_id)).await;
@@ -264,6 +265,7 @@ impl WorkerDiscovery {
             key_resolver: Arc::clone(&self.key_resolver),
             x0xd: self.x0xd.clone(),
             view: Arc::clone(&self.view),
+            decode_failures: Arc::new(Mutex::new(DecodeFailureTracker::new())),
         }
         .verify_and_insert_card_at(card, now)
         .await
@@ -276,6 +278,7 @@ impl WorkerDiscovery {
             key_resolver: Arc::clone(&self.key_resolver),
             x0xd: self.x0xd.clone(),
             view: Arc::clone(&self.view),
+            decode_failures: Arc::new(Mutex::new(DecodeFailureTracker::new())),
         }
         .process_sse_data_at(data, now)
         .await
@@ -293,12 +296,48 @@ impl WorkerViewProvider for WorkerDiscovery {
     }
 }
 
+/// Rate-limits repeated decode-failure warnings so a steady stream of
+/// foreign-schema events on a shared gossip plane doesn't spam the log.
+/// The first failure for each discriminator emits a `WARN`; repeats within
+/// `min_interval` are silently dropped to `DEBUG`.
+struct DecodeFailureTracker {
+    last_warn_at: HashMap<&'static str, Instant>,
+    min_interval: Duration,
+}
+
+impl DecodeFailureTracker {
+    /// Minimum interval between WARN-level emissions for the same discriminator.
+    const DEFAULT_INTERVAL: Duration = Duration::from_mins(5);
+
+    fn new() -> Self {
+        Self {
+            last_warn_at: HashMap::new(),
+            min_interval: Self::DEFAULT_INTERVAL,
+        }
+    }
+
+    /// Returns `true` when a `WARN` should be emitted for this discriminator.
+    /// Subsequent calls within `min_interval` return `false` (caller logs at
+    /// `DEBUG` instead).
+    fn should_warn(&mut self, discriminator: &'static str) -> bool {
+        let now = Instant::now();
+        if let Some(&last) = self.last_warn_at.get(discriminator) {
+            if now.duration_since(last) < self.min_interval {
+                return false;
+            }
+        }
+        self.last_warn_at.insert(discriminator, now);
+        true
+    }
+}
+
 #[derive(Clone)]
 struct WorkerConsumerTask {
     signing_client: Arc<dyn SigningClient>,
     key_resolver: Arc<dyn TrustedKeyResolver>,
     x0xd: X0xdGossipClient,
     view: Arc<RwLock<WorkerView>>,
+    decode_failures: Arc<Mutex<DecodeFailureTracker>>,
 }
 
 impl WorkerConsumerTask {
@@ -344,7 +383,16 @@ impl WorkerConsumerTask {
                 if let Some(data) = sse_data(&event) {
                     let now = now_rfc3339();
                     if let Err(error) = self.process_sse_data_at(&data, &now).await {
-                        warn!(%error, "dropping malformed worker gossip event");
+                        let category = classify_decode_error(&error);
+                        let should_warn = self
+                            .decode_failures
+                            .lock()
+                            .map_or(true, |mut tracker| tracker.should_warn(category));
+                        if should_warn {
+                            warn!(%error, category, "dropping malformed worker gossip event");
+                        } else {
+                            debug!(%error, category, "dropping malformed worker gossip event (suppressed)");
+                        }
                     }
                 }
             }
@@ -616,6 +664,23 @@ async fn ensure_success(
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Classify a worker-gossip decode error into a stable discriminator for
+/// rate-limiting. Each variant maps to one `context()` call site in
+/// `process_sse_data_at`; foreign schemas from older or non-symphony agents
+/// cluster predictably into one bucket.
+fn classify_decode_error(error: &anyhow::Error) -> &'static str {
+    let msg = error.to_string();
+    if msg.contains("failed to decode worker gossip event JSON") {
+        "gossip_event_decode"
+    } else if msg.contains("worker gossip payload was not a WorkerCard") {
+        "worker_card_decode"
+    } else if msg.contains("worker gossip payload was not valid base64") {
+        "payload_base64"
+    } else {
+        "unknown_decode"
+    }
 }
 
 fn signature_envelope_is_consistent(card: &WorkerCard) -> bool {
@@ -1003,5 +1068,49 @@ mod tests {
         input.extend_from_slice(b":");
         input.extend_from_slice(payload);
         sha256_hex(&input).into_bytes()
+    }
+
+    #[test]
+    fn decode_failure_tracker_warns_once_then_suppresses() {
+        let mut tracker = DecodeFailureTracker::new();
+        assert!(
+            tracker.should_warn("gossip_event_decode"),
+            "first occurrence must warn"
+        );
+        assert!(
+            !tracker.should_warn("gossip_event_decode"),
+            "repeat within interval must be suppressed"
+        );
+        assert!(
+            !tracker.should_warn("gossip_event_decode"),
+            "third repeat still suppressed"
+        );
+    }
+
+    #[test]
+    fn decode_failure_tracker_tracks_discriminators_independently() {
+        let mut tracker = DecodeFailureTracker::new();
+        assert!(tracker.should_warn("gossip_event_decode"));
+        assert!(
+            tracker.should_warn("worker_card_decode"),
+            "different discriminator must warn independently"
+        );
+        assert!(!tracker.should_warn("gossip_event_decode"));
+        assert!(!tracker.should_warn("worker_card_decode"));
+    }
+
+    #[test]
+    fn classify_decode_error_categorizes_known_failures() {
+        let gossip_err = anyhow::anyhow!("failed to decode worker gossip event JSON: bad json");
+        assert_eq!(classify_decode_error(&gossip_err), "gossip_event_decode");
+
+        let card_err = anyhow::anyhow!("worker gossip payload was not a WorkerCard: missing field");
+        assert_eq!(classify_decode_error(&card_err), "worker_card_decode");
+
+        let b64_err = anyhow::anyhow!("worker gossip payload was not valid base64: invalid char");
+        assert_eq!(classify_decode_error(&b64_err), "payload_base64");
+
+        let unknown_err = anyhow::anyhow!("something completely different");
+        assert_eq!(classify_decode_error(&unknown_err), "unknown_decode");
     }
 }

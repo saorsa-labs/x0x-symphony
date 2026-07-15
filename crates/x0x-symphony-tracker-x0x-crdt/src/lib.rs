@@ -49,13 +49,13 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use reqwest::StatusCode;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 use x0x_symphony_core::{
     sha256_hex, shard, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState, Claim, Handoff,
     Issue, IssueDraft, IssueId, IssueState, PollContext, ReleaseReason, ShardRole,
-    SignatureEnvelope, SymphonyError, Tracker, VerificationNotice, VerificationNoticeKind,
-    WorkerCard, CLAIM_CONTEXT, HANDOFF_CONTEXT, SIGN_ALGORITHM, WORKER_CARD_CONTEXT,
-    WORKER_CARD_SCHEMA_VERSION,
+    SignatureEnvelope, SignatureProvenance, SymphonyError, Tracker, VerificationNotice,
+    VerificationNoticeKind, WorkerCard, CLAIM_CONTEXT, HANDOFF_CONTEXT, ISSUE_PROVENANCE_CONTEXT,
+    SIGN_ALGORITHM, WORKER_CARD_CONTEXT, WORKER_CARD_SCHEMA_VERSION,
 };
 use x0x_symphony_signing::{
     SignResponse, SigningClient, SigningPolicy, TrustedKeyResolver, VerifyOutcome,
@@ -65,10 +65,10 @@ use crate::{
     client::{AddTaskDraft, ClientError, TaskAction, X0xdApi, X0xdClient},
     mapping::{
         approval_key, claim_key, decode_approval_blob, decode_claim_blob, decode_handoff_blob,
-        decode_shard_blob, encode_approval_blob, encode_claim_blob, encode_handoff_blob,
-        encode_shard_blob, handoff_key, issue_from_task, shard_key, store_id_for_list,
-        ApprovalBlob, ClaimBlob, ClaimBlobStatus, HandoffBlob, ShardBlob,
-        SYMPHONY_JSON_CONTENT_TYPE,
+        decode_provenance_blob, decode_shard_blob, encode_approval_blob, encode_claim_blob,
+        encode_handoff_blob, encode_provenance_blob, encode_shard_blob, handoff_key,
+        issue_from_task, provenance_key, shard_key, store_id_for_list, ApprovalBlob, ClaimBlob,
+        ClaimBlobStatus, HandoffBlob, ProvenanceBlob, ShardBlob, SYMPHONY_JSON_CONTENT_TYPE,
     },
 };
 
@@ -681,12 +681,67 @@ impl X0xCrdtTracker {
         Ok(())
     }
 
+    async fn provenance_blob_for_task(&self, task_id: &str) -> Result<Option<ProvenanceBlob>> {
+        let scope = self.resource_scope().await?;
+        let key = provenance_key(task_id);
+        self.client
+            .get_kv(&scope.store_id, &key)
+            .await?
+            .map(|value| decode_provenance_blob(&value.value).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn put_provenance_blob(&self, task_id: &str, blob: &ProvenanceBlob) -> Result<()> {
+        let scope = self.resource_scope().await?;
+        let key = provenance_key(task_id);
+        let encoded = encode_provenance_blob(blob)?;
+        self.client
+            .put_kv(&scope.store_id, &key, &encoded, SYMPHONY_JSON_CONTENT_TYPE)
+            .await?;
+        Ok(())
+    }
+
     async fn fetch_issue(&self, id: &IssueId) -> Result<Issue> {
         self.list_issues()
             .await?
             .into_iter()
             .find(|issue| &issue.id == id)
             .ok_or_else(|| TrackerError::IssueNotFound { id: id.clone() })
+    }
+
+    /// Ensure the configured `TaskList` and companion `KvStore` exist in x0xd.
+    ///
+    /// Creates both surfaces if missing. Idempotent: surfaces that already
+    /// exist are left untouched. Respects group-scoped list and store ids
+    /// when a group is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrackerError::Client`] when x0xd listing or creation fails.
+    pub async fn ensure_surfaces(&self) -> Result<()> {
+        let scope = self.resource_scope().await?;
+        let task_lists = self.client.list_task_lists().await?;
+        if !task_lists.iter().any(|entry| entry.id == scope.list_id) {
+            info!(
+                list_id = %scope.list_id,
+                group_scoped = scope.group_scoped,
+                "creating missing x0xd TaskList for symphony tracker"
+            );
+            self.client
+                .create_task_list(&scope.list_id, &scope.list_id)
+                .await?;
+        }
+        let stores = self.client.list_kv_stores().await?;
+        if !stores.iter().any(|entry| entry.id == scope.store_id) {
+            info!(
+                store_id = %scope.store_id,
+                "creating missing x0xd KvStore sidecar for symphony tracker"
+            );
+            self.client
+                .create_kv_store(&scope.store_id, &scope.store_id)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn create_issue_with_shard(&self, draft: IssueDraft) -> Result<Issue> {
@@ -707,9 +762,10 @@ impl X0xCrdtTracker {
             .into());
         }
 
+        let description = effective_description(draft.description.as_ref());
         let mut add_task = AddTaskDraft::new(draft.title.clone());
-        if let Some(description) = draft.description.filter(|value| !value.trim().is_empty()) {
-            add_task = add_task.with_description(description);
+        if !description.is_empty() {
+            add_task = add_task.with_description(description.clone());
         }
         let scope = self.resource_scope().await?;
         let task_id = self.client.add_task(&scope.list_id, add_task).await?;
@@ -726,11 +782,36 @@ impl X0xCrdtTracker {
                 "cannot assign shard: live worker view is empty; start at least one trusted worker",
             )
         })?;
-        self.put_shard_blob(
-            &task_id,
-            &ShardBlob::new(shard, snapshot.view_epoch, now_utc()),
-        )
-        .await?;
+        let mut sidecar_result = self
+            .put_shard_blob(
+                &task_id,
+                &ShardBlob::new(shard, snapshot.view_epoch, now_utc()),
+            )
+            .await;
+        if sidecar_result.is_ok() && self.signing.policy == SigningPolicy::Required {
+            sidecar_result = self
+                .sign_and_put_provenance(&task_id, &draft.title, &description)
+                .await;
+        }
+        if let Err(error) = sidecar_result {
+            warn!(
+                task_id = %task_id,
+                error = %error,
+                "sidecar blob write failed; marking task terminal to avoid zombie"
+            );
+            if let Err(cleanup_error) = self
+                .client
+                .update_task(&scope.list_id, &task_id, TaskAction::Complete)
+                .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    error = %cleanup_error,
+                    "failed to mark zombie task terminal; bare task remains in TaskList"
+                );
+            }
+            return Err(error);
+        }
         self.fetch_issue(&issue_id).await
     }
 
@@ -820,6 +901,29 @@ impl X0xCrdtTracker {
         Ok(handoff)
     }
 
+    async fn sign_and_put_provenance(
+        &self,
+        task_id: &str,
+        title: &str,
+        description: &str,
+    ) -> Result<()> {
+        let payload = issue_provenance_payload(task_id, title, description);
+        let response = self
+            .signing
+            .client()?
+            .sign(ISSUE_PROVENANCE_CONTEXT, &payload)
+            .await
+            .map_err(signing_error)?;
+        let envelope = envelope_from_sign_response(
+            response,
+            ISSUE_PROVENANCE_CONTEXT,
+            &payload,
+            &self.agent_id,
+        )?;
+        let blob = ProvenanceBlob::new(envelope);
+        self.put_provenance_blob(task_id, &blob).await
+    }
+
     async fn filter_verified_issues(&self, issues: Vec<Issue>) -> Result<Vec<Issue>> {
         if self.signing.policy == SigningPolicy::Disabled {
             return Ok(issues);
@@ -846,9 +950,9 @@ impl X0xCrdtTracker {
                     }
                 }
             }
-            if let Some(handoff) = &issue.handoff {
+            let handoff_ok = if let Some(handoff) = &issue.handoff {
                 match self.verify_handoff(&issue, handoff).await {
-                    Ok(()) => verified.push(issue),
+                    Ok(()) => true,
                     Err(TrackerError::VerifyTransport { reason }) => {
                         return Err(TrackerError::VerifyTransport {
                             reason: format!("issue {}: {reason}", issue.id),
@@ -856,9 +960,31 @@ impl X0xCrdtTracker {
                     }
                     Err(error) => {
                         warn!(issue_id = %issue.id, error = %error, "dropping issue with invalid handoff signature");
+                        false
                     }
                 }
             } else {
+                true
+            };
+            if handoff_ok {
+                match self.verify_issue_provenance(&issue).await {
+                    Ok(Some(signer)) => {
+                        issue.signature_provenance = Some(SignatureProvenance::verified(signer));
+                    }
+                    Ok(None) => {}
+                    Err(TrackerError::VerifyTransport { reason }) => {
+                        return Err(TrackerError::VerifyTransport {
+                            reason: format!("issue {}: {reason}", issue.id),
+                        });
+                    }
+                    Err(error) => {
+                        warn!(
+                            issue_id = %issue.id,
+                            error = %error,
+                            "issue provenance verification failed; leaving unsigned"
+                        );
+                    }
+                }
                 verified.push(issue);
             }
         }
@@ -913,6 +1039,24 @@ impl X0xCrdtTracker {
             .map_err(TrackerError::from)?;
         self.verify_envelope(&issue.id, envelope, HANDOFF_CONTEXT, &payload)
             .await
+    }
+
+    /// Verify issue creation provenance and return the verified signer id.
+    ///
+    /// Returns `Ok(None)` when no provenance blob is stored for this issue.
+    async fn verify_issue_provenance(&self, issue: &Issue) -> Result<Option<String>> {
+        let Some(blob) = self.provenance_blob_for_task(issue.id.as_str()).await? else {
+            return Ok(None);
+        };
+        let payload = issue_provenance_payload(issue.id.as_str(), &issue.title, &issue.description);
+        self.verify_envelope(
+            &issue.id,
+            &blob.envelope,
+            ISSUE_PROVENANCE_CONTEXT,
+            &payload,
+        )
+        .await?;
+        Ok(Some(blob.envelope.signer_agent_id))
     }
 
     async fn verify_envelope(
@@ -1308,6 +1452,35 @@ fn draft_priority_as_u8(priority: Option<i32>) -> Result<Option<u8>> {
         .transpose()
 }
 
+/// Build the deterministic signing payload for issue creation provenance.
+///
+/// The payload is a canonical JSON object with sorted keys: `description`,
+/// `issue_id`, and `title`. The exact same fields are reconstructed on read
+/// from the assembled [`Issue`] so the stored signature verifies.
+fn issue_provenance_payload(task_id: &str, title: &str, description: &str) -> Vec<u8> {
+    use std::collections::BTreeMap;
+    let mut payload: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    payload.insert(
+        "description",
+        serde_json::Value::String(description.to_owned()),
+    );
+    payload.insert("issue_id", serde_json::Value::String(task_id.to_owned()));
+    payload.insert("title", serde_json::Value::String(title.to_owned()));
+    // Serializing a map of String JSON values cannot fail in practice.
+    serde_json::to_vec(&payload).unwrap_or_default()
+}
+
+/// Return the description value that will be stored on the x0xd task entry.
+///
+/// Whitespace-only descriptions are normalised to empty so the signing payload
+/// matches what `issue_from_task` reads back.
+fn effective_description(description: Option<&String>) -> String {
+    description
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn live_verified_worker_ids(cards: &[WorkerCard], now: &str) -> Vec<AgentId> {
     cards
         .iter()
@@ -1374,6 +1547,15 @@ mod tests {
         joins: Vec<String>,
         list_task_calls: Vec<String>,
         hidden_list_ids: Vec<String>,
+        /// When true, `list_task_lists`/`list_kv_stores` return empty to
+        /// simulate missing surfaces.
+        surfaces_missing: bool,
+        /// Topics passed to `create_task_list`.
+        created_lists: Vec<String>,
+        /// Topics passed to `create_kv_store`.
+        created_stores: Vec<String>,
+        /// When true, `put_kv` returns a synthetic HTTP 500.
+        put_kv_failing: bool,
     }
 
     impl MockApi {
@@ -1477,11 +1659,31 @@ mod tests {
         async fn put_count(&self) -> usize {
             self.state.lock().await.puts.len()
         }
+
+        async fn set_surfaces_missing(&self, missing: bool) {
+            self.state.lock().await.surfaces_missing = missing;
+        }
+
+        async fn set_put_kv_failing(&self, failing: bool) {
+            self.state.lock().await.put_kv_failing = failing;
+        }
+
+        async fn created_lists(&self) -> Vec<String> {
+            self.state.lock().await.created_lists.clone()
+        }
+
+        async fn created_stores(&self) -> Vec<String> {
+            self.state.lock().await.created_stores.clone()
+        }
     }
 
     #[async_trait]
     impl X0xdApi for MockApi {
         async fn list_task_lists(&self) -> client::Result<Vec<TaskListEntry>> {
+            let state = self.state.lock().await;
+            if state.surfaces_missing {
+                return Ok(Vec::new());
+            }
             Ok(vec![TaskListEntry {
                 id: "list-a".to_owned(),
                 topic: "list-a".to_owned(),
@@ -1489,6 +1691,7 @@ mod tests {
         }
 
         async fn create_task_list(&self, _name: &str, topic: &str) -> client::Result<String> {
+            self.state.lock().await.created_lists.push(topic.to_owned());
             Ok(topic.to_owned())
         }
 
@@ -1594,6 +1797,10 @@ mod tests {
         }
 
         async fn list_kv_stores(&self) -> client::Result<Vec<TaskListEntry>> {
+            let state = self.state.lock().await;
+            if state.surfaces_missing {
+                return Ok(Vec::new());
+            }
             Ok(vec![TaskListEntry {
                 id: store_id_for_list("list-a"),
                 topic: store_id_for_list("list-a"),
@@ -1601,6 +1808,11 @@ mod tests {
         }
 
         async fn create_kv_store(&self, _name: &str, topic: &str) -> client::Result<String> {
+            self.state
+                .lock()
+                .await
+                .created_stores
+                .push(topic.to_owned());
             Ok(topic.to_owned())
         }
 
@@ -1631,6 +1843,12 @@ mod tests {
             _content_type: &str,
         ) -> client::Result<()> {
             let mut state = self.state.lock().await;
+            if state.put_kv_failing {
+                return Err(ClientError::Http {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    body: "store not found".to_owned(),
+                });
+            }
             state
                 .kv
                 .insert((store_id.to_owned(), key.to_owned()), value.to_vec());
@@ -1930,6 +2148,81 @@ mod tests {
         Ok(())
     }
 
+    fn required_tracker_with_workers(
+        api: Arc<MockApi>,
+        signing: Arc<MockSigning>,
+        provider: Arc<MockWorkerView>,
+    ) -> TestResult<X0xCrdtTracker> {
+        let signing_client: Arc<dyn SigningClient> = signing.clone();
+        let resolver: Arc<dyn TrustedKeyResolver> = signing;
+        Ok(
+            X0xCrdtTracker::builder("mock://x0xd", "list-a", AgentId::new(AGENT_A)?)
+                .client(api)
+                .worker_view(provider)
+                .replication_factor(shard::DEFAULT_REPLICATION_FACTOR)
+                .required_signing(signing_client, resolver)
+                .build()?,
+        )
+    }
+
+    fn valid_signing() -> Arc<MockSigning> {
+        Arc::new(MockSigning {
+            verify_outcome: VerifyOutcome::Valid,
+            public_key: b"trusted-key".to_vec(),
+        })
+    }
+
+    /// Locally-created issues MUST carry verified signature provenance when
+    /// signing is Required, so the dispatch gate treats them as cryptographically
+    /// attested rather than blocking them as unsigned network-sourced issues.
+    #[tokio::test]
+    async fn create_issue_with_required_signing_attaches_verified_provenance() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        let provider = MockWorkerView::new(vec![worker_snapshot(
+            &["agent-a", "agent-b", "agent-c"],
+            1,
+        )?]);
+        let tracker = required_tracker_with_workers(api, valid_signing(), provider)?;
+
+        let issue = tracker.create_issue(issue_draft("Provenance test")).await?;
+
+        // The returned issue carries verified provenance from the read-back path.
+        assert_eq!(
+            issue.signature_provenance,
+            Some(SignatureProvenance::verified(AGENT_A))
+        );
+
+        // Re-reading confirms the provenance is stable across fetches.
+        let reloaded = tracker.list_issues().await?;
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(
+            reloaded[0].signature_provenance,
+            Some(SignatureProvenance::verified(AGENT_A))
+        );
+        Ok(())
+    }
+
+    /// Issues without a provenance blob (arrived from the network or created
+    /// before provenance support) MUST have no verified provenance under
+    /// Required signing. The dispatch gate will then refuse them as unsigned.
+    #[tokio::test]
+    async fn unsigned_issue_has_no_provenance_under_required_signing() -> TestResult {
+        let api = MockApi::with_tasks(vec![task(ISSUE_A, "unsigned", "empty", 3)]).await;
+        let provider = MockWorkerView::new(vec![worker_snapshot(
+            &["agent-a", "agent-b", "agent-c"],
+            1,
+        )?]);
+        let tracker = required_tracker_with_workers(api, valid_signing(), provider)?;
+
+        let issues = tracker.list_issues().await?;
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].signature_provenance.is_none(),
+            "unsigned issue must not gain provenance"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn fetch_candidates_does_not_assign_missing_shards_on_read_path() -> TestResult {
         let api = MockApi::with_tasks(vec![task(ISSUE_A, "unsharded", "empty", 3)]).await;
@@ -2142,12 +2435,16 @@ mod tests {
     impl SigningClient for MockSigning {
         async fn sign(
             &self,
-            _context: &str,
+            context: &str,
             _payload: &[u8],
         ) -> x0x_symphony_signing::Result<SignResponse> {
-            Err(x0x_symphony_signing::SigningError::InvalidResponse(
-                "mock signer does not sign".to_owned(),
-            ))
+            Ok(SignResponse {
+                agent_id: AGENT_A.to_owned(),
+                public_key_b64: BASE64.encode(&self.public_key),
+                signature_b64: BASE64.encode(b"mock-signature"),
+                algorithm: SIGN_ALGORITHM.to_owned(),
+                context: context.to_owned(),
+            })
         }
 
         async fn verify(
@@ -2372,6 +2669,60 @@ mod tests {
                 .to_string()
                 .contains("signature verification transport error"),
             "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_surfaces_creates_missing_surfaces() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        api.set_surfaces_missing(true).await;
+        let tracker = tracker(api.clone())?;
+
+        tracker.ensure_surfaces().await?;
+
+        let created_lists = api.created_lists().await;
+        let created_stores = api.created_stores().await;
+        assert_eq!(created_lists, vec!["list-a".to_owned()]);
+        assert_eq!(created_stores, vec![store_id_for_list("list-a")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ensure_surfaces_idempotent_when_surfaces_exist() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        let tracker = tracker(api.clone())?;
+
+        tracker.ensure_surfaces().await?;
+
+        // Default mock already lists list-a and symphony-list-a, so nothing
+        // should have been created.
+        assert!(api.created_lists().await.is_empty());
+        assert!(api.created_stores().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_issue_marks_task_terminal_on_shard_write_failure() -> TestResult {
+        let api = MockApi::with_tasks(Vec::new()).await;
+        api.set_put_kv_failing(true).await;
+        let provider = MockWorkerView::new(vec![worker_snapshot(
+            &["agent-a", "agent-b", "agent-c"],
+            1,
+        )?]);
+        let tracker = tracker_with_worker_view(api.clone(), provider)?;
+
+        let result = tracker.create_issue(issue_draft("Zombie test")).await;
+        assert!(
+            result.is_err(),
+            "create_issue should fail when put_kv fails"
+        );
+
+        // The bare task was added but should have been marked terminal.
+        let completes = api.action_count(TaskAction::Complete).await;
+        assert_eq!(
+            completes, 1,
+            "task should have been completed (marked terminal) to avoid zombie"
         );
         Ok(())
     }
