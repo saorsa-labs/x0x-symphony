@@ -4,7 +4,7 @@
 //! reads the prompt from stdin when no prompt argument is given — matching the
 //! shell runner's stdin-only prompt channel. The previous `codex app-server`
 //! argv spoke JSON-RPC and rejected a plain rendered prompt ("Failed to
-//! deserialize JSONRPCMessage"). Verified live 2026-07-15; see
+//! deserialize `JSONRPCMessage`"). Verified live 2026-07-15; see
 //! `tests/preset_live_smoke.rs`. For other harness versions, override via
 //! `runner.command`/`runner.args` or the `runner.codex.args` block in
 //! `WORKFLOW.md`.

@@ -55,8 +55,8 @@ async fn pi_preset_argv_is_accepted_by_installed_pi() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-async fn codex_preset_argv_is_accepted_by_installed_codex(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn codex_preset_argv_is_accepted_by_installed_codex() -> Result<(), Box<dyn std::error::Error>>
+{
     smoke(PresetName::Codex).await
 }
 
