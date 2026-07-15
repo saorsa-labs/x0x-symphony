@@ -7,18 +7,21 @@
 //! `--verbose`).
 //!
 //! These are dev-machine tests, not CI tests:
-//! - they are gated behind `X0X_SYMPHONY_PRESET_SMOKE=1` because they launch
-//!   real AI harnesses (which may spend tokens); run them via
+//! - they are gated behind `X0X_SYMPHONY_PRESET_SMOKE=1` (exact value) because
+//!   they launch real AI harnesses (which may spend tokens); run them via
 //!   `just preset-smoke`;
 //! - a preset whose harness binary is absent from `PATH` (or not executable)
 //!   is skipped with a message.
 //!
-//! Classification is fail-closed: exit 0 passes, and a child still running at
-//! the bounded wait passes (argv accepted, model turn in flight — its process
-//! group is killed and reaped). A non-zero exit passes only when the output
-//! matches a known *runtime* failure (auth/API-key, provider/rate-limit,
-//! codex's untrusted-directory refusal); any other non-zero exit fails with
-//! the captured output, so unknown argv rejections cannot slip through.
+//! Classification is fail-closed and argv-rejection takes precedence: exit 0
+//! passes, and a child still running at the bounded wait passes (argv
+//! accepted, model turn in flight — its process group is killed and reaped).
+//! For a non-zero exit the output is classified: any argv/usage-error
+//! signature fails the test even if a runtime marker also matches; otherwise
+//! a known *runtime* failure (auth/API-key, provider/rate-limit, codex's
+//! untrusted-directory refusal) passes; anything unrecognised fails with the
+//! captured output. The classifier itself is covered by (ungated) negative
+//! unit tests below.
 //!
 //! Pinned harness versions (verified 2026-07-15): Claude Code 2.1.208,
 //! pi 0.80.3, codex-cli 0.144.1. Kimi/GLM/Minimax remain unpinned config-only
@@ -41,13 +44,37 @@ use x0x_symphony_runner_shell::{preset, PresetName, ShellRunner};
 const SMOKE_ENV: &str = "X0X_SYMPHONY_PRESET_SMOKE";
 const PROMPT: &str = "Reply with exactly OK and nothing else.\n";
 const WAIT: Duration = Duration::from_secs(30);
+/// Grace period for post-kill reaping and for output pipes to reach EOF after
+/// the child exits (a forked grandchild can hold the pipes open past exit).
+const GRACE: Duration = Duration::from_secs(5);
+/// Retain at most this much combined output per stream for classification.
+const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 
 /// Presets whose harness contract is pinned and live-verified.
 const PINNED_PRESETS: &[PresetName] = &[PresetName::ClaudeCode, PresetName::Pi, PresetName::Codex];
 
+/// Argv/usage-rejection signatures. Matching any of these on a non-zero exit
+/// fails the smoke *regardless* of runtime markers — an argv error such as
+/// `error: unknown option '--provider'` must never pass via the runtime
+/// allow-list below.
+const USAGE_ERROR_SIGNATURES: &[&str] = &[
+    "unknown option",
+    "unknown argument",
+    "unexpected argument",
+    "unrecognized option",
+    "unrecognized argument",
+    "unrecognized subcommand",
+    "invalid option",
+    "invalid value",
+    "option requires",
+    "requires --verbose",
+    "usage:",
+];
+
 /// Known *runtime* (post-argv-parse) failure markers. A non-zero exit passes
-/// the smoke only when its output matches one of these; anything else fails
-/// closed as a suspected argv/contract rejection.
+/// the smoke only when its output matches one of these and no usage-error
+/// signature; anything else fails closed as a suspected argv/contract
+/// rejection.
 const RUNTIME_FAILURE_MARKERS: &[&str] = &[
     // Auth / account problems (claude, pi, codex).
     "api key",
@@ -71,6 +98,98 @@ const RUNTIME_FAILURE_MARKERS: &[&str] = &[
     "not inside a trusted directory",
 ];
 
+/// Fail-closed classification of a non-zero-exit output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExitClass {
+    /// Output matches an argv/usage-error signature: the preset argv is broken.
+    ArgvRejected,
+    /// Output matches a known runtime (non-argv) failure: the argv is fine.
+    KnownRuntimeFailure,
+    /// Unrecognised failure: treated as a suspected argv/contract rejection.
+    Unknown,
+}
+
+fn classify_failure_output(output: &str) -> ExitClass {
+    let lowered = output.to_lowercase();
+    if USAGE_ERROR_SIGNATURES
+        .iter()
+        .any(|signature| lowered.contains(signature))
+    {
+        return ExitClass::ArgvRejected;
+    }
+    if RUNTIME_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return ExitClass::KnownRuntimeFailure;
+    }
+    ExitClass::Unknown
+}
+
+fn smoke_enabled() -> bool {
+    std::env::var(SMOKE_ENV).is_ok_and(|value| value == "1")
+}
+
+// ---------------------------------------------------------------------------
+// Classifier unit tests (always run; no processes spawned).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn classifier_fails_argv_errors_even_when_runtime_markers_also_match() {
+    // "--provider" contains the runtime marker "provider"; the usage-error
+    // signature must take precedence.
+    assert_eq!(
+        classify_failure_output("error: unknown option '--provider'"),
+        ExitClass::ArgvRejected
+    );
+    // "--login" contains the runtime marker "login".
+    assert_eq!(
+        classify_failure_output("unrecognized argument --login"),
+        ExitClass::ArgvRejected
+    );
+    assert_eq!(
+        classify_failure_output(
+            "Error: When using --print, --output-format=stream-json requires --verbose"
+        ),
+        ExitClass::ArgvRejected
+    );
+    assert_eq!(
+        classify_failure_output("Error: Unknown option: --stdin"),
+        ExitClass::ArgvRejected
+    );
+}
+
+#[test]
+fn classifier_accepts_known_runtime_failures() {
+    assert_eq!(
+        classify_failure_output(
+            "Not inside a trusted directory and --skip-git-repo-check was not specified."
+        ),
+        ExitClass::KnownRuntimeFailure
+    );
+    assert_eq!(
+        classify_failure_output("Error: No API key found for provider google"),
+        ExitClass::KnownRuntimeFailure
+    );
+    assert_eq!(
+        classify_failure_output("Invalid API key. Please run /login"),
+        ExitClass::KnownRuntimeFailure
+    );
+}
+
+#[test]
+fn classifier_fails_closed_on_unrecognised_output() {
+    assert_eq!(
+        classify_failure_output("segmentation fault"),
+        ExitClass::Unknown
+    );
+    assert_eq!(classify_failure_output(""), ExitClass::Unknown);
+}
+
+// ---------------------------------------------------------------------------
+// Live smokes (gated).
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
 async fn claude_code_preset_argv_is_accepted_by_installed_claude(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -89,14 +208,14 @@ async fn codex_preset_argv_is_accepted_by_installed_codex() -> Result<(), Box<dy
 }
 
 /// Same contract check, but through the production `ShellRunner` spawn path
-/// (`env_clear` + declared env only), so the smoke also proves each harness can
-/// start under the runner's environment policy rather than the test's
+/// (`env_clear` + declared env only), so the smoke also proves each harness
+/// can start under the runner's environment policy rather than the test's
 /// inherited environment. `HOME` and `PATH` are declared on the spec the way
 /// an operator would allow-list them in `WORKFLOW.md`.
 #[tokio::test]
 async fn pinned_presets_start_under_production_shell_runner(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os(SMOKE_ENV).is_none() {
+    if !smoke_enabled() {
         eprintln!("SKIP shell-runner live smoke: set {SMOKE_ENV}=1 (or run `just preset-smoke`)");
         return Ok(());
     }
@@ -134,23 +253,24 @@ async fn pinned_presets_start_under_production_shell_runner(
             TurnStatus::TimedOut => {
                 eprintln!("PASS {name} (shell runner): argv accepted, turn timed out");
             }
-            TurnStatus::Failed | TurnStatus::Cancelled => {
-                if !is_known_runtime_failure(&output) {
+            TurnStatus::Failed | TurnStatus::Cancelled => match classify_failure_output(&output) {
+                ExitClass::KnownRuntimeFailure => {
+                    eprintln!("PASS {name} (shell runner): known runtime failure, argv accepted");
+                }
+                class @ (ExitClass::ArgvRejected | ExitClass::Unknown) => {
                     return Err(format!(
-                        "{name} preset failed under ShellRunner without a known runtime \
-                         cause (suspected argv/contract rejection): {output}",
+                        "{name} preset failed under ShellRunner ({class:?}): {output}",
                     )
                     .into());
                 }
-                eprintln!("PASS {name} (shell runner): known runtime failure, argv accepted");
-            }
+            },
         }
     }
     Ok(())
 }
 
 async fn smoke(name: PresetName) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os(SMOKE_ENV).is_none() {
+    if !smoke_enabled() {
         eprintln!("SKIP {name} live smoke: set {SMOKE_ENV}=1 (or run `just preset-smoke`)");
         return Ok(());
     }
@@ -188,16 +308,24 @@ async fn smoke(name: PresetName) -> Result<(), Box<dyn std::error::Error>> {
     drop(stdin); // EOF so stdin-reading harnesses see a complete prompt.
     let stdout_pipe = child.stdout.take().ok_or("child stdout unavailable")?;
     let stderr_pipe = child.stderr.take().ok_or("child stderr unavailable")?;
-    let stdout_task = tokio::spawn(read_to_string(stdout_pipe));
-    let stderr_task = tokio::spawn(read_to_string(stderr_pipe));
+    // Readers are self-bounded (time budget + retained-byte cap): they cannot
+    // hang the test if a grandchild inherits the pipes and never closes them,
+    // and they cannot accumulate unbounded output. They keep draining past
+    // the cap so the child is never blocked on a full pipe.
+    let read_budget = WAIT + GRACE;
+    let stdout_task = tokio::spawn(read_capped(stdout_pipe, OUTPUT_CAP_BYTES, read_budget));
+    let stderr_task = tokio::spawn(read_capped(stderr_pipe, OUTPUT_CAP_BYTES, read_budget));
 
     match timeout(WAIT, child.wait()).await {
         Err(_elapsed) => {
             // Argv was accepted and a turn is in flight; that is all this
             // smoke asserts. Kill the whole process group (mirroring the
-            // production runner's timeout path) and reap the child.
-            kill_process_group(&child)?;
-            child.wait().await?;
+            // production runner's timeout path) and reap the child, bounding
+            // the reap so a platform where the kill is weaker cannot hang us.
+            kill_child(&mut child)?;
+            if timeout(GRACE, child.wait()).await.is_err() {
+                eprintln!("WARN {name}: child not reaped within {GRACE:?}; kill_on_drop remains");
+            }
             stdout_task.abort();
             stderr_task.abort();
             eprintln!("PASS {name}: still running after {WAIT:?} (argv accepted); killed");
@@ -205,45 +333,70 @@ async fn smoke(name: PresetName) -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(status) => {
             let status = status?;
-            let stdout = stdout_task.await??;
-            let stderr = stderr_task.await??;
+            let stdout = stdout_task.await?;
+            let stderr = stderr_task.await?;
             if status.success() {
                 eprintln!("PASS {name}: exited {status}");
                 return Ok(());
             }
             let combined = format!("{stderr}\n{stdout}");
-            if !is_known_runtime_failure(&combined) {
-                return Err(format!(
-                    "{name} preset argv suspected rejected by `{}` ({status}): stderr: {} \
-                     stdout: {}",
+            match classify_failure_output(&combined) {
+                ExitClass::KnownRuntimeFailure => {
+                    eprintln!(
+                        "PASS {name}: exited {status} with a known runtime (non-argv) failure"
+                    );
+                    Ok(())
+                }
+                class @ (ExitClass::ArgvRejected | ExitClass::Unknown) => Err(format!(
+                    "{name} preset argv suspected rejected by `{}` ({status}, {class:?}): \
+                     stderr: {} stdout: {}",
                     spec.command,
                     stderr.trim(),
                     stdout.trim(),
                 )
-                .into());
+                .into()),
             }
-            eprintln!("PASS {name}: exited {status} with a known runtime (non-argv) failure");
-            Ok(())
         }
     }
 }
 
-/// Fail-closed non-zero-exit classifier: only recognised runtime failures pass.
-fn is_known_runtime_failure(output: &str) -> bool {
-    let lowered = output.to_lowercase();
-    RUNTIME_FAILURE_MARKERS
-        .iter()
-        .any(|marker| lowered.contains(marker))
+/// Read a pipe until EOF or `budget` elapses, retaining at most `cap` bytes.
+/// Keeps draining (and discarding) past the cap so the child never blocks on
+/// a full pipe.
+async fn read_capped(
+    mut pipe: impl AsyncRead + Unpin + Send,
+    cap: usize,
+    budget: Duration,
+) -> String {
+    let mut retained: Vec<u8> = Vec::new();
+    {
+        let drain = async {
+            let mut buffer = [0u8; 8 * 1024];
+            loop {
+                match pipe.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        if retained.len() < cap {
+                            let take = (cap - retained.len()).min(count);
+                            retained.extend_from_slice(&buffer[..take]);
+                        }
+                    }
+                }
+            }
+        };
+        // On budget expiry the drain future is dropped; whatever was retained
+        // so far is still available for classification.
+        let _ = timeout(budget, drain).await;
+    }
+    String::from_utf8_lossy(&retained).into_owned()
 }
 
-async fn read_to_string(mut pipe: impl AsyncRead + Unpin + Send) -> Result<String, std::io::Error> {
-    let mut buffer = Vec::new();
-    pipe.read_to_end(&mut buffer).await?;
-    Ok(String::from_utf8_lossy(&buffer).into_owned())
-}
-
+/// Kill the child on timeout, mirroring the production runner: SIGKILL to the
+/// process group on unix; `start_kill` on other platforms (grandchildren may
+/// outlive the smoke there — the production runner's non-unix kill path has
+/// the same limitation).
 #[cfg(unix)]
-fn kill_process_group(child: &Child) -> Result<(), Box<dyn std::error::Error>> {
+fn kill_child(child: &mut Child) -> Result<(), Box<dyn std::error::Error>> {
     use nix::{
         errno::Errno,
         sys::signal::{kill, Signal},
@@ -261,10 +414,8 @@ fn kill_process_group(child: &Child) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_child: &Child) -> Result<(), Box<dyn std::error::Error>> {
-    // No process groups on this platform; kill_on_drop covers the direct
-    // child and grandchildren may outlive the smoke (same limitation as the
-    // production runner's non-unix kill path).
+fn kill_child(child: &mut Child) -> Result<(), Box<dyn std::error::Error>> {
+    child.start_kill()?;
     Ok(())
 }
 
