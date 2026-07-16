@@ -388,6 +388,10 @@ impl SignatureProvenance {
 pub enum VerificationNoticeKind {
     /// A claim failed verification and was stripped while the issue stayed visible.
     BadClaim,
+    /// An author equivocated: two signed events with one chain sequence
+    /// number (tracker-integrity v2 fork evidence). The forked suffix is
+    /// inadmissible; the notice surfaces the anomaly to operators.
+    ForkEvidence,
 }
 
 /// Non-serialized read-path verification notice for operator visibility.

@@ -2080,3 +2080,166 @@ fn consume_of_unknown_approval_is_losing() -> TestResult {
     assert!(out.losing_consumes[0].reason.contains("unknown"));
     Ok(())
 }
+
+/// Codex blocker 3 regression: duplicate streams claiming one owner with
+/// DIFFERENT card-self values must fold identically in both input orders —
+/// the owner is rejected as conflicted (no pick-one rule), and a creator
+/// conflict refuses the whole list.
+#[test]
+fn conflicting_card_self_rejects_owner_order_independently() -> TestResult {
+    let creator = Author::generate()?;
+    let member = Author::generate()?;
+    let imposter = Author::generate()?; // source of the second key bytes
+    let fixture = make_genesis(&creator, "list-cardconflict", &[&creator, &member])?;
+
+    let mut creator_chain = Chain::new(&creator, &fixture);
+    let (_open_hash, open) = creator_chain.next(
+        0,
+        "i1",
+        1,
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
+    )?;
+    let mut member_chain = Chain::new(&member, &fixture);
+    let (_claim_hash, claim) = member_chain.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: "n1".to_owned(),
+        },
+    )?;
+
+    let genuine = stream(&member, vec![claim]);
+    // Same owner id, different self-card bytes (an anomaly no deterministic
+    // rule can bind): the fold must reject the owner outright.
+    let conflicting = AuthorStream {
+        owner: member.id.clone(),
+        card_self: Some(imposter.pk.clone()),
+        records: vec![StoreRecord {
+            key: CARD_SELF_KEY.to_owned(),
+            value: imposter.pk.clone(),
+        }],
+    };
+
+    let creator_stream = stream(&creator, vec![fixture.genesis_record.clone(), open]);
+    let forward = fold(
+        &fixture,
+        &creator,
+        vec![
+            creator_stream.clone(),
+            genuine.clone(),
+            conflicting.clone(),
+        ],
+    )
+    .map_err(|e| err(format!("{e}")))?;
+    let reverse = fold(
+        &fixture,
+        &creator,
+        vec![conflicting.clone(), genuine.clone(), creator_stream],
+    )
+    .map_err(|e| err(format!("{e}")))?;
+
+    assert_eq!(forward, reverse, "fold output must be stream-order-independent");
+    assert!(
+        matches!(status_of(&forward, "i1")?, IssueStatusV2::Open),
+        "the conflicted owner's claim must not take effect"
+    );
+    assert_some_reason_contains(&forward, "conflicting card-self")?;
+
+    // Creator conflict: the entire list is refused, both orders.
+    let creator_conflicting = AuthorStream {
+        owner: creator.id.clone(),
+        card_self: Some(imposter.pk.clone()),
+        records: Vec::new(),
+    };
+    let creator_stream = stream(&creator, vec![fixture.genesis_record.clone()]);
+    for streams in [
+        vec![creator_stream.clone(), creator_conflicting.clone()],
+        vec![creator_conflicting, creator_stream],
+    ] {
+        let refused = fold(&fixture, &creator, streams);
+        assert!(
+            matches!(&refused, Err(ListRefusal::InvalidGenesis(reason)) if reason.contains("card-self conflict")),
+            "creator card conflict must refuse the list, got {refused:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Codex blocker 4 regression: a consume whose approval carries a LATER
+/// fold position (higher lamport) is still effective — approvals are an
+/// order-independent set collected before the ordered walk.
+#[test]
+fn consume_is_effective_when_its_approval_orders_later_in_fold() -> TestResult {
+    let creator = Author::generate()?;
+    let worker = Author::generate()?;
+    let approver = Author::generate()?;
+    let fixture = make_genesis(
+        &creator,
+        "list-late-approval",
+        &[&creator, &worker, &approver],
+    )?;
+
+    let mut creator_chain = Chain::new(&creator, &fixture);
+    let (open_hash, open) = creator_chain.next(
+        0,
+        "i1",
+        1,
+        TransitionKind::open("t".to_owned(), "s".to_owned()),
+    )?;
+    let mut worker_chain = Chain::new(&worker, &fixture);
+    let (claim_hash, claim) = worker_chain.next(
+        0,
+        "i1",
+        2,
+        TransitionKind::Claim {
+            claim_nonce: "n1".to_owned(),
+        },
+    )?;
+    // Approval at lamport 10 — AFTER the consume's fold position (3).
+    let mut approver_chain = Chain::new(&approver, &fixture);
+    let (approval_hash, approval) = approver_chain.next_approval(
+        0,
+        "i1",
+        10,
+        &open_hash,
+        ApprovalVerdictV2::Approve,
+        1_000,
+    )?;
+    let (consume_hash, consume) = worker_chain.next_consume(
+        0,
+        "i1",
+        3,
+        &approval_hash,
+        &approver.id,
+        "n1",
+        &claim_hash,
+    )?;
+
+    let base_streams = || {
+        vec![
+            stream(&creator, vec![fixture.genesis_record.clone(), open.clone()]),
+            stream(&worker, vec![claim.clone(), consume.clone()]),
+            stream(&approver, vec![approval.clone()]),
+        ]
+    };
+    let out = fold(&fixture, &creator, base_streams()).map_err(|e| err(format!("{e}")))?;
+    assert!(
+        out.effective_consumes
+            .get(&approval_hash)
+            .is_some_and(|c| c.event_hash == consume_hash),
+        "the consume must be effective even though its approval folds later; \
+         losing: {:?}",
+        out.losing_consumes
+    );
+    assert!(out.losing_consumes.is_empty());
+
+    // Shuffle determinism across stream orders.
+    for seed in 0..6u64 {
+        let mut streams = base_streams();
+        lcg_shuffle(&mut streams, seed);
+        let shuffled = fold(&fixture, &creator, streams).map_err(|e| err(format!("{e}")))?;
+        assert_eq!(shuffled, out, "seed {seed} disagreed");
+    }
+    Ok(())
+}

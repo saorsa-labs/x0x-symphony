@@ -152,12 +152,37 @@ struct InMemoryX0xd {
     tasks: Mutex<BTreeMap<String, Vec<TaskEntry>>>,
     lists: Mutex<BTreeSet<String>>,
     kv_stores: Mutex<BTreeSet<String>>,
+    /// Daemon-anchored owner + policy per store topic — the double mocks
+    /// the anchoring NEGOTIATION (create anchors to the local agent with
+    /// the requested policy; join anchors to the expected owner), never
+    /// blessing topics by name.
+    anchors: Mutex<BTreeMap<String, (String, String)>>,
+    /// The daemon's local agent identity (owner of created stores).
+    local_agent: Mutex<Option<String>>,
+    /// Topics passed to `join_kv_store`, for join-path assertions.
+    joins: Mutex<Vec<String>>,
+    /// When set, writes to heartbeat companion stores fail (blocker-1
+    /// failure injection: heartbeats are non-authoritative).
+    fail_heartbeat_puts: Mutex<bool>,
     /// Records that become visible only after a key with the batch's
     /// trigger prefix is written — deterministic partition-heal staging.
     staged: Mutex<Vec<StagedBatch>>,
 }
 
 impl InMemoryX0xd {
+    async fn set_local_agent(&self, agent: &str) {
+        *self.local_agent.lock().await = Some(agent.to_owned());
+    }
+
+    /// Anchor `topic` to `owner` with `policy`, as the daemon would after a
+    /// network ownership lookup (used for directly seeded peer stores).
+    async fn anchor(&self, topic: &str, owner: &str, policy: &str) {
+        self.anchors
+            .lock()
+            .await
+            .insert(topic.to_owned(), (owner.to_owned(), policy.to_owned()));
+    }
+
     async fn seed(&self, topic: &str, key: &str, value: Vec<u8>) {
         self.kv
             .lock()
@@ -181,8 +206,12 @@ impl InMemoryX0xd {
             .count()
     }
 
-    fn is_append_only_topic(topic: &str) -> bool {
-        topic.starts_with("symphony2-ev-")
+    async fn is_append_only(&self, topic: &str) -> bool {
+        self.anchors
+            .lock()
+            .await
+            .get(topic)
+            .is_some_and(|(_, policy)| policy == "append_only")
     }
 }
 
@@ -195,6 +224,13 @@ impl V2StoreApi for InMemoryX0xd {
         policy: Option<&str>,
     ) -> std::result::Result<StoreCreateOutcome, ClientError> {
         self.kv_stores.lock().await.insert(topic.to_owned());
+        if let Some(agent) = self.local_agent.lock().await.clone() {
+            self.anchors
+                .lock()
+                .await
+                .entry(topic.to_owned())
+                .or_insert((agent, policy.unwrap_or("signed").to_owned()));
+        }
         Ok(StoreCreateOutcome {
             id: topic.to_owned(),
             policy: policy.map(str::to_owned),
@@ -203,25 +239,39 @@ impl V2StoreApi for InMemoryX0xd {
 
     async fn join_kv_store(
         &self,
-        _topic: &str,
-        _expected_owner: &str,
+        topic: &str,
+        expected_owner: &str,
     ) -> std::result::Result<(), ClientError> {
-        Ok(())
+        self.joins.lock().await.push(topic.to_owned());
+        let mut anchors = self.anchors.lock().await;
+        match anchors.get(topic) {
+            Some((owner, _)) if owner != expected_owner => Err(ClientError::Http {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                body: format!("expected owner mismatch: anchored to {owner}"),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                // Anchoring a store the double has never heard of mirrors a
+                // join whose network lookup succeeded; the policy of a
+                // remote v2 event store is append_only in these tests.
+                anchors.insert(
+                    topic.to_owned(),
+                    (expected_owner.to_owned(), "append_only".to_owned()),
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn kv_store_detail(
         &self,
         topic: &str,
     ) -> std::result::Result<Option<StoreDetailEntry>, ClientError> {
-        let policy = if Self::is_append_only_topic(topic) {
-            Some("append_only".to_owned())
-        } else {
-            Some("signed".to_owned())
-        };
-        Ok(Some(StoreDetailEntry {
+        let anchors = self.anchors.lock().await;
+        Ok(anchors.get(topic).map(|(owner, policy)| StoreDetailEntry {
             id: topic.to_owned(),
-            owner: None,
-            policy,
+            owner: Some(owner.clone()),
+            policy: Some(policy.clone()),
         }))
     }
 
@@ -265,16 +315,24 @@ impl V2StoreApi for InMemoryX0xd {
         value: &[u8],
         _content_type: &str,
     ) -> std::result::Result<(), ClientError> {
-        {
-            let mut kv = self.kv.lock().await;
-            let entry = (topic.to_owned(), key.to_owned());
-            if Self::is_append_only_topic(topic) && kv.contains_key(&entry) {
+        if *self.fail_heartbeat_puts.lock().await && topic.starts_with("symphony2-hb-") {
+            return Err(ClientError::Http {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: "injected heartbeat-store failure".to_owned(),
+            });
+        }
+        if self.is_append_only(topic).await {
+            let kv = self.kv.lock().await;
+            if kv.contains_key(&(topic.to_owned(), key.to_owned())) {
                 return Err(ClientError::Http {
                     status: StatusCode::CONFLICT,
                     body: "append_only: key exists".to_owned(),
                 });
             }
-            kv.insert(entry, value.to_vec());
+        }
+        {
+            let mut kv = self.kv.lock().await;
+            kv.insert((topic.to_owned(), key.to_owned()), value.to_vec());
         }
         // Release any staged batches whose trigger fired.
         let fired: Vec<StagedBatch> = {
@@ -471,6 +529,7 @@ impl V2World {
     async fn new(list_uuid: &str, extra_members: &[&Author]) -> TestResult<Self> {
         let daemon = Arc::new(InMemoryX0xd::default());
         let me = Arc::new(Author::generate()?);
+        daemon.set_local_agent(&me.id).await;
         let manager = V2StoreManager::new(
             daemon.clone(),
             Arc::new(LocalSigner { author: me.clone() }),
@@ -501,6 +560,7 @@ impl V2World {
                 .await;
             for member in extra_members {
                 let peer_topic = event_store_topic(list_uuid, &member.id);
+                daemon.anchor(&peer_topic, &member.id, "append_only").await;
                 daemon
                     .seed(&peer_topic, CARD_SELF_KEY, member.pk.clone())
                     .await;
@@ -1200,5 +1260,109 @@ async fn parity_handoff_reads_as_review() -> TestResult {
 
     let (v2, agent2, issue2) = v2_world_with_issue("wpb2-parity-handoff").await?;
     scenario_handoff_reads_as_review(&v2.tracker, &agent2, &issue2).await?;
+    Ok(())
+}
+
+/// Codex blocker 1 regression: a heartbeat-store write failure AFTER the
+/// fold-winning claim is durably confirmed must NOT fail the claim —
+/// heartbeats are non-authoritative liveness hints (spec §2.6).
+#[tokio::test]
+async fn claim_survives_heartbeat_write_failure() -> TestResult {
+    let world = V2World::new("wpb2-hbfail", &[]).await?;
+    let tracker: &dyn Tracker = &world.tracker;
+    let agent = AgentId::new(world.me.id.clone())?;
+    let issue = tracker.create_issue(draft("hb-fragile", "spec")).await?;
+
+    *world.daemon.fail_heartbeat_puts.lock().await = true;
+    let claim = tracker
+        .claim(&issue.id, &agent)
+        .await
+        .map_err(|e| err(format!("claim must survive a heartbeat failure, got: {e}")))?;
+    assert_eq!(claim.by, agent);
+    let folded = tracker.fetch_by_ids(std::slice::from_ref(&issue.id)).await?;
+    assert_eq!(
+        folded[0].state,
+        IssueState::new("in_progress")?,
+        "the durable claim stands even though the heartbeat write failed"
+    );
+    // The failure only cost the liveness hint; explicit heartbeat() still
+    // reports the store error (its ONLY job is the heartbeat write).
+    assert!(tracker.heartbeat(&claim).await.is_err());
+    *world.daemon.fail_heartbeat_puts.lock().await = false;
+    tracker.heartbeat(&claim).await?;
+    Ok(())
+}
+
+/// Codex blocker 2 regression: an author admitted by a roster UPDATE (not
+/// the genesis roster) must have its store joined and its events visible
+/// through the PRODUCTION tracker read path (fold_view join fixpoint).
+#[tokio::test]
+async fn roster_added_member_events_visible_via_tracker_read_path() -> TestResult {
+    let world = V2World::new("wpb2-rosteradd", &[]).await?;
+    let tracker: &dyn Tracker = &world.tracker;
+
+    // Creator publishes roster epoch 1 adding a brand-new member.
+    let peer = Author::generate()?;
+    let manager = V2StoreManager::new(
+        world.daemon.clone(),
+        Arc::new(LocalSigner {
+            author: world.me.clone(),
+        }),
+        StorePolicyMode::AppendOnly,
+    );
+    let own = manager.ensure_own_store(&world.list_uuid).await?;
+    manager
+        .publish_roster_update(
+            &own,
+            &world.genesis_hash,
+            1,
+            &world.genesis_hash,
+            vec![world.me.id.clone(), peer.id.clone()],
+        )
+        .await?;
+
+    // The peer's store exists with card-self + an Open event, but is NOT
+    // pre-anchored: only the tracker's own join may make it readable.
+    let peer_topic = event_store_topic(&world.list_uuid, &peer.id);
+    world
+        .daemon
+        .seed(&peer_topic, CARD_SELF_KEY, peer.pk.clone())
+        .await;
+    let open = TransitionEventV2 {
+        schema: V2_SCHEMA,
+        list_uuid: world.list_uuid.clone(),
+        genesis_manifest_hash: world.genesis_hash.clone(),
+        roster_epoch: 1,
+        issue_id: "peer-issue".to_owned(),
+        actor: peer.id.clone(),
+        lamport: 5,
+        author_seq: 1,
+        prev_own_event_hash: world.genesis_hash.clone(),
+        kind: TransitionKind::open("from the roster-added member", "spec"),
+    };
+    let payload = open.to_signed_bytes().map_err(err)?;
+    let open_hash = sha256_hex(&payload);
+    let envelope = peer.sign_envelope(TRANSITION_CONTEXT_V2, &payload)?;
+    world
+        .daemon
+        .seed(
+            &peer_topic,
+            &event_key("peer-issue", &open_hash),
+            envelope.encode().map_err(err)?,
+        )
+        .await;
+
+    // Production read path: list_issues → fold_view → join fixpoint.
+    let issues = tracker.list_issues().await?;
+    assert!(
+        issues.iter().any(|i| i.id.as_str() == "peer-issue"),
+        "roster-added member's issue must be visible via the tracker read path; got {:?}",
+        issues.iter().map(|i| i.id.as_str().to_owned()).collect::<Vec<_>>()
+    );
+    let joins = world.daemon.joins.lock().await.clone();
+    assert!(
+        joins.iter().any(|t| t == &peer_topic),
+        "the tracker must have JOINED the roster-added member's store, joins: {joins:?}"
+    );
     Ok(())
 }

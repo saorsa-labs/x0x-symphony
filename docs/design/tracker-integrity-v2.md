@@ -141,7 +141,12 @@ verbatim content of one author's store as anchored by the local x0xd.
 Trust (`required_trust` vs local contacts) and approval TTL are dispatch-time
 local policy ONLY (C2/C3): they may refuse to dispatch or display, they never
 change folded state. Two independent folds of the same event set agree; input
-order (streams and records) is canonicalized away.
+order (streams and records) is canonicalized away. Canonicalization includes
+`card-self` conflicts: when duplicate streams claim one owner with MORE THAN
+ONE distinct self-card (explicit field or `card-self` record), that owner is
+rejected outright with per-record rejections — any pick-one rule would make
+fold output depend on arrival order. A conflicted CREATOR refuses the whole
+list.
 
 ### 2.1 Genesis resolution — the refusal gate (downgrade defense, Q5)
 
@@ -264,9 +269,13 @@ Ineffective events are recorded as phase-2 rejections and change nothing.
 (callers stamp their next event with `max+1`), per-author chain tips,
 rejections, and fork evidence.
 
-**Approval ledger (WP-B).** The same ordered walk maintains:
+**Approval ledger (WP-B).** Admitted approvals are collected in a
+PRE-PASS over the full admitted set — they are an order-independent set, so
+a consume is never misdiagnosed merely because its approval carries a later
+fold position (e.g. an approver's lamport running ahead). The ordered walk
+then maintains:
 
-- `approvals`: admitted `ApprovalEventV2`s (a set — order-independent).
+- `approvals`: admitted `ApprovalEventV2`s (the pre-collected set).
 - `effective_consumes`: at most ONE effective consume per approval, ever.
   A consume is effective at its fold position iff (1) its approval is
   admitted, names the same issue and approver, carries an `approve` verdict
@@ -334,7 +343,7 @@ gossip records (out of WP-B2 scope, unchanged).
 |---|---|
 | `create_issue(draft)` | `Open` transition (title/spec + `title_sha256`/`spec_sha256`), issue id = fresh uuid. Also creates the display TaskList item (§2.7). |
 | `list_issues` / `fetch_by_ids` / `fetch_candidates` / `fetch_claimed` | fold → `Issue` projection (below). Candidate filtering/sorting matches v1 (active states, terminal blockers — v2 issues have no blockers — priority then id). |
-| `claim(id, agent)` | requires `agent` == the local author; fold → require `Open` → append `Claim` (nonce from `derive_claim_nonce`) → confirming re-fold: if the fold winner is not our claim, the claim FAILED (deterministic loser, surfaced as an error). |
+| `claim(id, agent)` | requires `agent` == the local author; fold → require `Open` → append `Claim` (nonce from `derive_claim_nonce`) → confirming re-fold: if the fold winner is not our claim, the claim FAILED (deterministic loser, surfaced as an error). The post-confirmation initial heartbeat write is BEST-EFFORT: heartbeats are non-authoritative, so its failure logs a warning and never un-wins the durable claim. |
 | `heartbeat(claim)` | fold-fence check (we hold the winning claim), then `hb-<issue>` write in the mutable heartbeat companion store. Never a fold input. |
 | `release(claim, reason)` | fold-fence → append `Release`. The v1 release `reason` is local diagnostics only (logged), NOT a fold input — except that the orchestrator's `block()` carries it (next row). |
 | `block(claim, reason)` | fold-fence → append `Block` with `reason = AwaitingApproval` when the v1 code is `awaiting_approval`, else `Other{detail}` (never requeue-able, C6). |
@@ -370,6 +379,20 @@ consume minted by the WP-B gate directly) projects to nothing on the v1
 surface; the v2 fold, not the v1 projection, is the authority on whether an
 approval is spent — `store_consumed`'s consume-then-confirm makes the v1
 flow inherit that authority.
+
+**Reads (join fixpoint + daemon anchors).** Every fold joins roster
+members' stores to a FIXPOINT: after each fold the current-epoch roster is
+diffed against the joined set, new members (including those admitted by
+roster UPDATES) are joined, and the list is re-read and re-folded until no
+new member appears (bounded; the cap is surfaced loudly). Every store the
+manager touches — own, joined, and read paths alike — is verified against
+the DAEMON-REPORTED anchor: reported owner must equal the expected author
+and, in append-only mode, the reported policy must be `append_only`;
+silence (missing listing/owner/policy) is refusal. The four-way binding is
+anchored in what the daemon reports, never in caller inputs. Fork evidence
+is logged at error level on every fold and attached as `ForkEvidence`
+verification notices to issues whose opener or current claimant
+equivocated.
 
 **Bootstrap (`ensure_surfaces`).** Bind the local author store (WP-X policy
 gate applies). When the local agent IS the list creator and no genesis

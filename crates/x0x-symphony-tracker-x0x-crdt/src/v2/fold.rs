@@ -193,6 +193,10 @@ pub struct FoldOutput {
     /// Highest roster epoch established by the verified roster chain
     /// (0 = genesis roster only).
     pub latest_roster_epoch: u64,
+    /// Membership at [`Self::latest_roster_epoch`]. Readers use this to
+    /// decide which per-author stores to join — including members added by
+    /// roster UPDATES, not just the genesis roster.
+    pub current_roster: BTreeSet<String>,
     /// Folded issues, keyed by issue id.
     pub issues: BTreeMap<String, IssueStateV2>,
     /// Highest lamport among admitted events (0 when none) — callers use
@@ -355,8 +359,16 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
 
     // Canonicalize stream order so nothing downstream depends on input order.
     // Duplicate streams for the same owner are merged (records concatenated,
-    // then key-sorted); duplicate identical records collapse.
-    let streams = canonical_streams(&input.streams);
+    // then key-sorted); duplicate identical records collapse. An owner whose
+    // merged input carries CONFLICTING card-self values is rejected outright
+    // — two different self-certifying keys for one agent id is an anomaly,
+    // and any pick-one rule would make fold output depend on input order.
+    let (streams, conflicted) = canonical_streams(&input.streams);
+    if let Some(reason) = conflicted.get(&input.creator) {
+        return Err(ListRefusal::InvalidGenesis(format!(
+            "creator card-self conflict: {reason}"
+        )));
+    }
 
     // ---- Genesis resolution (refusal gate) --------------------------------
     let creator_stream = streams
@@ -393,10 +405,19 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
     let latest_roster_epoch = u64::try_from(rosters.len())
         .unwrap_or(u64::MAX)
         .saturating_sub(1);
+    let current_roster = rosters.last().cloned().unwrap_or_default();
 
     // ---- Phase 1: per-stream candidate admission ---------------------------
     let mut per_author: BTreeMap<String, Vec<Admitted>> = BTreeMap::new();
     for (owner, stream) in &streams {
+        if let Some(reason) = conflicted.get(owner) {
+            // Conflicting card-self: no deterministic four-way binding is
+            // possible — reject every event, surfaced per record.
+            for record in event_records(stream) {
+                rejections.push(admission_rejection(owner, &record.key, reason.clone()));
+            }
+            continue;
+        }
         let card = match verified_card(stream) {
             Ok(card) => card,
             Err(reason) => {
@@ -465,6 +486,21 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
     let mut effective_consumes: BTreeMap<String, EffectiveConsumeV2> = BTreeMap::new();
     let mut losing_consumes: Vec<ConsumeDiagnostic> = Vec::new();
     let mut handoffs: BTreeMap<String, Vec<HandoffRecordV2>> = BTreeMap::new();
+    // Approvals are an order-independent SET (spec §2.4): collect ALL of
+    // them BEFORE the ordered walk, so a consume is never misdiagnosed as
+    // referencing an unknown approval merely because the approval carries a
+    // later fold position (e.g. an approver's lamport running ahead).
+    for adm in &ordered {
+        if let ChainedPayload::Approval(approval) = &adm.payload {
+            approvals.insert(
+                adm.event_hash.clone(),
+                AdmittedApprovalV2 {
+                    event_hash: adm.event_hash.clone(),
+                    approval: approval.clone(),
+                },
+            );
+        }
+    }
     for adm in &ordered {
         match &adm.payload {
             ChainedPayload::Transition(event) => {
@@ -477,16 +513,8 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
                     });
                 }
             }
-            ChainedPayload::Approval(approval) => {
-                // Approvals are a set: admission already established every
-                // binding; content addressing dedups byte-identical records.
-                approvals.insert(
-                    adm.event_hash.clone(),
-                    AdmittedApprovalV2 {
-                        event_hash: adm.event_hash.clone(),
-                        approval: approval.clone(),
-                    },
-                );
+            ChainedPayload::Approval(_) => {
+                // Collected in the pre-pass above (order-independent set).
             }
             ChainedPayload::Consume(consume) => {
                 match consume_effectiveness(&issues, &approvals, &effective_consumes, consume) {
@@ -540,6 +568,7 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
         genesis,
         genesis_hash,
         latest_roster_epoch,
+        current_roster,
         issues,
         max_admitted_lamport,
         rejections,
@@ -570,8 +599,18 @@ fn handoff_fence(
 }
 
 /// Merge and canonicalize input streams by owner; sort records by key.
-fn canonical_streams(streams: &[AuthorStream]) -> BTreeMap<String, AuthorStream> {
+///
+/// Returns `(streams, conflicted)`: an owner appears in `conflicted` (with a
+/// deterministic, order-independent reason) when its merged input carries
+/// MORE THAN ONE distinct `card-self` value — across explicit `card_self`
+/// fields and `card-self` records alike. Such an owner cannot be bound
+/// deterministically and is rejected by the caller; any pick-one rule would
+/// make fold output depend on which stream copy arrived first.
+fn canonical_streams(
+    streams: &[AuthorStream],
+) -> (BTreeMap<String, AuthorStream>, BTreeMap<String, String>) {
     let mut merged: BTreeMap<String, AuthorStream> = BTreeMap::new();
+    let mut cards: BTreeMap<String, BTreeSet<Vec<u8>>> = BTreeMap::new();
     for stream in streams {
         let entry = merged
             .entry(stream.owner.clone())
@@ -583,15 +622,41 @@ fn canonical_streams(streams: &[AuthorStream]) -> BTreeMap<String, AuthorStream>
         if entry.card_self.is_none() {
             entry.card_self.clone_from(&stream.card_self);
         }
+        if let Some(card) = &stream.card_self {
+            cards
+                .entry(stream.owner.clone())
+                .or_default()
+                .insert(card.clone());
+        }
         entry.records.extend(stream.records.iter().cloned());
     }
+    let mut conflicted: BTreeMap<String, String> = BTreeMap::new();
     for stream in merged.values_mut() {
         stream
             .records
             .sort_by(|a, b| (&a.key, &a.value).cmp(&(&b.key, &b.value)));
         stream.records.dedup();
+        let candidates = cards.entry(stream.owner.clone()).or_default();
+        for record in stream.records.iter().filter(|r| r.key == CARD_SELF_KEY) {
+            candidates.insert(record.value.clone());
+        }
+        if candidates.len() > 1 {
+            let hashes: Vec<String> = candidates
+                .iter()
+                .map(|card| sha256_hex(card))
+                .collect();
+            conflicted.insert(
+                stream.owner.clone(),
+                format!(
+                    "conflicting card-self values for this owner (sha256: {}) — \
+                     no deterministic author binding is possible; all events \
+                     from this stream are rejected",
+                    hashes.join(" vs ")
+                ),
+            );
+        }
     }
-    merged
+    (merged, conflicted)
 }
 
 /// Verify a stream's `card-self` against its anchored owner. Returns the raw

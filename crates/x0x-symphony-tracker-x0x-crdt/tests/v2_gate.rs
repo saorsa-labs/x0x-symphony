@@ -124,12 +124,32 @@ impl SigningClient for LocalSigner {
 #[derive(Default)]
 struct MockDaemon {
     kv: Mutex<BTreeMap<(String, String), Vec<u8>>>,
+    /// Daemon-anchored owner per store topic — the double mocks the
+    /// anchoring NEGOTIATION (create anchors to the local agent, join
+    /// anchors to the expected owner), never blessing topics by name.
+    anchors: Mutex<BTreeMap<String, String>>,
+    /// The daemon's local agent identity (owner of created stores).
+    local_agent: Mutex<Option<String>>,
     /// Records that become visible only after the first consume (`cs-*`)
     /// write — simulates a partition healing right as we consume.
     staged: Mutex<Vec<(String, String, Vec<u8>)>>,
 }
 
 impl MockDaemon {
+    async fn set_local_agent(&self, agent: &str) {
+        *self.local_agent.lock().await = Some(agent.to_owned());
+    }
+
+    /// Anchor `topic` to `owner`, as the daemon would after a network
+    /// ownership lookup (used when a peer store's records are seeded
+    /// directly instead of arriving through a join).
+    async fn anchor(&self, topic: &str, owner: &str) {
+        self.anchors
+            .lock()
+            .await
+            .insert(topic.to_owned(), owner.to_owned());
+    }
+
     async fn seed(&self, topic: &str, key: &str, value: Vec<u8>) {
         self.kv
             .lock()
@@ -162,6 +182,13 @@ impl V2StoreApi for MockDaemon {
         topic: &str,
         policy: Option<&str>,
     ) -> std::result::Result<StoreCreateOutcome, ClientError> {
+        if let Some(agent) = self.local_agent.lock().await.clone() {
+            self.anchors
+                .lock()
+                .await
+                .entry(topic.to_owned())
+                .or_insert(agent);
+        }
         Ok(StoreCreateOutcome {
             id: topic.to_owned(),
             policy: policy.map(str::to_owned),
@@ -170,19 +197,31 @@ impl V2StoreApi for MockDaemon {
 
     async fn join_kv_store(
         &self,
-        _topic: &str,
-        _expected_owner: &str,
+        topic: &str,
+        expected_owner: &str,
     ) -> std::result::Result<(), ClientError> {
-        Ok(())
+        let mut anchors = self.anchors.lock().await;
+        match anchors.get(topic) {
+            Some(owner) if owner != expected_owner => Err(ClientError::Http {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                body: format!("expected owner mismatch: anchored to {owner}"),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                anchors.insert(topic.to_owned(), expected_owner.to_owned());
+                Ok(())
+            }
+        }
     }
 
     async fn kv_store_detail(
         &self,
         topic: &str,
     ) -> std::result::Result<Option<StoreDetailEntry>, ClientError> {
-        Ok(Some(StoreDetailEntry {
+        let owner = self.anchors.lock().await.get(topic).cloned();
+        Ok(owner.map(|owner| StoreDetailEntry {
             id: topic.to_owned(),
-            owner: None,
+            owner: Some(owner),
             policy: Some("append_only".to_owned()),
         }))
     }
@@ -312,7 +351,9 @@ impl GateWorld {
         let open_hash = sha256_hex(&open_payload);
         let open_env = creator.sign_envelope(TRANSITION_CONTEXT_V2, &open_payload)?;
 
+        daemon.set_local_agent(&me.id).await;
         let creator_topic = event_store_topic(list_uuid, &creator.id);
+        daemon.anchor(&creator_topic, &creator.id).await;
         daemon
             .seed(&creator_topic, CARD_SELF_KEY, creator.pk.clone())
             .await;
@@ -332,6 +373,7 @@ impl GateWorld {
             .await;
 
         let approver_topic = event_store_topic(list_uuid, &approver.id);
+        daemon.anchor(&approver_topic, &approver.id).await;
         daemon
             .seed(&approver_topic, CARD_SELF_KEY, approver.pk.clone())
             .await;
@@ -481,6 +523,7 @@ async fn competing_consume_after_partition_heal_aborts_without_executing() -> Te
     // fold-winning (competitor's) claim. Our consume (13) is unfenced at its
     // position — the competitor's is the effective one once visible.
     let comp_topic = event_store_topic(&world.list_uuid, &competitor.id);
+    world.daemon.anchor(&comp_topic, &competitor.id).await;
     let comp_claim = TransitionEventV2 {
         schema: V2_SCHEMA,
         list_uuid: world.list_uuid.clone(),

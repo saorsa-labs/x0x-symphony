@@ -228,6 +228,24 @@ pub enum V2StoreError {
     #[error("invalid v2 record: {0}")]
     Invalid(String),
 
+    /// The daemon listing does not contain the store at all.
+    #[error("store {topic} is not in the daemon listing")]
+    NotFound {
+        /// Store topic.
+        topic: String,
+    },
+
+    /// The daemon-reported anchor (owner and/or policy) does not match what
+    /// this reader requires. The four-way author binding is anchored in what
+    /// the DAEMON reports, never in caller-supplied inputs.
+    #[error("store {topic}: daemon anchor mismatch: {reason}")]
+    AnchorMismatch {
+        /// Store topic.
+        topic: String,
+        /// What disagreed.
+        reason: String,
+    },
+
     /// The fold refused the entire list (downgrade defense).
     #[error(transparent)]
     Refused(#[from] super::fold::ListRefusal),
@@ -273,6 +291,49 @@ impl V2StoreManager {
     #[must_use]
     pub const fn mode(&self) -> StorePolicyMode {
         self.mode
+    }
+
+    /// Verify the DAEMON-REPORTED anchor for `topic`: the reported owner
+    /// must equal `expected_owner`, and in [`StorePolicyMode::AppendOnly`]
+    /// the reported policy must be `append_only`. Silence — a missing
+    /// listing, a missing owner, or a missing policy field — is refusal,
+    /// never acceptance. This runs for EVERY store this manager touches
+    /// (own, joined, and read paths): the four-way author binding is
+    /// anchored in what the daemon reports, not in caller inputs.
+    ///
+    /// # Errors
+    ///
+    /// [`V2StoreError::NotFound`] when the store is not listed,
+    /// [`V2StoreError::AnchorMismatch`] on an owner mismatch, and
+    /// [`V2StoreError::PolicyNotHonored`] on a policy mismatch.
+    pub async fn verify_store_anchor(&self, topic: &str, expected_owner: &str) -> Result<()> {
+        let detail = self
+            .api
+            .kv_store_detail(topic)
+            .await?
+            .ok_or_else(|| V2StoreError::NotFound {
+                topic: topic.to_owned(),
+            })?;
+        match detail.owner.as_deref() {
+            Some(owner) if owner == expected_owner => {}
+            other => {
+                return Err(V2StoreError::AnchorMismatch {
+                    topic: topic.to_owned(),
+                    reason: format!(
+                        "daemon reports owner {other:?}, expected author {expected_owner}"
+                    ),
+                });
+            }
+        }
+        if self.mode == StorePolicyMode::AppendOnly
+            && detail.policy.as_deref() != Some("append_only")
+        {
+            return Err(V2StoreError::PolicyNotHonored {
+                topic: topic.to_owned(),
+                actual: detail.policy,
+            });
+        }
+        Ok(())
     }
 
     /// Ensure the local author's event store exists for `list_uuid`, with the
@@ -323,31 +384,19 @@ impl V2StoreManager {
             Err(e) => return Err(e.into()),
         }
 
-        // Verify the effective policy on EVERY open, not just creation: a
-        // store created earlier (or by an older daemon that silently ignored
-        // the policy field) as mutable `signed` must never masquerade as
-        // append-only. The daemon-reported detail is the source of truth;
-        // silence (no policy field, or store missing from the listing) is
-        // NOT acceptance.
-        match self.mode {
-            StorePolicyMode::AppendOnly => {
-                let actual = self
-                    .api
-                    .kv_store_detail(&topic)
-                    .await?
-                    .and_then(|detail| detail.policy);
-                if actual.as_deref() != Some("append_only") {
-                    return Err(V2StoreError::PolicyNotHonored { topic, actual });
-                }
-            }
-            StorePolicyMode::SignedFallback => {
-                tracing::warn!(
-                    topic = %topic,
-                    "v2 event store opened with interim signed policy; \
-                     append-only guarantees (design r2 C1) are NOT active \
-                     (TODO x0x WP-X / x0x-symphony#10)"
-                );
-            }
+        // Verify the DAEMON-REPORTED anchor on EVERY open, not just
+        // creation: the reported owner must be this signer, and (in
+        // append-only mode) a store created earlier as mutable `signed` —
+        // or by an older daemon that silently ignored the policy field —
+        // must never masquerade as append-only. Silence is not acceptance.
+        self.verify_store_anchor(&topic, &sign.agent_id).await?;
+        if self.mode == StorePolicyMode::SignedFallback {
+            tracing::warn!(
+                topic = %topic,
+                "v2 event store opened with interim signed policy; \
+                 append-only guarantees (design r2 C1) are NOT active \
+                 (TODO x0x WP-X / x0x-symphony#10)"
+            );
         }
 
         // Publish card-self exactly once (first key each author writes).
@@ -384,10 +433,14 @@ impl V2StoreManager {
     pub async fn join_peer_store(&self, list_uuid: &str, peer_agent_id: &str) -> Result<String> {
         let topic = event_store_topic(list_uuid, peer_agent_id);
         match self.api.join_kv_store(&topic, peer_agent_id).await {
-            Ok(()) => Ok(topic),
-            Err(ClientError::Http { status, .. }) if status == StatusCode::CONFLICT => Ok(topic),
-            Err(e) => Err(e.into()),
+            Ok(()) => {}
+            Err(ClientError::Http { status, .. }) if status == StatusCode::CONFLICT => {}
+            Err(e) => return Err(e.into()),
         }
+        // The join's expected_owner is our input; the binding is only real
+        // once the DAEMON reports the same anchor (owner + policy).
+        self.verify_store_anchor(&topic, peer_agent_id).await?;
+        Ok(topic)
     }
 
     /// Join every roster peer's store (excluding `own_agent_id`). Returns the
@@ -718,6 +771,10 @@ impl V2StoreManager {
         author_agent_id: &str,
     ) -> Result<AuthorStream> {
         let topic = event_store_topic(list_uuid, author_agent_id);
+        // The caller supplies the author id, but the read is only trusted
+        // once the daemon-reported anchor agrees (owner + policy) — the
+        // fold's four-way binding starts from what the daemon anchored.
+        self.verify_store_anchor(&topic, author_agent_id).await?;
         let keys = self.api.list_kv_keys(&topic).await?;
         let mut card_self = None;
         let mut records = Vec::with_capacity(keys.len());
@@ -754,16 +811,29 @@ impl V2StoreManager {
     /// the pure layer).
     pub async fn read_fold_input(&self, list_uuid: &str, creator: &str) -> Result<FoldInput> {
         let creator_stream = self.read_author_stream(list_uuid, creator).await?;
-        // Best-effort roster pre-extraction, for addressing only: parse the
-        // genesis payload WITHOUT trusting it (fold re-verifies everything).
-        let mut members: Vec<String> = Vec::new();
-        if let Some(record) = creator_stream.records.iter().find(|r| r.key == GENESIS_KEY) {
-            if let Ok(envelope) = EventEnvelope::decode(&record.value) {
-                if let Ok(payload) = envelope.payload_bytes() {
-                    if let Ok(genesis) = serde_json::from_slice::<GenesisManifestV2>(&payload) {
-                        members = genesis.roster;
-                    }
+        // Best-effort roster pre-extraction, for ADDRESSING only: parse the
+        // genesis payload AND every roster-update payload WITHOUT trusting
+        // them (the fold re-verifies everything). Roster updates matter
+        // here so members added after genesis get their streams read too.
+        let mut members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for record in &creator_stream.records {
+            let is_genesis = record.key == GENESIS_KEY;
+            let is_roster = record.key.starts_with(super::events::ROSTER_KEY_PREFIX);
+            if !is_genesis && !is_roster {
+                continue;
+            }
+            let Ok(envelope) = EventEnvelope::decode(&record.value) else {
+                continue;
+            };
+            let Ok(payload) = envelope.payload_bytes() else {
+                continue;
+            };
+            if is_genesis {
+                if let Ok(genesis) = serde_json::from_slice::<GenesisManifestV2>(&payload) {
+                    members.extend(genesis.roster);
                 }
+            } else if let Ok(roster) = serde_json::from_slice::<RosterEventV2>(&payload) {
+                members.extend(roster.roster);
             }
         }
         let mut streams = vec![creator_stream];
@@ -779,6 +849,9 @@ impl V2StoreManager {
                     if status == StatusCode::NOT_FOUND =>
                 {
                     tracing::debug!(member = %member, "v2 member stream not available yet");
+                }
+                Err(V2StoreError::NotFound { .. }) => {
+                    tracing::debug!(member = %member, "v2 member store not anchored yet");
                 }
                 Err(e) => return Err(e),
             }
@@ -850,9 +923,28 @@ impl V2StoreManager {
     pub async fn join_peer_heartbeats(&self, list_uuid: &str, peer_agent_id: &str) -> Result<()> {
         let topic = heartbeat_store_topic(list_uuid, peer_agent_id);
         match self.api.join_kv_store(&topic, peer_agent_id).await {
-            Ok(()) => Ok(()),
-            Err(ClientError::Http { status, .. }) if status == StatusCode::CONFLICT => Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(()) => {}
+            Err(ClientError::Http { status, .. }) if status == StatusCode::CONFLICT => {}
+            Err(e) => return Err(e.into()),
+        }
+        // Owner must anchor to the peer; the policy is deliberately the
+        // mutable `signed` one (heartbeats are non-authoritative), so only
+        // the owner leg of the anchor is enforced here.
+        let detail = self
+            .api
+            .kv_store_detail(&topic)
+            .await?
+            .ok_or_else(|| V2StoreError::NotFound {
+                topic: topic.clone(),
+            })?;
+        match detail.owner.as_deref() {
+            Some(owner) if owner == peer_agent_id => Ok(()),
+            other => Err(V2StoreError::AnchorMismatch {
+                topic,
+                reason: format!(
+                    "heartbeat store owner {other:?} is not the expected peer {peer_agent_id}"
+                ),
+            }),
         }
     }
 }
@@ -941,11 +1033,15 @@ mod tests {
         Policy(&'static str),
     }
 
-    /// In-memory daemon double for the store manager.
+    /// In-memory daemon double for the store manager. The double mocks the
+    /// daemon's anchoring NEGOTIATION (a reported owner id + policy), never
+    /// blessing topics by name.
     struct MockApi {
         /// `create` returns 409 when true (store pre-exists).
         store_exists: bool,
         detail: MockDetail,
+        /// Daemon-reported owner for every listed store.
+        owner: std::sync::Mutex<Option<String>>,
         kv: Mutex<BTreeMap<(String, String), Vec<u8>>>,
     }
 
@@ -954,8 +1050,16 @@ mod tests {
             Self {
                 store_exists,
                 detail,
+                owner: std::sync::Mutex::new(None),
                 kv: Mutex::new(BTreeMap::new()),
             }
+        }
+
+        fn with_owner(self, owner: &str) -> Self {
+            if let Ok(mut slot) = self.owner.lock() {
+                *slot = Some(owner.to_owned());
+            }
+            self
         }
     }
 
@@ -996,12 +1100,12 @@ mod tests {
                 MockDetail::NotListed => None,
                 MockDetail::NoPolicyField => Some(StoreDetailEntry {
                     id: topic.to_owned(),
-                    owner: None,
+                    owner: self.owner.lock().ok().and_then(|o| o.clone()),
                     policy: None,
                 }),
                 MockDetail::Policy(policy) => Some(StoreDetailEntry {
                     id: topic.to_owned(),
-                    owner: None,
+                    owner: self.owner.lock().ok().and_then(|o| o.clone()),
                     policy: Some((*policy).to_owned()),
                 }),
             })
@@ -1057,7 +1161,28 @@ mod tests {
     }
 
     fn manager(api: MockApi, signer: MockSigner, mode: StorePolicyMode) -> V2StoreManager {
+        // The double reports the signer as the daemon-anchored owner (the
+        // production shape: the daemon signs and owns the local store).
+        let api = api.with_owner(&signer.agent_id);
         V2StoreManager::new(Arc::new(api), Arc::new(signer), mode)
+    }
+
+    /// The daemon-reported owner is authoritative: a listing that anchors a
+    /// DIFFERENT owner than the signing identity is refused outright.
+    #[tokio::test]
+    async fn owner_mismatch_is_refused() -> TestResult {
+        let api = MockApi::new(true, MockDetail::Policy("append_only"))
+            .with_owner(&"d".repeat(64));
+        let mgr = V2StoreManager::new(
+            Arc::new(api),
+            Arc::new(MockSigner::generate()?),
+            StorePolicyMode::AppendOnly,
+        );
+        assert!(matches!(
+            mgr.ensure_own_store("list-1").await,
+            Err(V2StoreError::AnchorMismatch { .. })
+        ));
+        Ok(())
     }
 
     /// FIX 1 (Codex review of PR #11): a store that ALREADY EXISTS as
@@ -1094,7 +1219,8 @@ mod tests {
             mgr.ensure_own_store("list-1").await,
             Err(V2StoreError::PolicyNotHonored { actual: None, .. })
         ));
-        // Store 409s on create but is missing from GET /stores: also refused.
+        // Store 409s on create but is missing from GET /stores: refused as
+        // not-listed (silence is not acceptance).
         let mgr = manager(
             MockApi::new(true, MockDetail::NotListed),
             MockSigner::generate()?,
@@ -1102,7 +1228,7 @@ mod tests {
         );
         assert!(matches!(
             mgr.ensure_own_store("list-1").await,
-            Err(V2StoreError::PolicyNotHonored { actual: None, .. })
+            Err(V2StoreError::NotFound { .. })
         ));
         Ok(())
     }

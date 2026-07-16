@@ -19,13 +19,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use x0x_symphony_core::{
     content_hash, sha256_hex, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalState,
     ApprovalVerdict, Claim, Handoff, Issue, IssueDraft, IssueId, IssueState, PollContext,
     ReleaseReason, ReleaseReasonCode, ShardRole, SignatureProvenance, SymphonyError, Tracker,
-    ValidationResult,
+    ValidationResult, VerificationNotice, VerificationNoticeKind,
 };
 
 use super::events::{
@@ -184,30 +184,82 @@ impl V2Tracker {
         Ok(())
     }
 
-    /// Read + fold the list; join newly visible roster peers (event and
-    /// heartbeat stores) best-effort so the NEXT fold sees them.
+    /// Read + fold the list, joining roster members' stores to a FIXPOINT:
+    /// roster UPDATES can admit members whose stores this reader has never
+    /// joined, so after each fold the current roster is diffed against the
+    /// joined set, new members are joined (event + heartbeat stores), and
+    /// the list is re-read + re-folded until no new member appears. The
+    /// loop is bounded — each pass must join at least one new member to
+    /// continue, and rosters are small; the cap is surfaced loudly.
     async fn fold_view(&self) -> x0x_symphony_core::Result<FoldOutput> {
+        const MAX_JOIN_PASSES: usize = 8;
+        let mut out = self.read_and_fold().await?;
+        for _pass in 0..MAX_JOIN_PASSES {
+            if !self.join_new_members(&out).await {
+                return Ok(out);
+            }
+            out = self.read_and_fold().await?;
+        }
+        warn!(
+            list = %self.list_ref.to_ref_string(),
+            "v2 roster join fixpoint not reached in {MAX_JOIN_PASSES} passes; \
+             proceeding with the current fold view"
+        );
+        Ok(out)
+    }
+
+    async fn read_and_fold(&self) -> x0x_symphony_core::Result<FoldOutput> {
         let input = self
             .manager
             .read_fold_input(&self.list_ref.list_uuid, &self.list_ref.creator)
             .await
             .map_err(|e| store_err(&e))?;
-        let out = fold_v2(&input).map_err(|refusal| terr(format!("v2 list refused: {refusal}")))?;
-        // Best-effort follow-up joins for roster members we have not joined.
+        let out =
+            fold_v2(&input).map_err(|refusal| terr(format!("v2 list refused: {refusal}")))?;
+        // Fork evidence is self-authenticating proof of equivocation —
+        // surfaced loudly on every fold, never swallowed.
+        for fork in &out.forks {
+            error!(
+                list = %self.list_ref.to_ref_string(),
+                author = %fork.author,
+                author_seq = fork.author_seq,
+                event_hashes = ?fork.event_hashes,
+                "v2 fold surfaced author equivocation (fork evidence); the \
+                 forked suffix is inadmissible"
+            );
+        }
+        Ok(out)
+    }
+
+    /// Join stores of roster members (genesis ∪ current epoch) not yet
+    /// joined. Returns true when at least one NEW member store was joined
+    /// (⇒ the caller should re-read and re-fold).
+    async fn join_new_members(&self, out: &FoldOutput) -> bool {
         let own_id = self.agent_id.as_str();
         let mut joined = self.joined.lock().await;
-        for member in &out.genesis.roster {
-            if member == own_id || !joined.insert(member.clone()) {
+        let mut joined_any = false;
+        let members = out
+            .genesis
+            .roster
+            .iter()
+            .chain(out.current_roster.iter());
+        for member in members {
+            if member == own_id || joined.contains(member) {
                 continue;
             }
-            if let Err(e) = self
+            match self
                 .manager
                 .join_peer_store(&self.list_ref.list_uuid, member)
                 .await
             {
-                debug!(member = %member, error = %e, "v2 peer event-store join failed");
-                joined.remove(member);
-                continue;
+                Ok(_) => {
+                    joined.insert(member.clone());
+                    joined_any = true;
+                }
+                Err(e) => {
+                    debug!(member = %member, error = %e, "v2 peer event-store join failed");
+                    continue;
+                }
             }
             if let Err(e) = self
                 .manager
@@ -217,7 +269,7 @@ impl V2Tracker {
                 debug!(member = %member, error = %e, "v2 peer heartbeat-store join failed");
             }
         }
-        Ok(out)
+        joined_any
     }
 
     /// Project one folded issue into the v1 `Issue` surface (spec §2.6).
@@ -250,6 +302,30 @@ impl V2Tracker {
         // The fold admitted the Open event only after full ML-DSA
         // verification — provenance is real, not asserted.
         issue.signature_provenance = Some(SignatureProvenance::verified(st.opened_by.clone()));
+        // Fork evidence involving this issue's opener or current claimant
+        // is attached as a read-path notice (spec: forks are diagnostics,
+        // never silent).
+        let involved: Vec<&str> = match &st.status {
+            IssueStatusV2::Claimed { claimant, .. } | IssueStatusV2::Blocked { claimant, .. } => {
+                vec![st.opened_by.as_str(), claimant.as_str()]
+            }
+            _ => vec![st.opened_by.as_str()],
+        };
+        for fork in &out.forks {
+            if involved.contains(&fork.author.as_str()) {
+                issue.verification_notices.push(VerificationNotice {
+                    kind: VerificationNoticeKind::ForkEvidence,
+                    claimant: AgentId::new(fork.author.clone()).ok(),
+                    reason: format!(
+                        "author {} equivocated at chain seq {} ({} conflicting signed events); \
+                         the forked suffix is inadmissible",
+                        fork.author,
+                        fork.author_seq,
+                        fork.event_hashes.len()
+                    ),
+                });
+            }
+        }
         if let IssueStatusV2::Claimed { claimant, .. } = &st.status {
             let heartbeat = self
                 .manager
@@ -581,11 +657,18 @@ impl Tracker for V2Tracker {
                 )));
             }
         }
+        // The fold-winning claim is already durable and confirmed above.
+        // Heartbeats are non-authoritative liveness hints (spec §2.6) — a
+        // failed initial heartbeat write must NOT un-win the claim.
         let at = now_utc();
-        self.manager
-            .put_heartbeat(own, id.as_str(), &at)
-            .await
-            .map_err(|e| store_err(&e))?;
+        if let Err(e) = self.manager.put_heartbeat(own, id.as_str(), &at).await {
+            warn!(
+                issue = %id,
+                error = %e,
+                "initial heartbeat write failed after a confirmed claim; \
+                 claim stands (heartbeats are non-authoritative)"
+            );
+        }
         self.display_reconcile(id.as_str(), TaskAction::Claim).await;
         Ok(Claim::new(
             Some(id.clone()),
