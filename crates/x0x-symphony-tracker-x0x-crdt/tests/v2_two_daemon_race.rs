@@ -1,48 +1,39 @@
 //! WP-C: the tracker-integrity race harness (x0x-symphony#10, design r2).
 //!
-//! # Execution model — READ THIS FIRST (honest fidelity)
+//! # Topology — GENUINE two-daemon runs
 //!
-//! The design target is TWO isolated live x0xd daemons whose per-author KV
-//! event stores replicate over gossip. This harness was written and
-//! committed against that topology (see `spawn_pair` / the two-daemon
-//! bootstrap below, retained for infrastructure where gossip converges).
-//! **In the local/CI sandbox that topology is not runnable**: two ephemeral
-//! loopback daemons connect at the transport layer and replicate store
-//! *metadata*, but KV *values* do not anti-entropy within a bounded window
-//! (verified: no convergence in 210s on x0xd 0.32.1), and KV values are not
-//! durable across a daemon restart on the same data dir (verified: keys lost
-//! after SIGKILL+restart on 0.32.1). Both are the pillars scenarios ii–vi
-//! would depend on.
+//! The cross-author scenarios spawn TWO isolated live x0xd daemons on
+//! loopback (fresh temp dirs, ephemeral ports, MUTUAL `bootstrap_peers`,
+//! rolling start, `--no-hard-coded-bootstrap`, `[update] enabled = false`)
+//! and drive real cross-daemon replication. Each daemon's own agent
+//! identity signs its author's events, so the daemon-anchored store
+//! ownership (blocker-5 verification) holds exactly as in production.
 //!
-//! So the cross-author scenarios execute against **one live x0xd daemon with
-//! two local ML-DSA-65 authors** (the `mock-crypto` signer pattern):
-//! author A and author B each own an event-store topic on the SAME daemon's
-//! real KV, read back immediately (no cross-daemon sync in the loop). This
-//! PRESERVES the properties that matter for WP-C — real x0xd storage, real
-//! `AccessPolicy::AppendOnly` enforcement (PUT-to-existing → 409), the pure
-//! fold's convergence/exactly-once/rejection/fork guarantees over live
-//! bytes — and DEGRADES only what the sandbox cannot provide:
+//! Empirically verified sync contract (x0xd 0.33.0) the harness relies on:
 //!
-//! - **partition/heal (iv)** → sequential local writes then a single fold
-//!   (a latency-free window, not a real partition; the deterministic-winner
-//!   property is identical because fold order is total);
-//! - **crash-after-consume durability (v)** → SKIPPED live with a loud note,
-//!   because x0xd 0.32.1 does not persist KV across restart; the
-//!   consume-then-execute fail-toward-zero LOGIC is proven in the in-memory
-//!   `v2_gate::crash_after_consume_recovers_via_reapproval` test.
+//! - **subscribe-before-write**: a joined replica receives live deltas
+//!   instantly; keys written BEFORE the peer joined do not backfill within
+//!   test patience. Setup therefore creates each event store and cross-
+//!   joins it BEFORE the first key (card-self/genesis) is written.
+//! - **heal catch-up**: deltas missed while a daemon is down arrive within
+//!   ~15s of restart (checkpoint announce) — partition/heal assertions
+//!   poll well past that.
+//! - **restart persistence**: KV survives SIGKILL + restart (x0x ≥ 0.33.0,
+//!   PR #237). The crash-after-consume scenario requires it and skips
+//!   loudly on older daemons.
 //!
-//! Scenario (i) (v1 RMW record loss) runs fully against one live daemon —
-//! the interleave class it reproduces (API `store_approval` vs gate
-//! `store_consumed` on one node) is exactly issue #10(b)'s single-node RMW
-//! race.
+//! Two single-daemon SMOKE scenarios remain, clearly labeled: (i) the v1
+//! RMW record-loss repro (a single-node interleave by nature — issue
+//! #10(b) names it alongside the cross-node race) and (vi) downgrade
+//! refusals (pure local refusal paths).
 //!
 //! # Mode matrix
 //!
-//! `X0X_V2_APPEND_ONLY=1` → `StorePolicyMode::AppendOnly` plus the WP-X REST
-//! contract assertions (reported policy `append_only`; PUT-to-existing key
-//! → 409). Requires an x0xd honoring `AccessPolicy::AppendOnly`
-//! (x0x ≥ 0.33.0 / PR #237). Unset → interim `SignedFallback` against
-//! x0xd ≤ 0.32.x, append-only assertions skipped (loud `MODE:` banner).
+//! `X0X_V2_APPEND_ONLY=1` → `StorePolicyMode::AppendOnly` plus the WP-X
+//! REST contract assertions (reported policy `append_only`;
+//! PUT-to-existing → 409). Requires x0xd ≥ 0.33.0. Unset → interim
+//! `SignedFallback` for older daemons; append-only assertions skipped
+//! (loud `MODE:` banner).
 
 use std::{
     error::Error,
@@ -54,26 +45,20 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use saorsa_pqc::{MlDsa65, MlDsaOperations, MlDsaSecretKey};
 use x0x_symphony_core::{
     content_hash, sha256_hex, AgentId, ApprovalConsumed, ApprovalEvent, ApprovalVerdict, IssueId,
     SignatureEnvelope, Tracker,
 };
-use x0x_symphony_signing::{
-    AgentInfo, SignResponse, SigningClient, SigningError, VerifyOutcome,
-    X0xdClient as SigningX0xdClient,
-};
+use x0x_symphony_signing::{SigningClient, X0xdClient as SigningX0xdClient};
 use x0x_symphony_tracker_x0x_crdt::{
     client::{AddTaskDraft, X0xdApi, X0xdClient},
     v2::{
+        build_claim_transition,
         events::{
-            event_key, event_store_topic, ApprovalEventV2, ApprovalPayloadV2, ApprovalVerdictV2,
-            BlockReason, EventEnvelope, RequeueJustification, TransitionEventV2, TransitionKind,
-            TRANSITION_CONTEXT_V2, V2_SCHEMA,
+            event_store_topic, ApprovalEventV2, ApprovalPayloadV2, ApprovalVerdictV2,
+            RequeueJustification, TransitionEventV2, TransitionKind, V2_SCHEMA,
         },
-        fold_v2, ConsumeEventV2, FoldInput, FoldOutput, IssueStatusV2, OwnEventStore,
+        fold_v2, BlockReason, ConsumeEventV2, FoldOutput, IssueStatusV2, OwnEventStore,
         StorePolicyMode, V2ListRef, V2StoreApi, V2StoreError, V2StoreManager, V2Tracker,
     },
     X0xCrdtTracker,
@@ -98,6 +83,14 @@ fn policy_mode() -> StorePolicyMode {
              assertions SKIPPED; C1 deletion residual open in this mode"
         );
         StorePolicyMode::SignedFallback
+    }
+}
+
+fn requested_policy_flag() -> Option<&'static str> {
+    if append_only_mode() {
+        Some("append_only")
+    } else {
+        None
     }
 }
 
@@ -126,72 +119,27 @@ fn free_udp_port() -> TestResult<u16> {
     Ok(UdpSocket::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
-// ---------------------------------------------------------------------------
-// Local ML-DSA author (mock-crypto pattern) + its SigningClient.
-// ---------------------------------------------------------------------------
-
-struct Author {
-    id: String,
-    pk: Vec<u8>,
-    sk: MlDsaSecretKey,
-}
-
-impl Author {
-    fn generate() -> TestResult<Self> {
-        let (pk, sk) = MlDsa65::new().generate_keypair()?;
-        let pk = pk.as_bytes().to_vec();
-        Ok(Self {
-            id: x0x_symphony_tracker_x0x_crdt::v2::identity::derive_agent_id_hex(&pk),
-            pk,
-            sk,
-        })
-    }
-}
-
-struct LocalSigner {
-    author: Arc<Author>,
-}
-
-#[async_trait]
-impl SigningClient for LocalSigner {
-    async fn sign(
-        &self,
-        context: &str,
-        payload: &[u8],
-    ) -> std::result::Result<SignResponse, SigningError> {
-        let canonical =
-            x0x_symphony_tracker_x0x_crdt::v2::identity::assemble_external_dst(context, payload);
-        let sig = MlDsa65::new()
-            .sign(&self.author.sk, &canonical)
-            .map_err(|e| SigningError::InvalidResponse(format!("{e}")))?;
-        Ok(SignResponse {
-            agent_id: self.author.id.clone(),
-            public_key_b64: BASE64.encode(&self.author.pk),
-            signature_b64: BASE64.encode(sig.as_bytes()),
-            algorithm: "x0x.agent-sign.v2.ml-dsa-65".to_owned(),
-            context: context.to_owned(),
-        })
-    }
-
-    async fn verify(
-        &self,
-        _c: &str,
-        _p: &[u8],
-        _s: &[u8],
-        _k: &[u8],
-    ) -> std::result::Result<VerifyOutcome, SigningError> {
-        Ok(VerifyOutcome::Valid)
-    }
-
-    async fn agent_identity(&self) -> std::result::Result<AgentInfo, SigningError> {
-        Ok(AgentInfo {
-            agent_id: self.author.id.clone(),
-        })
-    }
+/// Poll `cond` (an async bool expression) every 500ms until true or the
+/// deadline passes; fail the test with `desc` on timeout.
+macro_rules! wait_until {
+    ($desc:expr, $timeout_secs:expr, $cond:expr) => {{
+        let mut ok = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs($timeout_secs);
+        while std::time::Instant::now() < deadline {
+            if $cond {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if !ok {
+            return Err(err(format!("timed out waiting for: {}", $desc)));
+        }
+    }};
 }
 
 // ---------------------------------------------------------------------------
-// Live x0xd daemon lifecycle (single daemon; spawn_pair retained for infra).
+// Daemon lifecycle
 // ---------------------------------------------------------------------------
 
 struct Daemon {
@@ -199,14 +147,20 @@ struct Daemon {
     child: Option<Child>,
     dir: PathBuf,
     config_path: PathBuf,
-    bind_port: u16,
     url: String,
     token: String,
     binary: PathBuf,
 }
 
 impl Daemon {
-    async fn spawn(name: &str, binary: &Path, bootstrap: &[String]) -> TestResult<Self> {
+    /// Write config + start. `bind_port` is pre-allocated by the caller so
+    /// MUTUAL bootstrap lists can name both daemons before either starts.
+    async fn spawn(
+        name: &str,
+        binary: &Path,
+        bind_port: u16,
+        bootstrap: &[String],
+    ) -> TestResult<Self> {
         let dir = std::env::temp_dir().join(format!(
             "x0x-symphony-wpc-{name}-{}-{}",
             std::process::id(),
@@ -214,17 +168,22 @@ impl Daemon {
         ));
         fs::create_dir_all(dir.join("data"))?;
         let api_port = free_tcp_port()?;
-        let bind_port = free_udp_port()?;
         let peers = bootstrap
             .iter()
             .map(|p| format!("\"{p}\""))
             .collect::<Vec<_>>()
             .join(", ");
+        // identity_dir is REQUIRED for isolation: without it every daemon
+        // on this machine loads the same ~/.x0x keys and both "daemons"
+        // share one agent identity (which silently collapses the two-author
+        // topology into self-joins).
         let config = format!(
-            "data_dir = \"{data}\"\napi_address = \"127.0.0.1:{api_port}\"\n\
+            "data_dir = \"{data}\"\nidentity_dir = \"{identity}\"\n\
+             api_address = \"127.0.0.1:{api_port}\"\n\
              bind_address = \"127.0.0.1:{bind_port}\"\nlog_level = \"warn\"\n\
              bootstrap_peers = [{peers}]\n[update]\nenabled = false\n",
             data = dir.join("data").display(),
+            identity = dir.join("identity").display(),
         );
         let config_path = dir.join("config.toml");
         fs::write(&config_path, config)?;
@@ -233,8 +192,7 @@ impl Daemon {
             child: None,
             dir,
             config_path,
-            bind_port,
-            url: format!("http://127.0.0.1:{api_port}"), // api_port consumed here
+            url: format!("http://127.0.0.1:{api_port}"),
             token: String::new(),
             binary: binary.to_path_buf(),
         };
@@ -300,6 +258,44 @@ impl Daemon {
             let _ = child.wait();
         }
     }
+
+    /// SIGKILL then start again with the SAME config and data dir.
+    async fn restart(&mut self) -> TestResult<()> {
+        self.kill();
+        self.start().await
+    }
+
+    /// Connected peer count from /health.
+    async fn peers(&self) -> u64 {
+        let Ok(resp) = reqwest::Client::new()
+            .get(format!("{}/health", self.url))
+            .send()
+            .await
+        else {
+            return 0;
+        };
+        let Ok(json) = resp.json::<serde_json::Value>().await else {
+            return 0;
+        };
+        json.get("peers")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    async fn version(&self) -> TestResult<String> {
+        let body = reqwest::Client::new()
+            .get(format!("{}/health", self.url))
+            .send()
+            .await?
+            .text()
+            .await?;
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        Ok(json
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned())
+    }
 }
 
 impl Drop for Daemon {
@@ -309,33 +305,68 @@ impl Drop for Daemon {
     }
 }
 
-/// Spawn one live daemon.
-async fn spawn_one(name: &str) -> TestResult<Daemon> {
-    let binary = x0xd_binary()?;
-    Daemon::spawn(name, &binary, &[]).await
+/// Per-daemon client bundle: the daemon's OWN agent identity signs.
+struct Ctx {
+    api: Arc<X0xdClient>,
+    signer: Arc<SigningX0xdClient>,
+    agent: String,
 }
 
-/// Retained for infrastructure where gossip converges: spawn A + B with B
-/// bootstrapping to A. NOT used by the sandbox scenarios (see the module
-/// doc — cross-daemon KV values do not converge locally).
-#[allow(dead_code)]
+impl Ctx {
+    async fn new(daemon: &Daemon) -> TestResult<Self> {
+        let api = Arc::new(X0xdClient::with_token(
+            &daemon.url,
+            Some(daemon.token.clone()),
+        )?);
+        let signer = Arc::new(SigningX0xdClient::with_token(
+            &daemon.url,
+            Some(daemon.token.clone()),
+        )?);
+        let agent = signer.agent_identity().await?.agent_id;
+        Ok(Self { api, signer, agent })
+    }
+
+    fn manager(&self) -> V2StoreManager {
+        V2StoreManager::new(self.api.clone(), self.signer.clone(), policy_mode())
+    }
+}
+
+/// Spawn two mutually-bootstrapped daemons with a rolling start.
 async fn spawn_pair(test: &str) -> TestResult<(Daemon, Daemon)> {
     let binary = x0xd_binary()?;
-    let a = Daemon::spawn(&format!("{test}-a"), &binary, &[]).await?;
-    let boot = vec![format!("127.0.0.1:{}", a.bind_port)];
-    let b = Daemon::spawn(&format!("{test}-b"), &binary, &boot).await?;
+    let bind_a = free_udp_port()?;
+    let bind_b = free_udp_port()?;
+    let a = Daemon::spawn(
+        &format!("{test}-a"),
+        &binary,
+        bind_a,
+        &[format!("127.0.0.1:{bind_b}")],
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(2)).await; // rolling start
+    let b = Daemon::spawn(
+        &format!("{test}-b"),
+        &binary,
+        bind_b,
+        &[format!("127.0.0.1:{bind_a}")],
+    )
+    .await?;
     Ok((a, b))
 }
 
 // ---------------------------------------------------------------------------
-// Two-author world over ONE live daemon.
+// Two-daemon world: A (creator) on daemon A, B on daemon B, roster [A, B].
+// Setup follows the verified subscribe-before-write discipline.
 // ---------------------------------------------------------------------------
 
-struct World {
-    _daemon: Daemon,
-    api: Arc<X0xdClient>,
-    a: Arc<Author>,
-    b: Arc<Author>,
+struct Pair {
+    /// Holds the daemon A process alive for the pair's lifetime
+    /// (Drop kills it); scenarios address daemon B for restarts.
+    #[allow(dead_code)]
+    daemon_a: Daemon,
+    daemon_b: Daemon,
+    ctx_a: Ctx,
+    ctx_b: Ctx,
     manager_a: V2StoreManager,
     manager_b: V2StoreManager,
     own_a: OwnEventStore,
@@ -343,60 +374,106 @@ struct World {
     list_uuid: String,
 }
 
-impl World {
-    /// Create a live daemon, two local authors (A creator, roster [A,B]),
-    /// publish genesis, and materialize B's card-self. Each store is ensured
-    /// EXACTLY ONCE (one manager per author) — a second `ensure_own_store`
-    /// on the same topic re-anchors x0x KV ownership, which is a test-only
-    /// hazard the real one-tracker-per-daemon product never hits. Everything
-    /// lives on the one daemon's KV, so reads are immediate.
+impl Pair {
     async fn new(test: &str) -> TestResult<Self> {
-        let daemon = spawn_one(test).await?;
-        let api = Arc::new(X0xdClient::with_token(
-            &daemon.url,
-            Some(daemon.token.clone()),
-        )?);
-        let a = Arc::new(Author::generate()?);
-        let b = Arc::new(Author::generate()?);
-        let manager_a = V2StoreManager::new(
-            api.clone(),
-            Arc::new(LocalSigner { author: a.clone() }),
-            policy_mode(),
+        let (daemon_a, daemon_b) = spawn_pair(test).await?;
+        // Transport gate: the QUIC link must be up before store joins can
+        // resolve cross-daemon ownership.
+        wait_until!(
+            "both daemons report a connected peer",
+            90,
+            daemon_a.peers().await >= 1 && daemon_b.peers().await >= 1
         );
-        let manager_b = V2StoreManager::new(
-            api.clone(),
-            Arc::new(LocalSigner { author: b.clone() }),
-            policy_mode(),
-        );
+        let ctx_a = Ctx::new(&daemon_a).await?;
+        let ctx_b = Ctx::new(&daemon_b).await?;
+        if ctx_a.agent == ctx_b.agent {
+            return Err(err(
+                "daemon identity collision: both daemons report one agent id — \
+                 identity_dir isolation failed",
+            ));
+        }
         let list_uuid = format!("wpc-{test}");
-        let own_a = manager_a.ensure_own_store(&list_uuid).await?;
-        manager_a
-            .publish_genesis(&own_a, vec![a.id.clone(), b.id.clone()], None, 1)
+
+        // Subscribe-before-write: create both event stores EMPTY, cross-
+        // join them (bidirectional), and only then let ensure_own_store
+        // write card-self and the creator publish genesis.
+        let topic_a = event_store_topic(&list_uuid, &ctx_a.agent);
+        let topic_b = event_store_topic(&list_uuid, &ctx_b.agent);
+        ctx_a
+            .api
+            .create_kv_store_with_policy(&topic_a, &topic_a, requested_policy_flag())
             .await?;
+        ctx_b
+            .api
+            .create_kv_store_with_policy(&topic_b, &topic_b, requested_policy_flag())
+            .await?;
+        wait_until!(
+            "bidirectional cross-daemon store joins",
+            60,
+            ctx_b
+                .api
+                .join_kv_store(&topic_a, &ctx_a.agent)
+                .await
+                .is_ok()
+                && ctx_a
+                    .api
+                    .join_kv_store(&topic_b, &ctx_b.agent)
+                    .await
+                    .is_ok()
+        );
+
+        let manager_a = ctx_a.manager();
+        let manager_b = ctx_b.manager();
+        let own_a = manager_a.ensure_own_store(&list_uuid).await?;
         let own_b = manager_b.ensure_own_store(&list_uuid).await?;
-        Ok(Self {
-            _daemon: daemon,
-            api,
-            a,
-            b,
+        manager_a
+            .publish_genesis(
+                &own_a,
+                vec![ctx_a.agent.clone(), ctx_b.agent.clone()],
+                None,
+                1,
+            )
+            .await?;
+
+        let pair = Self {
+            daemon_a,
+            daemon_b,
+            ctx_a,
+            ctx_b,
             manager_a,
             manager_b,
             own_a,
             own_b,
             list_uuid,
-        })
+        };
+        // Replication gate: BOTH daemons must fold the genesis — proves
+        // cross-daemon event replication end-to-end before any scenario.
+        wait_until!(
+            "both daemons fold the genesis (cross-daemon replication)",
+            90,
+            pair.fold_a().await.is_some() && pair.fold_b().await.is_some()
+        );
+        Ok(pair)
     }
 
-    async fn fold(&self) -> TestResult<FoldOutput> {
-        let input: FoldInput = self
-            .manager_a
-            .read_fold_input(&self.list_uuid, &self.a.id)
-            .await?;
-        fold_v2(&input).map_err(|e| err(format!("list refused: {e}")))
+    async fn fold_with(&self, manager: &V2StoreManager) -> Option<FoldOutput> {
+        let input = manager
+            .read_fold_input(&self.list_uuid, &self.ctx_a.agent)
+            .await
+            .ok()?;
+        fold_v2(&input).ok()
     }
 
-    /// Build a transition for `author` at its next chain link + lamport
-    /// horizon, from the given fold view.
+    /// Daemon A's independent replica fold.
+    async fn fold_a(&self) -> Option<FoldOutput> {
+        self.fold_with(&self.manager_a).await
+    }
+
+    /// Daemon B's independent replica fold.
+    async fn fold_b(&self) -> Option<FoldOutput> {
+        self.fold_with(&self.manager_b).await
+    }
+
     fn transition(
         &self,
         author: &str,
@@ -419,44 +496,31 @@ impl World {
         }
     }
 
-    /// A opens `issue_id`; returns the open event hash.
-    async fn a_open(&self, issue_id: &str, title: &str, spec: &str) -> TestResult<String> {
-        let fold = self.fold().await?;
+    async fn a_open(&self, issue_id: &str, title: &str) -> TestResult<String> {
+        let fold = self.fold_a().await.ok_or_else(|| err("fold A refused"))?;
         let ev = self.transition(
-            &self.a.id,
+            &self.ctx_a.agent,
             &fold,
             issue_id,
-            TransitionKind::open(title, spec),
+            TransitionKind::open(title, "wp-c spec"),
         );
         Ok(self.manager_a.append_transition(&self.own_a, &ev).await?)
     }
 
-    /// B claims `issue_id` (fold-fenced); returns the claim event hash.
     async fn b_claim(&self, issue_id: &str) -> TestResult<String> {
-        let fold = self.fold().await?;
-        let ev = x0x_symphony_tracker_x0x_crdt::v2::build_claim_transition(
-            &fold,
-            &self.list_uuid,
-            &self.b.id,
-            issue_id,
-        );
+        let fold = self.fold_b().await.ok_or_else(|| err("fold B refused"))?;
+        let ev = build_claim_transition(&fold, &self.list_uuid, &self.ctx_b.agent, issue_id);
         Ok(self.manager_b.append_transition(&self.own_b, &ev).await?)
     }
 
-    /// A approves `issue_id`'s current content; returns the approval hash.
-    async fn a_approve(
-        &self,
-        issue_id: &str,
-        approved_at: u64,
-        entropy: &str,
-    ) -> TestResult<String> {
-        let fold = self.fold().await?;
+    async fn a_approve(&self, issue_id: &str, entropy: &str) -> TestResult<String> {
+        let fold = self.fold_a().await.ok_or_else(|| err("fold A refused"))?;
         let open_hash = fold
             .issues
             .get(issue_id)
             .map(|st| st.open_event_hash.clone())
-            .ok_or_else(|| err("issue not folded for approval"))?;
-        let (author_seq, prev) = fold.next_chain_link(&self.a.id);
+            .ok_or_else(|| err("issue not folded on A"))?;
+        let (author_seq, prev) = fold.next_chain_link(&self.ctx_a.agent);
         let approval = ApprovalEventV2 {
             schema: V2_SCHEMA,
             kind: "dispatch_approval".to_owned(),
@@ -465,13 +529,13 @@ impl World {
             roster_epoch: fold.latest_roster_epoch,
             issue_id: issue_id.to_owned(),
             open_event_hash: open_hash,
-            actor: self.a.id.clone(),
+            actor: self.ctx_a.agent.clone(),
             lamport: fold.max_admitted_lamport + 1,
             author_seq,
             prev_own_event_hash: prev,
             verdict: ApprovalVerdictV2::Approve,
             entropy: entropy.to_owned(),
-            approved_at,
+            approved_at: 100,
             v1_record_json: String::new(),
         };
         Ok(self
@@ -480,24 +544,22 @@ impl World {
             .await?)
     }
 
-    /// B consumes `approval_hash` under its fold-winning claim; returns the
-    /// consume event hash. `entropy` distinguishes duplicate attempts.
     async fn b_consume(
         &self,
         issue_id: &str,
         approval_hash: &str,
         entropy: &str,
     ) -> TestResult<String> {
-        let fold = self.fold().await?;
+        let fold = self.fold_b().await.ok_or_else(|| err("fold B refused"))?;
         let approver = fold
             .approvals
             .get(approval_hash)
             .map(|a| a.approval.actor.clone())
-            .ok_or_else(|| err("approval not folded for consume"))?;
+            .ok_or_else(|| err("approval not folded on B"))?;
         let (claim_nonce, claimed_event_hash) = match &fold
             .issues
             .get(issue_id)
-            .ok_or_else(|| err("issue not folded for consume"))?
+            .ok_or_else(|| err("issue not folded on B"))?
             .status
         {
             IssueStatusV2::Claimed {
@@ -505,9 +567,9 @@ impl World {
                 claim_event_hash,
                 ..
             } => (claim_nonce.clone(), claim_event_hash.clone()),
-            other => return Err(err(format!("issue not claimed for consume: {other:?}"))),
+            other => return Err(err(format!("issue not claimed on B: {other:?}"))),
         };
-        let (author_seq, prev) = fold.next_chain_link(&self.b.id);
+        let (author_seq, prev) = fold.next_chain_link(&self.ctx_b.agent);
         let consume = ConsumeEventV2 {
             schema: V2_SCHEMA,
             kind: "consume".to_owned(),
@@ -515,7 +577,7 @@ impl World {
             genesis_manifest_hash: fold.genesis_hash.clone(),
             roster_epoch: fold.latest_roster_epoch,
             issue_id: issue_id.to_owned(),
-            actor: self.b.id.clone(),
+            actor: self.ctx_b.agent.clone(),
             lamport: fold.max_admitted_lamport + 1,
             author_seq,
             prev_own_event_hash: prev,
@@ -530,131 +592,600 @@ impl World {
         Ok(self.manager_b.append_consume(&self.own_b, &consume).await?)
     }
 
-    /// A claims `issue_id` (fold-fenced); returns the claim event hash.
-    async fn a_claim(&self, issue_id: &str) -> TestResult<String> {
-        let fold = self.fold().await?;
-        let ev = x0x_symphony_tracker_x0x_crdt::v2::build_claim_transition(
-            &fold,
-            &self.list_uuid,
-            &self.a.id,
-            issue_id,
-        );
-        Ok(self.manager_a.append_transition(&self.own_a, &ev).await?)
-    }
-
-    /// A blocks its own held `issue_id` with `reason`.
-    async fn a_block(&self, issue_id: &str, reason: BlockReason) -> TestResult<String> {
-        let fold = self.fold().await?;
-        let (claim_nonce, claimed_event_hash) = match &fold
-            .issues
-            .get(issue_id)
-            .ok_or_else(|| err("issue not folded for block"))?
-            .status
-        {
-            IssueStatusV2::Claimed {
-                claimant,
-                claim_nonce,
-                claim_event_hash,
-            } if claimant == &self.a.id => (claim_nonce.clone(), claim_event_hash.clone()),
-            other => {
-                return Err(err(format!(
-                    "A does not hold the claim to block: {other:?}"
-                )))
-            }
-        };
-        let ev = self.transition(
-            &self.a.id,
-            &fold,
-            issue_id,
-            TransitionKind::Block {
-                claim_nonce,
-                claimed_event_hash,
-                reason,
-            },
-        );
-        Ok(self.manager_a.append_transition(&self.own_a, &ev).await?)
+    fn winner_of(fold: &FoldOutput, issue_id: &str) -> Option<String> {
+        fold.issues.get(issue_id).and_then(|st| match &st.status {
+            IssueStatusV2::Claimed { claimant, .. } => Some(claimant.clone()),
+            _ => None,
+        })
     }
 }
-
-fn dummy_envelope(signer: &str) -> SignatureEnvelope {
-    SignatureEnvelope::new(
-        "ml-dsa-65",
-        "x0x-symphony-approval-consumed-v1",
-        "cGs=",
-        "c2ln",
-        sha256_hex(b"harness"),
-        signer,
-    )
-}
-
-fn approval_for(
-    issue: &x0x_symphony_core::Issue,
-    approver: &str,
-    at: &str,
-) -> TestResult<ApprovalEvent> {
-    Ok(ApprovalEvent {
-        issue_id: issue.id.clone(),
-        content_hash: content_hash(issue),
-        signer_agent_id: AgentId::new(approver.to_owned())?,
-        verdict: ApprovalVerdict::Approve,
-        approved_at: at.to_owned(),
-        approver_agent_id: AgentId::new(approver.to_owned())?,
-        claim_id: None,
-        signature: Some(dummy_envelope(approver)),
-    })
-}
-
-fn consumed_for(
-    issue: &x0x_symphony_core::Issue,
-    consumer: &str,
-    nonce: &str,
-) -> TestResult<ApprovalConsumed> {
-    Ok(ApprovalConsumed::new(
-        issue.id.clone(),
-        content_hash(issue),
-        AgentId::new(consumer.to_owned())?,
-        nonce,
-        "2026-07-16T00:00:01Z",
-        dummy_envelope(consumer),
-    ))
-}
-
-async fn issue_by_id(tracker: &dyn Tracker, id: &IssueId) -> Option<x0x_symphony_core::Issue> {
-    tracker
-        .fetch_by_ids(std::slice::from_ref(id))
-        .await
-        .ok()?
-        .into_iter()
-        .next()
-}
-
-const IGNORE: &str = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); \
-                      X0X_V2_APPEND_ONLY=1 for the append-only matrix";
 
 // ===========================================================================
-// (i) v1 RMW record loss — one live daemon, two tracker instances.
+// (ii) TWO-DAEMON: the v1-lethal interleave loses nothing on v2 —
+// bidirectional joins, cross-daemon replication, independent replica folds
+// agree, exactly-once effective consume, duplicate surfaced as a loser.
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix"]
+#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix (x0xd >= 0.33.0)"]
+#[allow(clippy::too_many_lines)]
+async fn two_daemon_v2_interleave_keeps_all_records_exactly_once() -> TestResult {
+    let pair = Pair::new("v2race").await?;
+    let issue_id = "i1";
+    pair.a_open(issue_id, "contested v2").await?;
+    wait_until!(
+        "daemon B folds the open issue",
+        90,
+        pair.fold_b()
+            .await
+            .is_some_and(|f| f.issues.contains_key(issue_id))
+    );
+    pair.b_claim(issue_id).await?;
+    wait_until!(
+        "daemon A folds B's claim",
+        90,
+        pair.fold_a()
+            .await
+            .and_then(|f| Pair::winner_of(&f, issue_id))
+            .is_some_and(|w| w == pair.ctx_b.agent)
+    );
+    let approval1 = pair.a_approve(issue_id, "ap1").await?;
+    wait_until!(
+        "daemon B folds approval #1",
+        90,
+        pair.fold_b()
+            .await
+            .is_some_and(|f| f.approvals.contains_key(&approval1))
+    );
+
+    // The lethal v1 interleave, GENUINELY CONCURRENT across daemons:
+    // A appends approval #2 on daemon A while B consumes #1 on daemon B.
+    let (ra, rc) = tokio::join!(
+        pair.a_approve(issue_id, "ap2"),
+        pair.b_consume(issue_id, &approval1, "consume1")
+    );
+    let approval2 = ra?;
+    let consume1 = rc?;
+
+    // Both independent replica folds converge: 2 approvals, exactly one
+    // effective consume, nothing lost.
+    for (name, is_a) in [("A", true), ("B", false)] {
+        wait_until!(
+            format!("daemon {name} folds 2 approvals + 1 effective consume"),
+            120,
+            {
+                let fold = if is_a {
+                    pair.fold_a().await
+                } else {
+                    pair.fold_b().await
+                };
+                fold.is_some_and(|f| {
+                    f.approvals.contains_key(&approval1)
+                        && f.approvals.contains_key(&approval2)
+                        && f.effective_consumes.len() == 1
+                        && f.effective_consumes
+                            .get(&approval1)
+                            .is_some_and(|c| c.event_hash == consume1)
+                })
+            }
+        );
+    }
+
+    // Duplicate consume for the same approval → durable, deterministic
+    // LOSER on both daemons.
+    pair.b_consume(issue_id, &approval1, "dup").await?;
+    for (name, is_a) in [("A", true), ("B", false)] {
+        wait_until!(
+            format!("daemon {name} surfaces the duplicate consume as a loser"),
+            120,
+            {
+                let fold = if is_a {
+                    pair.fold_a().await
+                } else {
+                    pair.fold_b().await
+                };
+                fold.is_some_and(|f| {
+                    f.effective_consumes.len() == 1
+                        && f.losing_consumes
+                            .iter()
+                            .any(|d| d.approval_event_hash == approval1)
+                })
+            }
+        );
+    }
+
+    // Append-only REST contract on the live daemon (mode 2 only).
+    if append_only_mode() {
+        let topic = event_store_topic(&pair.list_uuid, &pair.ctx_a.agent);
+        let detail = pair
+            .ctx_a
+            .api
+            .kv_store_detail(&topic)
+            .await?
+            .ok_or_else(|| err("own store missing from listing"))?;
+        assert_eq!(detail.policy.as_deref(), Some("append_only"));
+        let keys = V2StoreApi::list_kv_keys(pair.ctx_a.api.as_ref(), &topic).await?;
+        let ev = keys
+            .iter()
+            .map(|k| k.key.clone())
+            .find(|k| k.starts_with("ev-"))
+            .ok_or_else(|| err("no ev- key"))?;
+        let overwrite = V2StoreApi::put_kv(
+            pair.ctx_a.api.as_ref(),
+            &topic,
+            &ev,
+            b"tamper",
+            "text/plain",
+        )
+        .await;
+        assert!(overwrite.is_err(), "append-only PUT-to-existing must 409");
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// (iii) TWO-DAEMON: hostile un-park + fence-violating release inadmissible
+// on BOTH independent replicas.
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix (x0xd >= 0.33.0)"]
+#[allow(clippy::too_many_lines)]
+async fn two_daemon_hostile_unpark_and_fence_violations_inadmissible() -> TestResult {
+    let pair = Pair::new("hostile").await?;
+    let issue_id = "i1";
+    pair.a_open(issue_id, "parked").await?;
+    // A claims and blocks its own issue with a NON-requeue-able reason.
+    let fold = pair.fold_a().await.ok_or_else(|| err("fold A refused"))?;
+    let claim = build_claim_transition(&fold, &pair.list_uuid, &pair.ctx_a.agent, issue_id);
+    pair.manager_a
+        .append_transition(&pair.own_a, &claim)
+        .await?;
+    let fold = pair.fold_a().await.ok_or_else(|| err("fold A refused"))?;
+    let (claim_nonce, claim_event_hash) = match &fold
+        .issues
+        .get(issue_id)
+        .ok_or_else(|| err("issue missing on A"))?
+        .status
+    {
+        IssueStatusV2::Claimed {
+            claim_nonce,
+            claim_event_hash,
+            ..
+        } => (claim_nonce.clone(), claim_event_hash.clone()),
+        other => return Err(err(format!("A does not hold the claim: {other:?}"))),
+    };
+    let block = pair.transition(
+        &pair.ctx_a.agent,
+        &fold,
+        issue_id,
+        TransitionKind::Block {
+            claim_nonce: claim_nonce.clone(),
+            claimed_event_hash: claim_event_hash.clone(),
+            reason: BlockReason::Other {
+                detail: "retry_exhausted: budget spent".to_owned(),
+            },
+        },
+    );
+    pair.manager_a
+        .append_transition(&pair.own_a, &block)
+        .await?;
+    wait_until!(
+        "daemon B folds the blocked issue",
+        90,
+        pair.fold_b()
+            .await
+            .and_then(|f| f.issues.get(issue_id).cloned())
+            .is_some_and(|st| matches!(st.status, IssueStatusV2::Blocked { .. }))
+    );
+    let fold_b = pair.fold_b().await.ok_or_else(|| err("fold B refused"))?;
+    let IssueStatusV2::Blocked {
+        block_event_hash, ..
+    } = fold_b
+        .issues
+        .get(issue_id)
+        .ok_or_else(|| err("issue missing on B"))?
+        .status
+        .clone()
+    else {
+        return Err(err("issue not blocked on B"));
+    };
+
+    // (a) B-authored release naming A's fence: admissible, INEFFECTIVE.
+    let (seq, prev) = fold_b.next_chain_link(&pair.ctx_b.agent);
+    let release = TransitionEventV2 {
+        schema: V2_SCHEMA,
+        list_uuid: pair.list_uuid.clone(),
+        genesis_manifest_hash: fold_b.genesis_hash.clone(),
+        roster_epoch: fold_b.latest_roster_epoch,
+        issue_id: issue_id.to_owned(),
+        actor: pair.ctx_b.agent.clone(),
+        lamport: fold_b.max_admitted_lamport + 1,
+        author_seq: seq,
+        prev_own_event_hash: prev,
+        kind: TransitionKind::Release {
+            claim_nonce: claim_nonce.clone(),
+            claimed_event_hash: claim_event_hash.clone(),
+        },
+    };
+    let release_hash = pair
+        .manager_b
+        .append_transition(&pair.own_b, &release)
+        .await?;
+
+    // (b) B-authored requeue whose C6 bindings all verify — but the block
+    // reason is Other, so the fold refuses the un-park.
+    let approval_payload = ApprovalPayloadV2 {
+        schema: V2_SCHEMA,
+        kind: "approval".to_owned(),
+        list_uuid: pair.list_uuid.clone(),
+        genesis_manifest_hash: fold_b.genesis_hash.clone(),
+        issue_id: issue_id.to_owned(),
+        block_event_hash: block_event_hash.clone(),
+        claim_nonce: claim_nonce.clone(),
+        approver: pair.ctx_b.agent.clone(),
+        approved_at: 1,
+    };
+    let approval_bytes = serde_json::to_vec(&approval_payload)?;
+    let approval_hash = sha256_hex(&approval_bytes);
+    let approval_env = pair
+        .manager_b
+        .sign_approval_payload(&pair.own_b, &approval_bytes)
+        .await?;
+    let requeue = TransitionEventV2 {
+        schema: V2_SCHEMA,
+        list_uuid: pair.list_uuid.clone(),
+        genesis_manifest_hash: fold_b.genesis_hash.clone(),
+        roster_epoch: fold_b.latest_roster_epoch,
+        issue_id: issue_id.to_owned(),
+        actor: pair.ctx_b.agent.clone(),
+        lamport: fold_b.max_admitted_lamport + 2,
+        author_seq: seq + 1,
+        prev_own_event_hash: release_hash,
+        kind: TransitionKind::Requeue {
+            justification: RequeueJustification {
+                block_event_hash: block_event_hash.clone(),
+                claim_nonce: claim_nonce.clone(),
+                approval_event_hash: approval_hash.clone(),
+                approval_payload_sha256: approval_hash,
+                approver: pair.ctx_b.agent.clone(),
+                approval: approval_env,
+            },
+        },
+    };
+    pair.manager_b
+        .append_transition(&pair.own_b, &requeue)
+        .await?;
+
+    // Both independent replicas: still Blocked; both hostile records
+    // surfaced as rejections. (Forged actor=A authorship is covered at the
+    // fold level by `actor_field_mismatch_is_rejected` — a live daemon
+    // cannot even be asked to store it without B's own credentials.)
+    for (name, is_a) in [("A", true), ("B", false)] {
+        wait_until!(
+            format!("daemon {name} rejects the hostile records; issue stays blocked"),
+            120,
+            {
+                let fold = if is_a {
+                    pair.fold_a().await
+                } else {
+                    pair.fold_b().await
+                };
+                fold.is_some_and(|f| {
+                    let blocked = f
+                        .issues
+                        .get(issue_id)
+                        .is_some_and(|st| matches!(st.status, IssueStatusV2::Blocked { .. }));
+                    let hostile = f
+                        .rejections
+                        .iter()
+                        .filter(|r| r.author == pair.ctx_b.agent)
+                        .count();
+                    blocked && hostile >= 2
+                })
+            }
+        );
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// (iv) TWO-DAEMON partition/heal: divergent claims written across a REAL
+// daemon-down window heal to ONE deterministic winner on both replicas;
+// author equivocation surfaces fork evidence everywhere.
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix (x0xd >= 0.33.0)"]
+#[allow(clippy::too_many_lines)]
+async fn two_daemon_partition_heals_to_single_winner_and_fork_evidence() -> TestResult {
+    let mut pair = Pair::new("diverge").await?;
+    let issue_id = "i1";
+    pair.a_open(issue_id, "both want it").await?;
+    wait_until!(
+        "daemon B folds the open issue",
+        90,
+        pair.fold_b()
+            .await
+            .is_some_and(|f| f.issues.contains_key(issue_id))
+    );
+
+    // PARTITION: kill daemon B (a real daemon-down window). A claims —
+    // the claim lands on A only, so B's replica is GUARANTEED not to have
+    // seen it when B comes back.
+    //
+    // NOTE on kill order: the restarting daemon must have its peer UP.
+    // x0xd 0.33.0 wedges CRDT-subscription rehydration (including the
+    // daemon's OWN stores) when a joined store's owner is unreachable at
+    // startup — verified live and reported upstream.
+    pair.daemon_b.kill();
+    let fold = pair.fold_a().await.ok_or_else(|| err("fold A refused"))?;
+    let claim_a = build_claim_transition(&fold, &pair.list_uuid, &pair.ctx_a.agent, issue_id);
+    pair.manager_a
+        .append_transition(&pair.own_a, &claim_a)
+        .await?;
+
+    // HEAL: restart B (A is up, so rehydration completes) and immediately
+    // race B's divergent claim against the incoming catch-up. If B's local
+    // replica still shows Open, B writes a genuinely divergent claim; if
+    // catch-up won the race, only A's claim exists. BOTH are honest heal
+    // outcomes — the invariant under test is deterministic convergence to
+    // ONE winner on both replicas.
+    pair.daemon_b.restart().await?;
+    let ctx_b = Ctx::new(&pair.daemon_b).await?;
+    assert_eq!(
+        ctx_b.agent, pair.ctx_b.agent,
+        "agent identity survives restart"
+    );
+    pair.ctx_b = ctx_b;
+    let manager_b = pair.ctx_b.manager();
+    let mut b_wrote_divergent_claim = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match pair.fold_with(&manager_b).await {
+            Some(f) => {
+                if matches!(
+                    f.issues.get(issue_id).map(|st| &st.status),
+                    Some(IssueStatusV2::Open)
+                ) {
+                    let claim_b =
+                        build_claim_transition(&f, &pair.list_uuid, &pair.ctx_b.agent, issue_id);
+                    manager_b.append_transition(&pair.own_b, &claim_b).await?;
+                    b_wrote_divergent_claim = true;
+                }
+                break; // fold readable: either we diverged or catch-up won
+            }
+            None => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+    pair.manager_b = manager_b;
+    eprintln!("partition outcome: B wrote a divergent claim = {b_wrote_divergent_claim}");
+
+    // After heal: both independent replica folds agree on ONE winner.
+    wait_until!(
+        "both replicas agree on a single deterministic claim winner",
+        180,
+        {
+            let wa = pair
+                .fold_a()
+                .await
+                .and_then(|f| Pair::winner_of(&f, issue_id));
+            let wb = pair
+                .fold_b()
+                .await
+                .and_then(|f| Pair::winner_of(&f, issue_id));
+            wa.is_some() && wa == wb
+        }
+    );
+    let winner = pair
+        .fold_a()
+        .await
+        .and_then(|f| Pair::winner_of(&f, issue_id))
+        .ok_or_else(|| err("no winner after heal"))?;
+    assert!(
+        winner == pair.ctx_a.agent || winner == pair.ctx_b.agent,
+        "winner must be one of the two claimants"
+    );
+    eprintln!("deterministic heal winner = {winner}");
+
+    // Equivocation: B signs two DIFFERENT events at one author_seq; both
+    // replicas surface fork evidence.
+    let fold_b = pair.fold_b().await.ok_or_else(|| err("fold B refused"))?;
+    let (seq, prev) = fold_b.next_chain_link(&pair.ctx_b.agent);
+    for nonce in ["fork-one", "fork-two"] {
+        let ev = TransitionEventV2 {
+            schema: V2_SCHEMA,
+            list_uuid: pair.list_uuid.clone(),
+            genesis_manifest_hash: fold_b.genesis_hash.clone(),
+            roster_epoch: fold_b.latest_roster_epoch,
+            issue_id: issue_id.to_owned(),
+            actor: pair.ctx_b.agent.clone(),
+            lamport: fold_b.max_admitted_lamport + 1,
+            author_seq: seq,
+            prev_own_event_hash: prev.clone(),
+            kind: TransitionKind::Claim {
+                claim_nonce: nonce.to_owned(),
+            },
+        };
+        pair.manager_b.append_transition(&pair.own_b, &ev).await?;
+    }
+    for (name, is_a) in [("A", true), ("B", false)] {
+        wait_until!(format!("daemon {name} surfaces B's fork evidence"), 120, {
+            let fold = if is_a {
+                pair.fold_a().await
+            } else {
+                pair.fold_b().await
+            };
+            fold.is_some_and(|f| {
+                f.forks.iter().any(|fk| {
+                    fk.author == pair.ctx_b.agent
+                        && fk.author_seq == seq
+                        && fk.event_hashes.len() == 2
+                })
+            })
+        });
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// (v) TWO-DAEMON crash-after-consume: SIGKILL the consumer post-consume,
+// restart on the same data dir — the approval stays spent (v0.33.0 KV
+// persistence + resync), replay folds as a loser, re-approval recovers
+// exactly once.
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix (x0xd >= 0.33.0)"]
+#[allow(clippy::too_many_lines)]
+async fn two_daemon_crash_after_consume_recovers_via_reapproval() -> TestResult {
+    let mut pair = Pair::new("crash").await?;
+    let version = pair.daemon_b.version().await.unwrap_or_default();
+    if version.starts_with("0.31") || version.starts_with("0.32") {
+        eprintln!(
+            "SKIP-LIVE (v): daemon reports version {version} without KV \
+             restart persistence (x0x >= 0.33.0 required); the consume-then-\
+             execute fail-toward-zero logic is proven in \
+             v2_gate::crash_after_consume_recovers_via_reapproval"
+        );
+        return Ok(());
+    }
+    let issue_id = "i1";
+    pair.a_open(issue_id, "crashy").await?;
+    wait_until!(
+        "daemon B folds the open issue",
+        90,
+        pair.fold_b()
+            .await
+            .is_some_and(|f| f.issues.contains_key(issue_id))
+    );
+    pair.b_claim(issue_id).await?;
+    wait_until!(
+        "daemon A folds B's claim",
+        90,
+        pair.fold_a()
+            .await
+            .and_then(|f| Pair::winner_of(&f, issue_id))
+            .is_some_and(|w| w == pair.ctx_b.agent)
+    );
+    let approval1 = pair.a_approve(issue_id, "ap1").await?;
+    wait_until!(
+        "daemon B folds the approval",
+        90,
+        pair.fold_b()
+            .await
+            .is_some_and(|f| f.approvals.contains_key(&approval1))
+    );
+    let consume1 = pair.b_consume(issue_id, &approval1, "pre-crash").await?;
+    wait_until!(
+        "daemon B folds its own effective consume",
+        60,
+        pair.fold_b().await.is_some_and(|f| f
+            .effective_consumes
+            .get(&approval1)
+            .is_some_and(|c| c.event_hash == consume1))
+    );
+
+    // CRASH: SIGKILL daemon B post-consume, pre-"execute"; restart on the
+    // SAME data dir.
+    pair.daemon_b.restart().await?;
+    let ctx_b = Ctx::new(&pair.daemon_b).await?;
+    assert_eq!(
+        ctx_b.agent, pair.ctx_b.agent,
+        "agent identity survives restart"
+    );
+    pair.ctx_b = ctx_b;
+    pair.manager_b = pair.ctx_b.manager();
+
+    // Durability: the effective consume is still folded on the restarted
+    // daemon; the approval stays spent everywhere.
+    wait_until!(
+        "restarted daemon B still folds the effective consume (durability)",
+        120,
+        pair.fold_b().await.is_some_and(|f| {
+            f.effective_consumes
+                .get(&approval1)
+                .is_some_and(|c| c.event_hash == consume1)
+                && f.unconsumed_approvals(issue_id).is_empty()
+        })
+    );
+    // Replay: a second consume of the spent approval folds as a LOSER on
+    // both replicas.
+    pair.b_consume(issue_id, &approval1, "replay").await?;
+    wait_until!(
+        "replay consume surfaces as a loser on both replicas",
+        120,
+        {
+            let a = pair.fold_a().await;
+            let b = pair.fold_b().await;
+            let check = |f: FoldOutput| {
+                f.effective_consumes
+                    .get(&approval1)
+                    .is_some_and(|c| c.event_hash == consume1)
+                    && f.losing_consumes
+                        .iter()
+                        .any(|d| d.approval_event_hash == approval1)
+            };
+            a.is_some_and(check) && b.is_some_and(check)
+        }
+    );
+
+    // Recovery: a FRESH approval consumes exactly once.
+    let approval2 = pair.a_approve(issue_id, "ap2").await?;
+    wait_until!(
+        "daemon B folds the fresh approval",
+        90,
+        pair.fold_b()
+            .await
+            .is_some_and(|f| f.approvals.contains_key(&approval2))
+    );
+    let consume2 = pair
+        .b_consume(issue_id, &approval2, "post-recovery")
+        .await?;
+    wait_until!(
+        "both replicas: exactly one effective consume per approval",
+        120,
+        {
+            let a = pair.fold_a().await;
+            let b = pair.fold_b().await;
+            let check = |f: FoldOutput| {
+                f.effective_consumes.len() == 2
+                    && f.effective_consumes
+                        .get(&approval2)
+                        .is_some_and(|c| c.event_hash == consume2)
+                    && f.unconsumed_approvals(issue_id).is_empty()
+            };
+            a.is_some_and(check) && b.is_some_and(check)
+        }
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// (i) SMOKE (single daemon by nature): the v1 RMW blob loses records under
+// the concurrent approve/consume interleave — the defect v2 removes.
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix (x0xd >= 0.33.0)"]
+#[allow(clippy::too_many_lines)]
 async fn v1_rmw_interleave_loses_records_repro() -> TestResult {
-    let _ = IGNORE;
-    let daemon = spawn_one("v1rmw").await?;
-    let api = Arc::new(X0xdClient::with_token(
-        &daemon.url,
-        Some(daemon.token.clone()),
-    )?);
-    let signer = SigningX0xdClient::with_token(&daemon.url, Some(daemon.token.clone()))?;
-    let agent = AgentId::new(signer.agent_identity().await?.agent_id)?;
+    let binary = x0xd_binary()?;
+    let bind = free_udp_port()?;
+    let daemon = Daemon::spawn("v1rmw", &binary, bind, &[]).await?;
+    let ctx = Ctx::new(&daemon).await?;
+    let agent = AgentId::new(ctx.agent.clone())?;
 
     let list_id = "wpc-race-list";
-    api.create_task_list(list_id, list_id).await?;
-    api.create_kv_store(
-        &format!("symphony-{list_id}"),
-        &format!("symphony-{list_id}"),
-    )
-    .await?;
-    let task_id = api
+    ctx.api.create_task_list(list_id, list_id).await?;
+    ctx.api
+        .create_kv_store(
+            &format!("symphony-{list_id}"),
+            &format!("symphony-{list_id}"),
+        )
+        .await?;
+    let task_id = ctx
+        .api
         .add_task(
             list_id,
             AddTaskDraft::new("contested").with_description("spec"),
@@ -664,36 +1195,65 @@ async fn v1_rmw_interleave_loses_records_repro() -> TestResult {
         &daemon.url,
         list_id,
         agent.clone(),
-        api.clone() as Arc<dyn X0xdApi>,
+        ctx.api.clone() as Arc<dyn X0xdApi>,
     );
     let tracker_2 = X0xCrdtTracker::from_client(
         &daemon.url,
         list_id,
         agent.clone(),
-        api.clone() as Arc<dyn X0xdApi>,
+        ctx.api.clone() as Arc<dyn X0xdApi>,
     );
     let issue_id = IssueId::new(task_id)?;
-    let issue = issue_by_id(&tracker_1, &issue_id)
+    let issue = tracker_1
+        .fetch_by_ids(std::slice::from_ref(&issue_id))
         .await
+        .map_err(|e| err(format!("{e}")))?
+        .into_iter()
+        .next()
         .ok_or_else(|| err("seeded v1 issue not visible"))?;
+    let approval_for = |at: &str| -> TestResult<ApprovalEvent> {
+        Ok(ApprovalEvent {
+            issue_id: issue.id.clone(),
+            content_hash: content_hash(&issue),
+            signer_agent_id: agent.clone(),
+            verdict: ApprovalVerdict::Approve,
+            approved_at: at.to_owned(),
+            approver_agent_id: agent.clone(),
+            claim_id: None,
+            signature: Some(SignatureEnvelope::new(
+                "ml-dsa-65",
+                "x0x-symphony-approval-v1",
+                "cGs=",
+                "c2ln",
+                sha256_hex(b"harness"),
+                ctx.agent.clone(),
+            )),
+        })
+    };
     tracker_1
-        .store_approval(&approval_for(
-            &issue,
-            agent.as_str(),
-            "2026-07-16T00:00:00Z",
-        )?)
+        .store_approval(&approval_for("2026-07-16T00:00:00Z")?)
         .await?;
 
-    // API store_approval vs gate store_consumed on one node: both GET the
-    // blob, both PUT — the last PUT erases the other writer's record.
+    // API store_approval vs gate store_consumed: both GET the blob, both
+    // PUT — the last PUT erases the other writer's record.
     let mut loss = false;
     for round in 0..12u32 {
-        let approval = approval_for(
-            &issue,
-            agent.as_str(),
-            &format!("2026-07-16T00:01:{round:02}Z"),
-        )?;
-        let consumed = consumed_for(&issue, agent.as_str(), &format!("nonce-{round}"))?;
+        let approval = approval_for(&format!("2026-07-16T00:01:{round:02}Z"))?;
+        let consumed = ApprovalConsumed::new(
+            issue.id.clone(),
+            content_hash(&issue),
+            agent.clone(),
+            format!("nonce-{round}"),
+            "2026-07-16T00:00:01Z",
+            SignatureEnvelope::new(
+                "ml-dsa-65",
+                "x0x-symphony-approval-consumed-v1",
+                "cGs=",
+                "c2ln",
+                sha256_hex(b"consumed"),
+                ctx.agent.clone(),
+            ),
+        );
         let (ra, rc) = tokio::join!(
             tracker_1.store_approval(&approval),
             tracker_2.store_consumed(&consumed)
@@ -717,378 +1277,34 @@ async fn v1_rmw_interleave_loses_records_repro() -> TestResult {
         "v1 RMW interleave must lose a record in 12 rounds; if not, the v1 blob \
          gained atomicity and issue #10's defect catalogue needs re-verification"
     );
-    let _ = &daemon;
     Ok(())
 }
 
 // ===========================================================================
-// (ii) v2 interleave keeps all records; exactly-once effective consume;
-// duplicate surfaced as a loser. Real x0xd KV + (append-only mode) real 409.
+// (vi) SMOKE (single daemon): downgrade refusals — genesis-less v2 lists
+// refused with no v1 fallback; the append_only policy gate refuses loudly.
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix"]
-#[allow(clippy::too_many_lines)]
-async fn v2_interleave_keeps_all_records_exactly_once_consume() -> TestResult {
-    let world = World::new("v2race").await?;
-    // A opens, B claims (both fold-fenced), A approves. All over live KV.
-    let issue_id = "i1";
-    world.a_open(issue_id, "contested v2", "spec").await?;
-    world.b_claim(issue_id).await?;
-    let approval1 = world.a_approve(issue_id, 100, "ap1").await?;
-
-    // The interleave A raced with B's consume: in v1 the RMW blob erased one
-    // record; in v2 A's approval #2 and B's consume of #1 are DISTINCT
-    // per-key append-only records. Order cannot change the folded outcome —
-    // that is precisely the property v2 restores — so writing them
-    // sequentially over the single-daemon KV is a faithful test. Both must
-    // survive.
-    let approval2 = world.a_approve(issue_id, 100, "ap2").await?;
-    let consume = world.b_consume(issue_id, &approval1, "consume1").await?;
-
-    let fold = world.fold().await?;
-    let approval_count = fold
-        .approvals
-        .values()
-        .filter(|a| a.approval.issue_id == issue_id)
-        .count();
-    assert_eq!(
-        approval_count, 2,
-        "both approvals present (nothing clobbered) — {approval_count} != 2"
-    );
-    assert!(
-        fold.approvals.contains_key(&approval2),
-        "approval #2 durable"
-    );
-    assert_eq!(
-        fold.effective_consumes.len(),
-        1,
-        "exactly one effective consume"
-    );
-    assert!(
-        fold.effective_consumes
-            .get(&approval1)
-            .is_some_and(|c| c.event_hash == consume),
-        "our consume is THE effective one for approval #1"
-    );
-
-    // Duplicate consume for the same approval → deterministic loser.
-    world.b_consume(issue_id, &approval1, "dup").await?;
-    let fold = world.fold().await?;
-    let ah = approval1.clone();
-    assert_eq!(
-        fold.effective_consumes.len(),
-        1,
-        "still exactly one effective"
-    );
-    assert!(
-        fold.losing_consumes
-            .iter()
-            .any(|d| d.approval_event_hash == ah),
-        "duplicate consume surfaced as a loser, never silently dropped"
-    );
-
-    // Append-only REST contract (only when the daemon honors it).
-    if append_only_mode() {
-        let topic = event_store_topic(&world.list_uuid, &world.a.id);
-        let detail = world
-            .api
-            .kv_store_detail(&topic)
-            .await?
-            .ok_or_else(|| err("own store missing from listing"))?;
-        assert_eq!(detail.policy.as_deref(), Some("append_only"));
-        let keys = V2StoreApi::list_kv_keys(world.api.as_ref(), &topic).await?;
-        let ev = keys
-            .iter()
-            .map(|k| k.key.clone())
-            .find(|k| k.starts_with("ev-"))
-            .ok_or_else(|| err("no ev- key"))?;
-        let overwrite =
-            V2StoreApi::put_kv(world.api.as_ref(), &topic, &ev, b"tamper", "text/plain").await;
-        assert!(overwrite.is_err(), "append-only PUT-to-existing must 409");
-    }
-    Ok(())
-}
-
-// ===========================================================================
-// (iii) hostile un-park + forged authorship inadmissible.
-// ===========================================================================
-
-#[tokio::test]
-#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix"]
-#[allow(clippy::too_many_lines)]
-async fn hostile_unpark_and_forged_authorship_inadmissible() -> TestResult {
-    let world = World::new("hostile").await?;
-    // A opens, claims, and parks its own issue with a NON-requeue-able reason.
-    let issue_id = "i1";
-    world.a_open(issue_id, "parked", "spec").await?;
-    world.a_claim(issue_id).await?;
-    world
-        .a_block(
-            issue_id,
-            BlockReason::Other {
-                detail: "retry_exhausted: budget spent".to_owned(),
-            },
-        )
-        .await?;
-    let fold = world.fold().await?;
-    let st = fold
-        .issues
-        .get(issue_id)
-        .ok_or_else(|| err("issue missing"))?;
-    let IssueStatusV2::Blocked {
-        claim_nonce,
-        claim_event_hash,
-        block_event_hash,
-        ..
-    } = st.status.clone()
-    else {
-        return Err(err("issue not blocked"));
-    };
-    let own_b = &world.own_b;
-
-    // (a) B-authored release naming A's fence: admissible, INEFFECTIVE.
-    let (seq, prev) = fold.next_chain_link(&world.b.id);
-    let release = TransitionEventV2 {
-        schema: V2_SCHEMA,
-        list_uuid: world.list_uuid.clone(),
-        genesis_manifest_hash: fold.genesis_hash.clone(),
-        roster_epoch: fold.latest_roster_epoch,
-        issue_id: issue_id.to_owned(),
-        actor: world.b.id.clone(),
-        lamport: fold.max_admitted_lamport + 1,
-        author_seq: seq,
-        prev_own_event_hash: prev,
-        kind: TransitionKind::Release {
-            claim_nonce: claim_nonce.clone(),
-            claimed_event_hash: claim_event_hash.clone(),
-        },
-    };
-    let release_hash = world.manager_b.append_transition(own_b, &release).await?;
-
-    // (b) B-authored requeue with a valid-looking B-signed justification —
-    // block reason is Other, so the C6 fold refuses the un-park.
-    let approval_payload = ApprovalPayloadV2 {
-        schema: V2_SCHEMA,
-        kind: "approval".to_owned(),
-        list_uuid: world.list_uuid.clone(),
-        genesis_manifest_hash: fold.genesis_hash.clone(),
-        issue_id: issue_id.to_owned(),
-        block_event_hash: block_event_hash.clone(),
-        claim_nonce: claim_nonce.clone(),
-        approver: world.b.id.clone(),
-        approved_at: 1,
-    };
-    let approval_bytes = serde_json::to_vec(&approval_payload)?;
-    let approval_hash = sha256_hex(&approval_bytes);
-    let approval_env = world
-        .manager_b
-        .sign_approval_payload(own_b, &approval_bytes)
-        .await?;
-    let requeue = TransitionEventV2 {
-        schema: V2_SCHEMA,
-        list_uuid: world.list_uuid.clone(),
-        genesis_manifest_hash: fold.genesis_hash.clone(),
-        roster_epoch: fold.latest_roster_epoch,
-        issue_id: issue_id.to_owned(),
-        actor: world.b.id.clone(),
-        lamport: fold.max_admitted_lamport + 2,
-        author_seq: seq + 1,
-        prev_own_event_hash: release_hash,
-        kind: TransitionKind::Requeue {
-            justification: RequeueJustification {
-                block_event_hash: block_event_hash.clone(),
-                claim_nonce: claim_nonce.clone(),
-                approval_event_hash: approval_hash.clone(),
-                approval_payload_sha256: approval_hash,
-                approver: world.b.id.clone(),
-                approval: approval_env,
-            },
-        },
-    };
-    world.manager_b.append_transition(own_b, &requeue).await?;
-
-    // (c) forged authorship: payload actor=A, signed by B, dropped into B's
-    // store — four-way binding fails at admission.
-    let forged = TransitionEventV2 {
-        schema: V2_SCHEMA,
-        list_uuid: world.list_uuid.clone(),
-        genesis_manifest_hash: fold.genesis_hash.clone(),
-        roster_epoch: fold.latest_roster_epoch,
-        issue_id: issue_id.to_owned(),
-        actor: world.a.id.clone(),
-        lamport: fold.max_admitted_lamport + 3,
-        author_seq: 999,
-        prev_own_event_hash: fold.genesis_hash.clone(),
-        kind: TransitionKind::Release {
-            claim_nonce,
-            claimed_event_hash: claim_event_hash,
-        },
-    };
-    let forged_bytes = forged.to_signed_bytes().map_err(err)?;
-    let forged_hash = sha256_hex(&forged_bytes);
-    let signer_b = LocalSigner {
-        author: world.b.clone(),
-    };
-    let sign = signer_b.sign(TRANSITION_CONTEXT_V2, &forged_bytes).await?;
-    let forged_env = EventEnvelope {
-        schema: V2_SCHEMA,
-        context: TRANSITION_CONTEXT_V2.to_owned(),
-        algorithm: sign.algorithm,
-        payload_b64: BASE64.encode(&forged_bytes),
-        public_key_b64: sign.public_key_b64,
-        signature_b64: sign.signature_b64,
-        signer_agent_id: sign.agent_id,
-    };
-    let topic_b = event_store_topic(&world.list_uuid, &world.b.id);
-    V2StoreApi::put_kv(
-        world.api.as_ref(),
-        &topic_b,
-        &event_key(issue_id, &forged_hash),
-        &forged_env.encode().map_err(err)?,
-        "application/x0x-symphony-v2+json",
-    )
-    .await?;
-
-    let fold = world.fold().await?;
-    assert!(
-        fold.issues
-            .get(issue_id)
-            .is_some_and(|st| matches!(st.status, IssueStatusV2::Blocked { .. })),
-        "issue must stay blocked despite three hostile records"
-    );
-    let hostile = fold
-        .rejections
-        .iter()
-        .filter(|r| r.author == world.b.id || r.reason.contains("store owner"))
-        .count();
-    assert!(
-        hostile >= 3,
-        "all three hostile records must be surfaced as rejections, got {hostile}"
-    );
-    Ok(())
-}
-
-// ===========================================================================
-// (iv) divergent claims → one deterministic winner; equivocation → fork.
-// Partition degraded to sequential local writes (see module doc).
-// ===========================================================================
-
-#[tokio::test]
-#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix"]
-async fn divergent_claims_heal_to_single_winner_and_fork_evidence() -> TestResult {
-    let world = World::new("diverge").await?;
-    let issue_id = "i1";
-    world.a_open(issue_id, "both want it", "spec").await?;
-
-    // "Partition": B claims, then A claims — both claims exist; the total
-    // fold order picks ONE. (Fidelity: sequential local writes, not a
-    // firewalled partition — the deterministic-winner property is identical
-    // because fold order is total over (lamport, author, event_hash).)
-    let own_b = &world.own_b;
-    world.b_claim(issue_id).await?;
-    world.a_claim(issue_id).await?;
-
-    let winner_of = |fold: &FoldOutput| {
-        fold.issues.get(issue_id).and_then(|st| match &st.status {
-            IssueStatusV2::Claimed { claimant, .. } => Some(claimant.clone()),
-            _ => None,
-        })
-    };
-    let fold = world.fold().await?;
-    let winner = winner_of(&fold).ok_or_else(|| err("no claim winner"))?;
-    assert!(
-        winner == world.a.id || winner == world.b.id,
-        "winner must be one of the two claimants"
-    );
-    // Determinism: a second independent fold agrees.
-    let winner2 = winner_of(&world.fold().await?);
-    assert_eq!(Some(winner.clone()), winner2, "winner is deterministic");
-    eprintln!("divergent claim winner (deterministic) = {winner}");
-
-    // Equivocation: B signs two DIFFERENT events at one author_seq.
-    let fold = world.fold().await?;
-    let (seq, prev) = fold.next_chain_link(&world.b.id);
-    for nonce in ["fork-one", "fork-two"] {
-        let ev = TransitionEventV2 {
-            schema: V2_SCHEMA,
-            list_uuid: world.list_uuid.clone(),
-            genesis_manifest_hash: fold.genesis_hash.clone(),
-            roster_epoch: fold.latest_roster_epoch,
-            issue_id: issue_id.to_owned(),
-            actor: world.b.id.clone(),
-            lamport: fold.max_admitted_lamport + 1,
-            author_seq: seq,
-            prev_own_event_hash: prev.clone(),
-            kind: TransitionKind::Claim {
-                claim_nonce: nonce.to_owned(),
-            },
-        };
-        world.manager_b.append_transition(own_b, &ev).await?;
-    }
-    let fold = world.fold().await?;
-    assert!(
-        fold.forks
-            .iter()
-            .any(|f| f.author == world.b.id && f.author_seq == seq && f.event_hashes.len() == 2),
-        "author equivocation must surface ForkEvidence"
-    );
-    Ok(())
-}
-
-// ===========================================================================
-// (v) crash-after-consume — SKIPPED live (see module doc: x0xd 0.32.1 does
-// not persist KV across restart). The consume-then-execute fail-toward-zero
-// logic is proven in v2_gate::crash_after_consume_recovers_via_reapproval.
-// ===========================================================================
-
-#[tokio::test]
-#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix"]
-async fn crash_after_consume_recovers_via_reapproval() -> TestResult {
-    eprintln!(
-        "SKIP-LIVE (v): x0xd KV is not durable across restart in this build \
-         (verified: keys lost after SIGKILL+restart on 0.32.1), so live \
-         crash-durability cannot be demonstrated here. The consume-then-\
-         execute fail-toward-zero LOGIC is proven in \
-         v2_gate::crash_after_consume_recovers_via_reapproval (in-memory, \
-         passing). This live scenario runs on infra with durable KV."
-    );
-    Ok(())
-}
-
-// ===========================================================================
-// (vi) downgrade refusals.
-// ===========================================================================
-
-#[tokio::test]
-#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix"]
+#[ignore = "live tracker-integrity race harness: set X0XD_TEST_BINARY (or PATH x0xd); X0X_V2_APPEND_ONLY=1 for the append-only matrix (x0xd >= 0.33.0)"]
 async fn downgrade_refusals() -> TestResult {
-    let daemon = spawn_one("downgrade").await?;
-    let api = Arc::new(X0xdClient::with_token(
-        &daemon.url,
-        Some(daemon.token.clone()),
-    )?);
-    let a = Arc::new(Author::generate()?);
+    let binary = x0xd_binary()?;
+    let bind = free_udp_port()?;
+    let daemon = Daemon::spawn("downgrade", &binary, bind, &[]).await?;
+    let ctx = Ctx::new(&daemon).await?;
 
-    // (a) genesis-less v2 list is refused (no v1 fallback).
-    let manager = V2StoreManager::new(
-        api.clone(),
-        Arc::new(LocalSigner { author: a.clone() }),
-        policy_mode(),
-    );
+    // (a) v2 list whose creator store exists but has NO genesis: refused
+    // outright — no partial state, no v1 fallback.
     let list_uuid = "wpc-nogen";
+    let manager = ctx.manager();
     manager.ensure_own_store(list_uuid).await?; // card-self only, NO genesis
     let tracker = V2Tracker::new(
-        V2StoreManager::new(
-            api.clone(),
-            Arc::new(LocalSigner { author: a.clone() }),
-            policy_mode(),
-        ),
+        ctx.manager(),
         V2ListRef {
             list_uuid: list_uuid.to_owned(),
-            creator: a.id.clone(),
+            creator: ctx.agent.clone(),
         },
-        AgentId::new(a.id.clone())?,
+        AgentId::new(ctx.agent.clone())?,
         None,
         Duration::ZERO,
     );
@@ -1097,25 +1313,36 @@ async fn downgrade_refusals() -> TestResult {
         matches!(&refused, Err(e) if e.to_string().contains("refused")),
         "genesis-less v2 list must be refused, got {refused:?}"
     );
-    let lists = api.list_task_lists().await?;
+    let lists = ctx.api.list_task_lists().await?;
     assert!(
         !lists.iter().any(|l| l.id.contains("symphony2:")),
         "a refused v2 list must not materialize a v1 surface"
     );
 
-    // (b) append_only policy gate fails loudly.
-    let a_id = a.id.clone();
+    // (b) the append_only policy gate fails LOUDLY. The arm depends on the
+    // DAEMON'S capability (probed live), not on the harness mode env.
     let gate = V2StoreManager::new(
-        api.clone(),
-        Arc::new(LocalSigner { author: a }),
+        ctx.api.clone(),
+        ctx.signer.clone(),
         StorePolicyMode::AppendOnly,
     );
     let policy_list = "wpc-policy";
-    if append_only_mode() {
-        // Daemon honors append_only: pre-create the store topic as a MUTABLE
-        // `signed` store; reuse must then refuse to masquerade it.
-        let topic = event_store_topic(policy_list, &a_id);
-        api.create_kv_store(&topic, &topic).await?;
+    let probe_topic = "wpc-policy-probe";
+    ctx.api
+        .create_kv_store_with_policy(probe_topic, probe_topic, Some("append_only"))
+        .await?;
+    let daemon_honors_append_only = ctx
+        .api
+        .kv_store_detail(probe_topic)
+        .await?
+        .and_then(|d| d.policy)
+        .as_deref()
+        == Some("append_only");
+    if daemon_honors_append_only {
+        // Daemon honors append_only: pre-create the store topic as a
+        // MUTABLE `signed` store; reuse must refuse to masquerade it.
+        let topic = event_store_topic(policy_list, &ctx.agent);
+        ctx.api.create_kv_store(&topic, &topic).await?;
         let outcome = gate.ensure_own_store(policy_list).await;
         assert!(
             matches!(outcome, Err(V2StoreError::PolicyNotHonored { .. })),
@@ -1129,6 +1356,5 @@ async fn downgrade_refusals() -> TestResult {
             "old daemon must be refused when append_only is requested, got {outcome:?}"
         );
     }
-    let _ = &daemon;
     Ok(())
 }

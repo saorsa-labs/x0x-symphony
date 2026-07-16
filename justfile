@@ -60,4 +60,4 @@ clean:
 
 # Live two-daemon tracker-integrity race harness (spawns two isolated x0xd daemons)
 test-v2-race:
-    RUSTFLAGS="-D warnings" cargo nextest run -p x0x-symphony-tracker-x0x-crdt --test v2_two_daemon_race --run-ignored all --no-capture
+    RUSTFLAGS="-D warnings" cargo nextest run -p x0x-symphony-tracker-x0x-crdt --test v2_two_daemon_race --run-ignored all --no-capture --test-threads=1 --no-fail-fast

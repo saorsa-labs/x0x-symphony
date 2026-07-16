@@ -641,10 +641,7 @@ fn canonical_streams(
             candidates.insert(record.value.clone());
         }
         if candidates.len() > 1 {
-            let hashes: Vec<String> = candidates
-                .iter()
-                .map(|card| sha256_hex(card))
-                .collect();
+            let hashes: Vec<String> = candidates.iter().map(|card| sha256_hex(card)).collect();
             conflicted.insert(
                 stream.owner.clone(),
                 format!(

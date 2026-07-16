@@ -214,8 +214,7 @@ impl V2Tracker {
             .read_fold_input(&self.list_ref.list_uuid, &self.list_ref.creator)
             .await
             .map_err(|e| store_err(&e))?;
-        let out =
-            fold_v2(&input).map_err(|refusal| terr(format!("v2 list refused: {refusal}")))?;
+        let out = fold_v2(&input).map_err(|refusal| terr(format!("v2 list refused: {refusal}")))?;
         // Fork evidence is self-authenticating proof of equivocation —
         // surfaced loudly on every fold, never swallowed.
         for fork in &out.forks {
@@ -238,11 +237,7 @@ impl V2Tracker {
         let own_id = self.agent_id.as_str();
         let mut joined = self.joined.lock().await;
         let mut joined_any = false;
-        let members = out
-            .genesis
-            .roster
-            .iter()
-            .chain(out.current_roster.iter());
+        let members = out.genesis.roster.iter().chain(out.current_roster.iter());
         for member in members {
             if member == own_id || joined.contains(member) {
                 continue;

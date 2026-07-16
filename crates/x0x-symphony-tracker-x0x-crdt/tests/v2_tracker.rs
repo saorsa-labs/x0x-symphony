@@ -1279,7 +1279,9 @@ async fn claim_survives_heartbeat_write_failure() -> TestResult {
         .await
         .map_err(|e| err(format!("claim must survive a heartbeat failure, got: {e}")))?;
     assert_eq!(claim.by, agent);
-    let folded = tracker.fetch_by_ids(std::slice::from_ref(&issue.id)).await?;
+    let folded = tracker
+        .fetch_by_ids(std::slice::from_ref(&issue.id))
+        .await?;
     assert_eq!(
         folded[0].state,
         IssueState::new("in_progress")?,
@@ -1295,7 +1297,7 @@ async fn claim_survives_heartbeat_write_failure() -> TestResult {
 
 /// Codex blocker 2 regression: an author admitted by a roster UPDATE (not
 /// the genesis roster) must have its store joined and its events visible
-/// through the PRODUCTION tracker read path (fold_view join fixpoint).
+/// through the PRODUCTION tracker read path (`fold_view` join fixpoint).
 #[tokio::test]
 async fn roster_added_member_events_visible_via_tracker_read_path() -> TestResult {
     let world = V2World::new("wpb2-rosteradd", &[]).await?;
@@ -1357,7 +1359,10 @@ async fn roster_added_member_events_visible_via_tracker_read_path() -> TestResul
     assert!(
         issues.iter().any(|i| i.id.as_str() == "peer-issue"),
         "roster-added member's issue must be visible via the tracker read path; got {:?}",
-        issues.iter().map(|i| i.id.as_str().to_owned()).collect::<Vec<_>>()
+        issues
+            .iter()
+            .map(|i| i.id.as_str().to_owned())
+            .collect::<Vec<_>>()
     );
     let joins = world.daemon.joins.lock().await.clone();
     assert!(

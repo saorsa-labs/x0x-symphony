@@ -468,25 +468,32 @@ consume-then-confirm failing closed under a staged divergent-claim heal —
 plus parity scenarios written once against `&dyn Tracker` and executed on
 BOTH the v1 and v2 trackers.
 
-WP-C: `tests/v2_two_daemon_race.rs` is the LIVE harness — it spawns two
-isolated loopback x0xd daemons (`X0XD_TEST_BINARY` or PATH,
-`--no-hard-coded-bootstrap`, `[update] enabled=false`, ephemeral ports)
-and proves, per scenario: (i) the v1 RMW blob loses records under the
-concurrent approval/consume interleave (the documented defect); (ii) the
-same interleave on v2 loses nothing — exactly-once effective consume,
-duplicate surfaced in `losing_consumes` on both daemons; (iii) hostile
-un-park (fence-violating release, C6-violating requeue) and forged
-authorship are rejected everywhere while the issue stays blocked;
-(iv) divergent claims raced inside the gossip window heal to one
-deterministic winner on both daemons, and author equivocation surfaces
-`ForkEvidence` everywhere; (v) crash-after-consume keeps the approval
-spent across a SIGKILL/restart and recovers via re-approval, exactly once
-per approval; (vi) genesis-less v2 lists are refused with no v1 fallback
-and the `append_only` policy gate refuses loudly in both directions.
-`X0X_V2_APPEND_ONLY=1` switches the harness from the interim
+WP-C: `tests/v2_two_daemon_race.rs` is the LIVE harness — GENUINE
+two-daemon runs: two isolated loopback x0xd daemons (`X0XD_TEST_BINARY`
+or PATH, MUTUAL config `bootstrap_peers`, rolling start, per-daemon
+`identity_dir`, `--no-hard-coded-bootstrap`, `[update] enabled=false`,
+ephemeral ports) with real cross-daemon KV replication
+(subscribe-before-write discipline: stores are created and cross-joined
+BEFORE the first key is written). Scenarios: (ii) the v1-lethal
+approve/consume interleave, genuinely concurrent across daemons, loses
+nothing — both independent replica folds agree, exactly-once effective
+consume, duplicate surfaced in `losing_consumes` on both; (iii) hostile
+un-park (fence-violating release, C6-violating requeue) rejected on both
+replicas while the issue stays blocked; (iv) a REAL partition (daemon
+SIGKILL window) with a guaranteed divergent claim heals to one
+deterministic winner on both replicas, and author equivocation surfaces
+`ForkEvidence` everywhere; (v) SIGKILL-after-consume, restart on the same
+data dir: the approval stays spent (x0x ≥ 0.33.0 KV persistence), replay
+folds as a loser on both replicas, re-approval recovers exactly once per
+approval. Single-daemon SMOKE scenarios: (i) the v1 RMW blob loses
+records under the concurrent interleave (the documented defect) and
+(vi) genesis-less v2 lists refused with no v1 fallback plus the
+`append_only` policy gate refusing loudly (arm chosen by probed daemon
+capability). `X0X_V2_APPEND_ONLY=1` switches the harness from the interim
 `SignedFallback` mode to the full `AppendOnly` matrix (adds the WP-X REST
 contract assertions: reported policy + PUT-to-existing refusal); run via
-`just test-v2-race`.
+`just test-v2-race` (serial — daemon restarts are timing-sensitive under
+parallel pairs).
 
 `tests/v2_gate.rs` drives `V2ApprovalGate` over an in-memory daemon double
 that honors the append-only contract and can release "concurrently

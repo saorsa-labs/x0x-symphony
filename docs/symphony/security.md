@@ -180,7 +180,7 @@ resolve differently:
 | Crash after consume, before execute | Approval spent, zero executions (re-approve) | Same fail-toward-zero semantics (re-approve); unchanged by design |
 | Equivocation (rewriting own history) | Undetectable | Per-author hash chains: two signed events with one `author_seq` are self-authenticating fork evidence; the forked author's suffix is inadmissible |
 | Downgrade | n/a | A `symphony2:` reference with a missing/invalid genesis manifest is REFUSED outright — never silently served as v1 |
-| Storage mutability | Mutable KV blobs | `AccessPolicy::AppendOnly` stores (x0x ≥ 0.33.0). Interim `v2_store_policy = "signed"` fallback runs on older daemons with the deletion residual OPEN — the default mode refuses loudly instead |
+| Storage mutability | Mutable KV blobs | `AccessPolicy::AppendOnly` stores (x0x ≥ 0.33.0, released). The daemon-reported anchor (owner AND policy) is verified on EVERY store the tracker touches — own, joined, and read paths alike; silence is refusal. Scope honestly stated: this verifies the policy the LOCAL daemon enforces on its replica; a remote hostile daemon mutating its own replica is caught by the fold (hash chains + content addressing), not by the policy bit. Interim `v2_store_policy = "signed"` fallback runs on older daemons with the deletion residual OPEN — the default mode refuses loudly instead |
 
 v2 requires `signing.policy: required`. Heartbeats remain mutable
 non-authoritative liveness hints in a `symphony2-hb-*` companion store and

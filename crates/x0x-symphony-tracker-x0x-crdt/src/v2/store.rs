@@ -307,13 +307,13 @@ impl V2StoreManager {
     /// [`V2StoreError::AnchorMismatch`] on an owner mismatch, and
     /// [`V2StoreError::PolicyNotHonored`] on a policy mismatch.
     pub async fn verify_store_anchor(&self, topic: &str, expected_owner: &str) -> Result<()> {
-        let detail = self
-            .api
-            .kv_store_detail(topic)
-            .await?
-            .ok_or_else(|| V2StoreError::NotFound {
-                topic: topic.to_owned(),
-            })?;
+        let detail =
+            self.api
+                .kv_store_detail(topic)
+                .await?
+                .ok_or_else(|| V2StoreError::NotFound {
+                    topic: topic.to_owned(),
+                })?;
         match detail.owner.as_deref() {
             Some(owner) if owner == expected_owner => {}
             other => {
@@ -930,13 +930,13 @@ impl V2StoreManager {
         // Owner must anchor to the peer; the policy is deliberately the
         // mutable `signed` one (heartbeats are non-authoritative), so only
         // the owner leg of the anchor is enforced here.
-        let detail = self
-            .api
-            .kv_store_detail(&topic)
-            .await?
-            .ok_or_else(|| V2StoreError::NotFound {
-                topic: topic.clone(),
-            })?;
+        let detail =
+            self.api
+                .kv_store_detail(&topic)
+                .await?
+                .ok_or_else(|| V2StoreError::NotFound {
+                    topic: topic.clone(),
+                })?;
         match detail.owner.as_deref() {
             Some(owner) if owner == peer_agent_id => Ok(()),
             other => Err(V2StoreError::AnchorMismatch {
@@ -1171,8 +1171,7 @@ mod tests {
     /// DIFFERENT owner than the signing identity is refused outright.
     #[tokio::test]
     async fn owner_mismatch_is_refused() -> TestResult {
-        let api = MockApi::new(true, MockDetail::Policy("append_only"))
-            .with_owner(&"d".repeat(64));
+        let api = MockApi::new(true, MockDetail::Policy("append_only")).with_owner(&"d".repeat(64));
         let mgr = V2StoreManager::new(
             Arc::new(api),
             Arc::new(MockSigner::generate()?),

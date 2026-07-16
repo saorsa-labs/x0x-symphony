@@ -2125,11 +2125,7 @@ fn conflicting_card_self_rejects_owner_order_independently() -> TestResult {
     let forward = fold(
         &fixture,
         &creator,
-        vec![
-            creator_stream.clone(),
-            genuine.clone(),
-            conflicting.clone(),
-        ],
+        vec![creator_stream.clone(), genuine.clone(), conflicting.clone()],
     )
     .map_err(|e| err(format!("{e}")))?;
     let reverse = fold(
@@ -2139,7 +2135,10 @@ fn conflicting_card_self_rejects_owner_order_independently() -> TestResult {
     )
     .map_err(|e| err(format!("{e}")))?;
 
-    assert_eq!(forward, reverse, "fold output must be stream-order-independent");
+    assert_eq!(
+        forward, reverse,
+        "fold output must be stream-order-independent"
+    );
     assert!(
         matches!(status_of(&forward, "i1")?, IssueStatusV2::Open),
         "the conflicted owner's claim must not take effect"
@@ -2198,23 +2197,10 @@ fn consume_is_effective_when_its_approval_orders_later_in_fold() -> TestResult {
     )?;
     // Approval at lamport 10 — AFTER the consume's fold position (3).
     let mut approver_chain = Chain::new(&approver, &fixture);
-    let (approval_hash, approval) = approver_chain.next_approval(
-        0,
-        "i1",
-        10,
-        &open_hash,
-        ApprovalVerdictV2::Approve,
-        1_000,
-    )?;
-    let (consume_hash, consume) = worker_chain.next_consume(
-        0,
-        "i1",
-        3,
-        &approval_hash,
-        &approver.id,
-        "n1",
-        &claim_hash,
-    )?;
+    let (approval_hash, approval) =
+        approver_chain.next_approval(0, "i1", 10, &open_hash, ApprovalVerdictV2::Approve, 1_000)?;
+    let (consume_hash, consume) =
+        worker_chain.next_consume(0, "i1", 3, &approval_hash, &approver.id, "n1", &claim_hash)?;
 
     let base_streams = || {
         vec![
