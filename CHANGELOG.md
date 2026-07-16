@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.0] — 2026-07-16
+
+Tracker Integrity v2 (#10, PR #11): replicated tracker state is now
+tamper-evident and convergently deterministic across daemons.
+
+### Added
+
+- **v2 tracker engine** for `symphony2:` lists: every mutation is an
+  ML-DSA-65-signed, per-author hash-chained event in the author's own
+  append-only x0x KV store (requires x0x ≥ 0.33.0 for
+  `AccessPolicy::AppendOnly`; falls back to `signed` stores via
+  `tracker.v2_store_policy` with a reduced guarantee, loudly). Issue state is
+  a pure deterministic two-phase fold (cryptographic admission → state
+  machine): four-way author binding (envelope signer = event actor = store
+  owner = agent-id-derived-from-pubkey — self-certifying, no TOFU),
+  creator-signed genesis manifest + epoch'd roster, per-author chains with
+  fork evidence, lamport bounds, cross-list/genesis replay binding, and
+  resource budgets (fail-closed). Trust and TTL are dispatch-time policy,
+  never fold inputs.
+- **Convergent approvals/consumption**: approval and consumption records are
+  per-key signed events (set-union by construction — the v1 lost-update RMW
+  race is structurally impossible); dispatch is claim-fenced
+  consume-then-confirm with deterministic at-most-one effective consume and
+  `losing_consumes` diagnostics. Requeue authorizes itself cryptographically
+  (block event + claim nonce + approval bindings) — no writer can un-park
+  blocked work.
+- **Two-daemon live race harness** (`just test-v2-race`, mode-gated): proves
+  on real x0xd v0.33.0 pairs — v1 RMW loss reproduced; v2 loses no records
+  with exactly-once effective consume; hostile un-park and forged authorship
+  rejected; controlled partition divergence heals to one deterministic winner
+  with the loser present-and-rejected on both replicas; SIGKILL-after-consume
+  spends durably with re-approval recovery; downgrade attempts refused.
+
+### Documentation
+
+- `docs/design/tracker-integrity-v2.md` (normative spec) and a
+  `docs/symphony/security.md` v1-vs-v2 guarantees table with the honest
+  three-regime integrity scope: alteration rejected; interior deletion of an
+  observed chain detected; tail withholding by a remote daemon of its own
+  stream is undetectable (indistinguishable from lag). Residual x0x-side
+  recovery defects tracked in x0x#238; remaining test follow-ups in #12.
+
 ## [v0.1.3] — 2026-07-15
 
 Patch release closing the two v0.1.2 pilot blockers (#6, #7) found in the
