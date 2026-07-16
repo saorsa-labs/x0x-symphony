@@ -1371,3 +1371,73 @@ async fn roster_added_member_events_visible_via_tracker_read_path() -> TestResul
     );
     Ok(())
 }
+
+/// Codex round-3 item 2: a member store whose daemon-reported anchor is
+/// PRESENT but WRONG (owner mismatch) fails the whole list read
+/// (fail-closed), while a member whose store is genuinely ABSENT (no
+/// listing at all — normal replication lag) is skipped and the list still
+/// folds.
+#[tokio::test]
+async fn member_anchor_mismatch_fails_read_but_absent_member_is_skipped() -> TestResult {
+    let peer = Author::generate()?;
+    let ghost = Author::generate()?;
+    let world = V2World::new("wpb2-anchor", &[&peer, &ghost]).await?;
+    let tracker: &dyn Tracker = &world.tracker;
+
+    // Baseline sanity: `ghost` is in the roster but has NO store listing —
+    // that is replication lag, not an integrity violation: reads succeed.
+    let issue = tracker.create_issue(draft("anchored", "spec")).await?;
+    assert_eq!(
+        tracker
+            .fetch_by_ids(std::slice::from_ref(&issue.id))
+            .await?
+            .len(),
+        1,
+        "absent member store must not block the list read"
+    );
+
+    // Now corrupt peer's anchor: listing present, WRONG owner.
+    let peer_topic = event_store_topic(&world.list_uuid, &peer.id);
+    world
+        .daemon
+        .anchor(&peer_topic, &ghost.id, "append_only")
+        .await;
+    let refused = tracker.list_issues().await;
+    assert!(
+        matches!(&refused, Err(e) if e.to_string().contains("anchor")),
+        "an owner-mismatched member store must fail the read, got {refused:?}"
+    );
+    Ok(())
+}
+
+/// Codex round-3 item 1: the read path enforces the record budget before
+/// fetching values — an over-budget stream refuses the read outright.
+#[tokio::test]
+async fn read_budget_violation_refuses_the_read() -> TestResult {
+    use x0x_symphony_tracker_x0x_crdt::v2::FoldLimits;
+    let world = V2World::new("wpb2-readbudget", &[]).await?;
+    let tracker: &dyn Tracker = &world.tracker;
+    for i in 0..3 {
+        tracker
+            .create_issue(draft(&format!("issue {i}"), "spec"))
+            .await?;
+    }
+    // A manager with a tiny record budget must refuse the same stream.
+    let tight = V2StoreManager::new(
+        world.daemon.clone(),
+        Arc::new(LocalSigner {
+            author: world.me.clone(),
+        }),
+        StorePolicyMode::AppendOnly,
+    )
+    .with_limits(FoldLimits {
+        max_records_per_stream: 2,
+        ..FoldLimits::default()
+    });
+    let refused = tight.read_fold_input(&world.list_uuid, &world.me.id).await;
+    assert!(
+        matches!(&refused, Err(e) if e.to_string().contains("budget")),
+        "over-budget stream must refuse the read, got {refused:?}"
+    );
+    Ok(())
+}

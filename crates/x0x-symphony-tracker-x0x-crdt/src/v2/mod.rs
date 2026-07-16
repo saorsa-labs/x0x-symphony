@@ -39,8 +39,8 @@ pub use events::{
 };
 pub use fold::{
     fold_v2, AdmittedApprovalV2, AuthorStream, ChainTipV2, ConsumeDiagnostic, EffectiveConsumeV2,
-    FoldInput, FoldOutput, ForkEvidence, HandoffRecordV2, IssueStateV2, IssueStatusV2, ListRefusal,
-    Rejection, RejectionPhase, StoreRecord, LAMPORT_MAX_SKEW,
+    FoldInput, FoldLimits, FoldOutput, ForkEvidence, HandoffRecordV2, IssueStateV2, IssueStatusV2,
+    ListRefusal, Rejection, RejectionPhase, StoreRecord, LAMPORT_MAX_SKEW,
 };
 pub use gate::{build_claim_transition, V2ApprovalGate, V2GateConfig, V2GateDecision};
 pub use store::{OwnEventStore, StorePolicyMode, V2StoreApi, V2StoreError, V2StoreManager};

@@ -59,7 +59,8 @@ use x0x_symphony_tracker_x0x_crdt::{
             RequeueJustification, TransitionEventV2, TransitionKind, V2_SCHEMA,
         },
         fold_v2, BlockReason, ConsumeEventV2, FoldOutput, IssueStatusV2, OwnEventStore,
-        StorePolicyMode, V2ListRef, V2StoreApi, V2StoreError, V2StoreManager, V2Tracker,
+        RejectionPhase, StorePolicyMode, V2ListRef, V2StoreApi, V2StoreError, V2StoreManager,
+        V2Tracker,
     },
     X0xCrdtTracker,
 };
@@ -911,26 +912,34 @@ async fn two_daemon_partition_heals_to_single_winner_and_fork_evidence() -> Test
     );
 
     // PARTITION: kill daemon B (a real daemon-down window). A claims —
-    // the claim lands on A only, so B's replica is GUARANTEED not to have
-    // seen it when B comes back.
+    // the claim lands on A only; B is down and provably cannot see it.
     //
     // NOTE on kill order: the restarting daemon must have its peer UP.
     // x0xd 0.33.0 wedges CRDT-subscription rehydration (including the
     // daemon's OWN stores) when a joined store's owner is unreachable at
-    // startup — verified live and reported upstream.
+    // startup — verified live and reported upstream (x0x#238).
     pair.daemon_b.kill();
     let fold = pair.fold_a().await.ok_or_else(|| err("fold A refused"))?;
     let claim_a = build_claim_transition(&fold, &pair.list_uuid, &pair.ctx_a.agent, issue_id);
-    pair.manager_a
+    let hash_a = pair
+        .manager_a
         .append_transition(&pair.own_a, &claim_a)
         .await?;
+    // Pre-heal view A (ASSERTED): A's replica shows A's own claim winning.
+    let a_view_pre_heal = pair.fold_a().await.ok_or_else(|| err("fold A refused"))?;
+    assert!(
+        matches!(
+            a_view_pre_heal.issues.get(issue_id).map(|st| &st.status),
+            Some(IssueStatusV2::Claimed { claimant, claim_event_hash, .. })
+                if claimant == &pair.ctx_a.agent && claim_event_hash == &hash_a
+        ),
+        "pre-heal: A's own fold must show A's claim winning"
+    );
 
-    // HEAL: restart B (A is up, so rehydration completes) and immediately
-    // race B's divergent claim against the incoming catch-up. If B's local
-    // replica still shows Open, B writes a genuinely divergent claim; if
-    // catch-up won the race, only A's claim exists. BOTH are honest heal
-    // outcomes — the invariant under test is deterministic convergence to
-    // ONE winner on both replicas.
+    // Restart B (A is up, so rehydration completes). DIVERGENCE IS
+    // ASSERTED, not hoped for: B's replica must still show the issue Open
+    // (it was down for A's claim; catch-up takes ~15s — if catch-up ever
+    // wins this race the test FAILS loudly and the timing needs rework).
     pair.daemon_b.restart().await?;
     let ctx_b = Ctx::new(&pair.daemon_b).await?;
     assert_eq!(
@@ -939,54 +948,102 @@ async fn two_daemon_partition_heals_to_single_winner_and_fork_evidence() -> Test
     );
     pair.ctx_b = ctx_b;
     let manager_b = pair.ctx_b.manager();
-    let mut b_wrote_divergent_claim = false;
+    let mut b_view_restarted = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
-        match pair.fold_with(&manager_b).await {
-            Some(f) => {
-                if matches!(
-                    f.issues.get(issue_id).map(|st| &st.status),
-                    Some(IssueStatusV2::Open)
-                ) {
-                    let claim_b =
-                        build_claim_transition(&f, &pair.list_uuid, &pair.ctx_b.agent, issue_id);
-                    manager_b.append_transition(&pair.own_b, &claim_b).await?;
-                    b_wrote_divergent_claim = true;
-                }
-                break; // fold readable: either we diverged or catch-up won
-            }
-            None => tokio::time::sleep(Duration::from_millis(250)).await,
+        if let Some(f) = pair.fold_with(&manager_b).await {
+            b_view_restarted = Some(f);
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    let b_view_restarted = b_view_restarted.ok_or_else(|| err("fold B refused after restart"))?;
+    assert!(
+        matches!(
+            b_view_restarted.issues.get(issue_id).map(|st| &st.status),
+            Some(IssueStatusV2::Open)
+        ),
+        "divergence precondition: B's replica must NOT have seen A's claim yet \
+         (status: {:?})",
+        b_view_restarted.issues.get(issue_id).map(|st| &st.status)
+    );
+    // B writes its DIVERGENT claim and (ASSERTED) sees itself winning
+    // pre-heal.
+    let claim_b = build_claim_transition(
+        &b_view_restarted,
+        &pair.list_uuid,
+        &pair.ctx_b.agent,
+        issue_id,
+    );
+    let hash_b = manager_b.append_transition(&pair.own_b, &claim_b).await?;
+    let fold_b_post_claim = pair
+        .fold_with(&manager_b)
+        .await
+        .ok_or_else(|| err("fold B refused"))?;
+    assert!(
+        matches!(
+            fold_b_post_claim.issues.get(issue_id).map(|st| &st.status),
+            Some(IssueStatusV2::Claimed { claimant, claim_event_hash, .. })
+                if claimant == &pair.ctx_b.agent && claim_event_hash == &hash_b
+        ),
+        "pre-heal: B's own fold must show B's claim winning"
+    );
     pair.manager_b = manager_b;
-    eprintln!("partition outcome: B wrote a divergent claim = {b_wrote_divergent_claim}");
+    assert_ne!(hash_a, hash_b, "the two claims are distinct events");
+    eprintln!("ASSERTED divergence: A claim {hash_a} / B claim {hash_b}");
 
-    // After heal: both independent replica folds agree on ONE winner.
+    // HEAL: both replicas must converge to the SAME single winner, with
+    // BOTH claim events present everywhere — the winner in the issue
+    // status, the loser surfaced as a state-machine rejection.
+    let issue_key_a = x0x_symphony_tracker_x0x_crdt::v2::events::event_key(issue_id, &hash_a);
+    let issue_key_b = x0x_symphony_tracker_x0x_crdt::v2::events::event_key(issue_id, &hash_b);
+    let converged = |f: &FoldOutput| -> Option<String> {
+        let (winner_agent, winner_hash) = match f.issues.get(issue_id).map(|st| &st.status) {
+            Some(IssueStatusV2::Claimed {
+                claimant,
+                claim_event_hash,
+                ..
+            }) => (claimant.clone(), claim_event_hash.clone()),
+            _ => return None,
+        };
+        let (loser_key, loser_hash) = if winner_hash == hash_a {
+            (issue_key_b.clone(), hash_b.clone())
+        } else if winner_hash == hash_b {
+            (issue_key_a.clone(), hash_a.clone())
+        } else {
+            return None; // winner is neither claim — not converged on ours
+        };
+        let _ = loser_hash;
+        // BOTH events present: the loser's record must have been SEEN and
+        // rejected by the state machine (fenced out), not merely missing.
+        let loser_rejected = f
+            .rejections
+            .iter()
+            .any(|r| r.key == loser_key && matches!(r.phase, RejectionPhase::StateMachine));
+        loser_rejected.then_some(winner_agent)
+    };
     wait_until!(
-        "both replicas agree on a single deterministic claim winner",
+        "both replicas converge: same winner, loser present-and-rejected on BOTH",
         180,
         {
-            let wa = pair
-                .fold_a()
-                .await
-                .and_then(|f| Pair::winner_of(&f, issue_id));
-            let wb = pair
-                .fold_b()
-                .await
-                .and_then(|f| Pair::winner_of(&f, issue_id));
+            let wa = pair.fold_a().await.as_ref().and_then(&converged);
+            let wb = pair.fold_b().await.as_ref().and_then(&converged);
             wa.is_some() && wa == wb
         }
     );
     let winner = pair
         .fold_a()
         .await
-        .and_then(|f| Pair::winner_of(&f, issue_id))
-        .ok_or_else(|| err("no winner after heal"))?;
+        .as_ref()
+        .and_then(&converged)
+        .ok_or_else(|| err("no converged winner"))?;
     assert!(
         winner == pair.ctx_a.agent || winner == pair.ctx_b.agent,
         "winner must be one of the two claimants"
     );
-    eprintln!("deterministic heal winner = {winner}");
+    eprintln!(
+        "ASSERTED heal: single deterministic winner = {winner}; loser rejected on both replicas"
+    );
 
     // Equivocation: B signs two DIFFERENT events at one author_seq; both
     // replicas surface fork evidence.

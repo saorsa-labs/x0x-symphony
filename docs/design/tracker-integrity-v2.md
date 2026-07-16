@@ -380,19 +380,29 @@ surface; the v2 fold, not the v1 projection, is the authority on whether an
 approval is spent — `store_consumed`'s consume-then-confirm makes the v1
 flow inherit that authority.
 
-**Reads (join fixpoint + daemon anchors).** Every fold joins roster
-members' stores to a FIXPOINT: after each fold the current-epoch roster is
-diffed against the joined set, new members (including those admitted by
-roster UPDATES) are joined, and the list is re-read and re-folded until no
-new member appears (bounded; the cap is surfaced loudly). Every store the
-manager touches — own, joined, and read paths alike — is verified against
-the DAEMON-REPORTED anchor: reported owner must equal the expected author
-and, in append-only mode, the reported policy must be `append_only`;
-silence (missing listing/owner/policy) is refusal. The four-way binding is
-anchored in what the daemon reports, never in caller inputs. Fork evidence
-is logged at error level on every fold and attached as `ForkEvidence`
-verification notices to issues whose opener or current claimant
-equivocated.
+**Reads (join fixpoint + daemon anchors + budgets).** Every fold joins
+roster members' stores to a FIXPOINT: after each fold the current-epoch
+roster is diffed against the joined set, new members (including those
+admitted by roster UPDATES) are joined, and the list is re-read and
+re-folded until no new member appears. The fixpoint loop is bounded, and
+exhausting the bound is FAIL-CLOSED: the partial view is refused, never
+served. Every EVENT store the manager touches — own, joined, and read
+paths alike — is verified against the DAEMON-REPORTED anchor: reported
+owner must equal the expected author and, in append-only mode, the
+reported policy must be `append_only`. Error classification: a member
+store with NO listing at all is ABSENT — normal replication lag, skipped
+with a per-member notice and retried next fold; a listing that is PRESENT
+but reports a wrong owner or policy is an integrity violation and FAILS
+the whole read. Heartbeat companion stores are EXCLUDED from the anchor
+guarantee (mutable, non-authoritative, never fold inputs; reads are
+best-effort). The four-way binding is anchored in what the daemon
+reports, never in caller inputs. Resource budgets (`FoldLimits`:
+max roster members, max records per stream, max record bytes — default
+256 / 4096 / 256 KiB, programmatically overridable) are enforced on both
+the read path and the pure fold; every violation is `BudgetExceeded`
+refusal (fail-closed, never partial processing). Fork evidence is logged
+at error level on every fold and attached as `ForkEvidence` verification
+notices to issues whose opener or current claimant equivocated.
 
 **Bootstrap (`ensure_surfaces`).** Bind the local author store (WP-X policy
 gate applies). When the local agent IS the list creator and no genesis

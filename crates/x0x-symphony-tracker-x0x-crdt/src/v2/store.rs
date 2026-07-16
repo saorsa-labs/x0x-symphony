@@ -36,7 +36,7 @@ use super::events::{
     CARD_SELF_KEY, CONSUME_CONTEXT_V2, GENESIS_CONTEXT_V2, GENESIS_KEY, HANDOFF_CONTEXT_V2,
     ROSTER_CONTEXT_V2, TRANSITION_CONTEXT_V2, V2_SCHEMA,
 };
-use super::fold::{AuthorStream, FoldInput, StoreRecord};
+use super::fold::{AuthorStream, FoldInput, FoldLimits, StoreRecord};
 use super::identity::decode_b64;
 use crate::client::{
     ClientError, KvKeyEntry, KvValue, StoreCreateOutcome, StoreDetailEntry, X0xdApi, X0xdClient,
@@ -274,6 +274,7 @@ pub struct V2StoreManager {
     api: Arc<dyn V2StoreApi>,
     signer: Arc<dyn SigningClient>,
     mode: StorePolicyMode,
+    limits: FoldLimits,
 }
 
 impl V2StoreManager {
@@ -284,7 +285,19 @@ impl V2StoreManager {
         signer: Arc<dyn SigningClient>,
         mode: StorePolicyMode,
     ) -> Self {
-        Self { api, signer, mode }
+        Self {
+            api,
+            signer,
+            mode,
+            limits: FoldLimits::default(),
+        }
+    }
+
+    /// Override the fold/read resource budgets (fail-closed on violation).
+    #[must_use]
+    pub const fn with_limits(mut self, limits: FoldLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Return the configured policy mode.
@@ -776,6 +789,14 @@ impl V2StoreManager {
         // fold's four-way binding starts from what the daemon anchored.
         self.verify_store_anchor(&topic, author_agent_id).await?;
         let keys = self.api.list_kv_keys(&topic).await?;
+        if keys.len() > self.limits.max_records_per_stream {
+            // Fail-closed read budget: never fetch an unbounded stream.
+            return Err(V2StoreError::Invalid(format!(
+                "stream {author_agent_id} lists {} records (budget {}); refusing the read",
+                keys.len(),
+                self.limits.max_records_per_stream
+            )));
+        }
         let mut card_self = None;
         let mut records = Vec::with_capacity(keys.len());
         for entry in keys {
@@ -836,6 +857,15 @@ impl V2StoreManager {
                 members.extend(roster.roster);
             }
         }
+        if members.len() > self.limits.max_roster_members {
+            // Fail-closed member budget: an (unverified) roster naming more
+            // members than the budget must not trigger unbounded reads.
+            return Err(V2StoreError::Invalid(format!(
+                "roster payloads name {} members (budget {}); refusing the read",
+                members.len(),
+                self.limits.max_roster_members
+            )));
+        }
         let mut streams = vec![creator_stream];
         for member in members {
             if member == creator {
@@ -860,6 +890,7 @@ impl V2StoreManager {
             list_uuid: list_uuid.to_owned(),
             creator: creator.to_owned(),
             streams,
+            limits: self.limits,
         })
     }
 
@@ -920,31 +951,18 @@ impl V2StoreManager {
     /// # Errors
     ///
     /// Returns client errors other than 409.
+    /// Heartbeat companion stores are EXCLUDED from the anchor-verification
+    /// guarantee, deliberately and consistently: they are mutable
+    /// (`signed`-policy) non-authoritative liveness hints, never fold
+    /// inputs, and their reads are best-effort ([`Self::read_heartbeat`]).
+    /// The documented guarantee (spec §2.6, security.md) covers EVENT
+    /// stores only.
     pub async fn join_peer_heartbeats(&self, list_uuid: &str, peer_agent_id: &str) -> Result<()> {
         let topic = heartbeat_store_topic(list_uuid, peer_agent_id);
         match self.api.join_kv_store(&topic, peer_agent_id).await {
-            Ok(()) => {}
-            Err(ClientError::Http { status, .. }) if status == StatusCode::CONFLICT => {}
-            Err(e) => return Err(e.into()),
-        }
-        // Owner must anchor to the peer; the policy is deliberately the
-        // mutable `signed` one (heartbeats are non-authoritative), so only
-        // the owner leg of the anchor is enforced here.
-        let detail =
-            self.api
-                .kv_store_detail(&topic)
-                .await?
-                .ok_or_else(|| V2StoreError::NotFound {
-                    topic: topic.clone(),
-                })?;
-        match detail.owner.as_deref() {
-            Some(owner) if owner == peer_agent_id => Ok(()),
-            other => Err(V2StoreError::AnchorMismatch {
-                topic,
-                reason: format!(
-                    "heartbeat store owner {other:?} is not the expected peer {peer_agent_id}"
-                ),
-            }),
+            Ok(()) => Ok(()),
+            Err(ClientError::Http { status, .. }) if status == StatusCode::CONFLICT => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
 }

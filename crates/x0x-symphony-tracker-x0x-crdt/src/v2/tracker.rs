@@ -195,17 +195,18 @@ impl V2Tracker {
         const MAX_JOIN_PASSES: usize = 8;
         let mut out = self.read_and_fold().await?;
         for _pass in 0..MAX_JOIN_PASSES {
-            if !self.join_new_members(&out).await {
+            if !self.join_new_members(&out).await? {
                 return Ok(out);
             }
             out = self.read_and_fold().await?;
         }
-        warn!(
-            list = %self.list_ref.to_ref_string(),
-            "v2 roster join fixpoint not reached in {MAX_JOIN_PASSES} passes; \
-             proceeding with the current fold view"
-        );
-        Ok(out)
+        // Fail-closed: a view that never reached the join fixpoint is
+        // PARTIAL and must not be served as truth.
+        Err(terr(format!(
+            "v2 roster join fixpoint not reached in {MAX_JOIN_PASSES} passes \
+             for {}; refusing the partial view",
+            self.list_ref.to_ref_string()
+        )))
     }
 
     async fn read_and_fold(&self) -> x0x_symphony_core::Result<FoldOutput> {
@@ -233,7 +234,12 @@ impl V2Tracker {
     /// Join stores of roster members (genesis ∪ current epoch) not yet
     /// joined. Returns true when at least one NEW member store was joined
     /// (⇒ the caller should re-read and re-fold).
-    async fn join_new_members(&self, out: &FoldOutput) -> bool {
+    /// Error classification (spec §2.6): a member store the daemon has NO
+    /// listing for is ABSENT (normal replication lag — skipped with a
+    /// per-member notice, retried next fold); a listing that is PRESENT
+    /// but reports the wrong owner or policy is an integrity violation and
+    /// FAILS the whole view (fail-closed).
+    async fn join_new_members(&self, out: &FoldOutput) -> x0x_symphony_core::Result<bool> {
         let own_id = self.agent_id.as_str();
         let mut joined = self.joined.lock().await;
         let mut joined_any = false;
@@ -251,8 +257,19 @@ impl V2Tracker {
                     joined.insert(member.clone());
                     joined_any = true;
                 }
+                Err(
+                    e @ (V2StoreError::AnchorMismatch { .. }
+                    | V2StoreError::PolicyNotHonored { .. }),
+                ) => {
+                    // Listing present but WRONG: integrity violation.
+                    return Err(terr(format!(
+                        "v2 member {member} store failed anchor verification: {e}"
+                    )));
+                }
                 Err(e) => {
-                    debug!(member = %member, error = %e, "v2 peer event-store join failed");
+                    // Absent / transport lag: per-member notice, retried on
+                    // the next fold.
+                    debug!(member = %member, error = %e, "v2 peer event store not joinable yet");
                     continue;
                 }
             }
@@ -261,10 +278,12 @@ impl V2Tracker {
                 .join_peer_heartbeats(&self.list_ref.list_uuid, member)
                 .await
             {
+                // Heartbeat companions are excluded from the anchor
+                // guarantee (non-authoritative, never fold inputs).
                 debug!(member = %member, error = %e, "v2 peer heartbeat-store join failed");
             }
         }
-        joined_any
+        Ok(joined_any)
     }
 
     /// Project one folded issue into the v1 `Issue` surface (spec §2.6).

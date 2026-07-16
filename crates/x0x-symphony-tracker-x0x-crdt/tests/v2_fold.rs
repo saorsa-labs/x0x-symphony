@@ -18,8 +18,8 @@ use x0x_symphony_tracker_x0x_crdt::v2::{
     fold_v2,
     identity::{assemble_external_dst, derive_agent_id_hex},
     ApprovalEventV2, ApprovalVerdictV2, AuthorStream, BlockReason, ConsumeEventV2, EventEnvelope,
-    FoldInput, FoldOutput, GenesisManifestV2, IssueStatusV2, ListRefusal, RequeueJustification,
-    RosterEventV2, StoreRecord, TransitionEventV2, TransitionKind, V2_SCHEMA,
+    FoldInput, FoldLimits, FoldOutput, GenesisManifestV2, IssueStatusV2, ListRefusal,
+    RequeueJustification, RosterEventV2, StoreRecord, TransitionEventV2, TransitionKind, V2_SCHEMA,
 };
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -247,6 +247,7 @@ fn fold(
         list_uuid: fixture.list_uuid.clone(),
         creator: creator.id.clone(),
         streams,
+        limits: FoldLimits::default(),
     })
 }
 
@@ -2227,5 +2228,103 @@ fn consume_is_effective_when_its_approval_orders_later_in_fold() -> TestResult {
         let shuffled = fold(&fixture, &creator, streams).map_err(|e| err(format!("{e}")))?;
         assert_eq!(shuffled, out, "seed {seed} disagreed");
     }
+    Ok(())
+}
+
+/// Codex round-3 item 1: resource budgets are FAIL-CLOSED — every violation
+/// refuses the list outright (never partial processing).
+#[test]
+fn budget_violations_refuse_the_list() -> TestResult {
+    let creator = Author::generate()?;
+    let fixture = make_genesis(&creator, "list-budget", &[&creator])?;
+    let tiny = FoldLimits {
+        max_roster_members: 2,
+        max_records_per_stream: 3,
+        max_record_bytes: 64 * 1024,
+    };
+    let fold_limited = |streams: Vec<AuthorStream>, limits: FoldLimits| {
+        fold_v2(&FoldInput {
+            list_uuid: fixture.list_uuid.clone(),
+            creator: creator.id.clone(),
+            streams,
+            limits,
+        })
+    };
+
+    // (a) genesis roster over budget.
+    let wide: Vec<Author> = (0..3)
+        .map(|_| Author::generate())
+        .collect::<Result<_, _>>()?;
+    let wide_refs: Vec<&Author> = wide.iter().collect();
+    let big_fixture = make_genesis(&creator, "list-budget", &wide_refs)?;
+    let refused = fold_v2(&FoldInput {
+        list_uuid: big_fixture.list_uuid.clone(),
+        creator: creator.id.clone(),
+        streams: vec![stream(&creator, vec![big_fixture.genesis_record.clone()])],
+        limits: tiny,
+    });
+    assert!(
+        matches!(&refused, Err(ListRefusal::BudgetExceeded(r)) if r.contains("genesis roster")),
+        "genesis roster over budget must refuse, got {refused:?}"
+    );
+
+    // (b) records per stream over budget (card-self + genesis + 3 events = 5 > 3).
+    let mut chain = Chain::new(&creator, &fixture);
+    let mut records = vec![fixture.genesis_record.clone()];
+    for (i, issue) in ["i1", "i2", "i3"].iter().enumerate() {
+        let (_, rec) = chain.next(
+            0,
+            issue,
+            (i + 1) as u64,
+            TransitionKind::open("t".to_owned(), "s".to_owned()),
+        )?;
+        records.push(rec);
+    }
+    let refused = fold_limited(vec![stream(&creator, records)], tiny);
+    assert!(
+        matches!(&refused, Err(ListRefusal::BudgetExceeded(r)) if r.contains("records")),
+        "stream record count over budget must refuse, got {refused:?}"
+    );
+
+    // (c) single record value over the byte budget.
+    let tiny_bytes = FoldLimits {
+        max_record_bytes: 16,
+        ..tiny
+    };
+    let refused = fold_limited(
+        vec![stream(&creator, vec![fixture.genesis_record.clone()])],
+        tiny_bytes,
+    );
+    assert!(
+        matches!(&refused, Err(ListRefusal::BudgetExceeded(r)) if r.contains("bytes")),
+        "record over the byte budget must refuse, got {refused:?}"
+    );
+
+    // (d) creator-signed roster UPDATE over budget.
+    let update = RosterEventV2 {
+        schema: V2_SCHEMA,
+        kind: "roster".to_owned(),
+        list_uuid: fixture.list_uuid.clone(),
+        genesis_manifest_hash: fixture.genesis_hash.clone(),
+        roster_epoch: 1,
+        prev_roster_hash: fixture.genesis_hash.clone(),
+        roster: vec![creator.id.clone(), "a".repeat(64), "b".repeat(64)],
+        actor: creator.id.clone(),
+    };
+    let payload = serde_json::to_vec(&update)?;
+    let hash = sha256_hex(&payload);
+    let envelope = creator.sign_envelope(ROSTER_CONTEXT_V2, &payload)?;
+    let record = envelope_record(&roster_key(1, &hash), &envelope)?;
+    let refused = fold_limited(
+        vec![stream(
+            &creator,
+            vec![fixture.genesis_record.clone(), record],
+        )],
+        tiny,
+    );
+    assert!(
+        matches!(&refused, Err(ListRefusal::BudgetExceeded(r)) if r.contains("roster update")),
+        "roster update over budget must refuse, got {refused:?}"
+    );
     Ok(())
 }

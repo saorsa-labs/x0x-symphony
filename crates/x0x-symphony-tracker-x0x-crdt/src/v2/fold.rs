@@ -62,6 +62,32 @@ pub struct AuthorStream {
     pub records: Vec<StoreRecord>,
 }
 
+/// Resource budgets for untrusted fold input. Violations REFUSE the list
+/// (fail-closed): an input that exceeds a budget is treated as hostile or
+/// broken, never partially processed. Overridable programmatically
+/// (`V2StoreManager::with_limits`, `X0xCrdtTrackerBuilder::v2_fold_limits`);
+/// the defaults are generous for real symphony rosters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FoldLimits {
+    /// Maximum members in the genesis roster or any roster update.
+    pub max_roster_members: usize,
+    /// Maximum records read/folded per author stream.
+    pub max_records_per_stream: usize,
+    /// Maximum bytes for any single stored record value (envelope bytes —
+    /// covers roster/genesis/transition payloads uniformly).
+    pub max_record_bytes: usize,
+}
+
+impl Default for FoldLimits {
+    fn default() -> Self {
+        Self {
+            max_roster_members: 256,
+            max_records_per_stream: 4096,
+            max_record_bytes: 256 * 1024,
+        }
+    }
+}
+
 /// Input to [`fold_v2`]: the list address plus every author stream the
 /// reader could fetch.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +98,8 @@ pub struct FoldInput {
     pub creator: String,
     /// Author streams (order irrelevant; the fold canonicalizes).
     pub streams: Vec<AuthorStream>,
+    /// Resource budgets enforced over this input (fail-closed).
+    pub limits: FoldLimits,
 }
 
 /// Why a v2-addressed list was refused outright (downgrade defense, design
@@ -87,6 +115,10 @@ pub enum ListRefusal {
     /// The genesis record exists but failed verification.
     #[error("v2 list refused: invalid genesis manifest: {0}")]
     InvalidGenesis(String),
+    /// A resource budget ([`FoldLimits`]) was exceeded. Fail-closed: the
+    /// list is refused rather than partially processed.
+    #[error("v2 list refused: budget exceeded: {0}")]
+    BudgetExceeded(String),
 }
 
 /// Evidence of a per-author chain fork: two signature-valid events by the
@@ -364,6 +396,29 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
     // — two different self-certifying keys for one agent id is an anomaly,
     // and any pick-one rule would make fold output depend on input order.
     let (streams, conflicted) = canonical_streams(&input.streams);
+    // Budgets (fail-closed): every violation refuses the list outright.
+    let limits = input.limits;
+    for (owner, stream) in &streams {
+        if stream.records.len() > limits.max_records_per_stream {
+            return Err(ListRefusal::BudgetExceeded(format!(
+                "stream {owner} carries {} records (max {})",
+                stream.records.len(),
+                limits.max_records_per_stream
+            )));
+        }
+        if let Some(record) = stream
+            .records
+            .iter()
+            .find(|r| r.value.len() > limits.max_record_bytes)
+        {
+            return Err(ListRefusal::BudgetExceeded(format!(
+                "record {} in stream {owner} is {} bytes (max {})",
+                record.key,
+                record.value.len(),
+                limits.max_record_bytes
+            )));
+        }
+    }
     if let Some(reason) = conflicted.get(&input.creator) {
         return Err(ListRefusal::InvalidGenesis(format!(
             "creator card-self conflict: {reason}"
@@ -388,6 +443,13 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
         &creator_card,
     )
     .map_err(ListRefusal::InvalidGenesis)?;
+    if genesis.roster.len() > limits.max_roster_members {
+        return Err(ListRefusal::BudgetExceeded(format!(
+            "genesis roster has {} members (max {})",
+            genesis.roster.len(),
+            limits.max_roster_members
+        )));
+    }
 
     // ---- Roster chain ------------------------------------------------------
     // rosters[e] = membership at epoch e; epoch 0 is the genesis roster.
@@ -398,10 +460,11 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
         &input.creator,
         &creator_card,
         &genesis_hash,
+        limits.max_roster_members,
         &mut rosters,
         &mut rejections,
         &mut forks,
-    );
+    )?;
     let latest_roster_epoch = u64::try_from(rosters.len())
         .unwrap_or(u64::MAX)
         .saturating_sub(1);
@@ -739,17 +802,18 @@ fn check_envelope_key(
 }
 
 /// Build the creator-signed roster chain (design r2 roster manifest).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_roster_chain(
     creator_stream: &AuthorStream,
     list_uuid: &str,
     creator: &str,
     creator_card: &[u8],
     genesis_hash: &str,
+    max_roster_members: usize,
     rosters: &mut Vec<BTreeSet<String>>,
     rejections: &mut Vec<Rejection>,
     forks: &mut Vec<ForkEvidence>,
-) {
+) -> Result<(), ListRefusal> {
     // Collect verified roster events keyed by epoch.
     let mut by_epoch: BTreeMap<u64, Vec<(String, RosterEventV2, String)>> = BTreeMap::new();
     for record in &creator_stream.records {
@@ -780,11 +844,22 @@ fn build_roster_chain(
             Ok((roster, hash))
         })();
         match verified {
-            Ok((roster, hash)) => by_epoch.entry(roster.roster_epoch).or_default().push((
-                record.key.clone(),
-                roster,
-                hash,
-            )),
+            Ok((roster, hash)) => {
+                if roster.roster.len() > max_roster_members {
+                    // A creator-signed oversize roster is fail-closed: the
+                    // reader refuses the list rather than budget-bust.
+                    return Err(ListRefusal::BudgetExceeded(format!(
+                        "roster update {} has {} members (max {max_roster_members})",
+                        record.key,
+                        roster.roster.len()
+                    )));
+                }
+                by_epoch.entry(roster.roster_epoch).or_default().push((
+                    record.key.clone(),
+                    roster,
+                    hash,
+                ));
+            }
             Err(reason) => {
                 rejections.push(admission_rejection(creator, &record.key, reason));
             }
@@ -850,6 +925,7 @@ fn build_roster_chain(
             }
         }
     }
+    Ok(())
 }
 
 /// Iterate a stream's chained records: transitions (`ev-*`), dispatch
