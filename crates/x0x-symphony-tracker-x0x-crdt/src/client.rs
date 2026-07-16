@@ -409,6 +409,99 @@ impl X0xdClient {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
+
+    /// Create a `KvStore`, optionally requesting an access policy (tracker
+    /// v2 uses `Some("append_only")` per the x0x WP-X REST contract).
+    ///
+    /// Daemons predating the `policy` flag ignore unknown JSON fields, so
+    /// callers MUST check [`StoreCreateOutcome::policy`] instead of assuming
+    /// the request was honored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport or HTTP failures (including 409
+    /// when the store already exists).
+    pub async fn create_kv_store_with_policy(
+        &self,
+        name: &str,
+        topic: &str,
+        policy: Option<&str>,
+    ) -> Result<StoreCreateOutcome> {
+        let request = CreateStoreWithPolicyRequest {
+            name: name.to_owned(),
+            topic: topic.to_owned(),
+            policy: policy.map(str::to_owned),
+        };
+        let response: StoreCreateResponse = self.post_json("/stores", &request).await?;
+        Ok(StoreCreateOutcome {
+            id: response.id,
+            policy: response.policy,
+        })
+    }
+
+    /// Join a peer's `KvStore` replica by topic with a required
+    /// `expected_owner` anchor (hex agent id, supplied out-of-band).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport or HTTP failures (including 409
+    /// when the store is already joined).
+    pub async fn join_kv_store(&self, topic: &str, expected_owner: &str) -> Result<()> {
+        let path = format!("/stores/{topic}/join");
+        let request = JoinStoreRequest {
+            expected_owner: expected_owner.to_owned(),
+        };
+        let _response: serde_json::Value = self.post_json(&path, &request).await?;
+        Ok(())
+    }
+
+    /// Fetch the daemon-reported detail entry (owner, policy) for one store
+    /// topic from `GET /stores`, or `None` when the store is not registered.
+    ///
+    /// Tracker v2 re-validates the access policy of an ALREADY-EXISTING event
+    /// store through this call on every open: a store created by an older
+    /// daemon (or an earlier run) as mutable `signed` must not silently
+    /// masquerade as append-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport or HTTP failures.
+    pub async fn kv_store_detail(&self, topic: &str) -> Result<Option<StoreDetailEntry>> {
+        let response: StoreDetailListResponse = self.get_json("/stores").await?;
+        let (StoreDetailListResponse::Wrapped { stores } | StoreDetailListResponse::Bare(stores)) =
+            response;
+        Ok(stores.into_iter().find(|entry| entry.id == topic))
+    }
+}
+
+/// Detail entry from `GET /stores`, keeping only the fields v2 validates.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct StoreDetailEntry {
+    /// Store id (currently the topic).
+    pub id: String,
+    /// Hex-encoded anchored owner, when known.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Access policy string reported by the daemon, when present.
+    #[serde(default)]
+    pub policy: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoreDetailListResponse {
+    Wrapped { stores: Vec<StoreDetailEntry> },
+    Bare(Vec<StoreDetailEntry>),
+}
+
+/// Outcome of `POST /stores`, including the daemon-reported access policy so
+/// callers can verify a requested policy was actually honored.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreCreateOutcome {
+    /// Store id (currently the topic).
+    pub id: String,
+    /// Access policy reported by the daemon, when present.
+    pub policy: Option<String>,
 }
 
 #[async_trait]
@@ -589,6 +682,26 @@ impl X0xdApi for X0xdClient {
 struct CreateNamedResourceRequest {
     name: String,
     topic: String,
+}
+
+#[derive(Serialize)]
+struct CreateStoreWithPolicyRequest {
+    name: String,
+    topic: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JoinStoreRequest {
+    expected_owner: String,
+}
+
+#[derive(Deserialize)]
+struct StoreCreateResponse {
+    id: String,
+    #[serde(default)]
+    policy: Option<String>,
 }
 
 #[derive(Serialize)]

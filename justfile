@@ -57,3 +57,12 @@ doc-test:
 # Remove build artefacts.
 clean:
     cargo clean
+
+# Live two-daemon tracker-integrity race harness (spawns two isolated x0xd daemons).
+# Requires an EXPLICIT mode: X0X_V2_APPEND_ONLY=1 (full matrix, x0xd >= 0.33.0)
+# or X0X_V2_RACE_MODE=signed (interim fallback, weaker guarantees).
+test-v2-race:
+    @if [ "${X0X_V2_APPEND_ONLY:-}" = "1" ]; then echo "test-v2-race MODE: append-only (full matrix)"; \
+    elif [ "${X0X_V2_RACE_MODE:-}" = "signed" ]; then echo "test-v2-race MODE: signed-fallback (interim, C1 residual open)"; \
+    else echo "refusing: set X0X_V2_APPEND_ONLY=1 (full matrix) or X0X_V2_RACE_MODE=signed (interim fallback)"; exit 2; fi
+    RUSTFLAGS="-D warnings" cargo nextest run -p x0x-symphony-tracker-x0x-crdt --test v2_two_daemon_race --run-ignored all --no-capture --test-threads=1 --no-fail-fast

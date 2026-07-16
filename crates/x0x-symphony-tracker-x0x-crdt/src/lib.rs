@@ -38,6 +38,7 @@
 
 pub mod client;
 pub mod mapping;
+pub mod v2;
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -282,6 +283,9 @@ pub struct X0xCrdtTrackerBuilder {
     group: Option<String>,
     worker_view: Option<Arc<dyn WorkerViewProvider>>,
     replication_factor: usize,
+    v2_store_policy: v2::StorePolicyMode,
+    v2_settle: std::time::Duration,
+    v2_fold_limits: v2::FoldLimits,
 }
 
 impl X0xCrdtTrackerBuilder {
@@ -297,7 +301,39 @@ impl X0xCrdtTrackerBuilder {
             group: None,
             worker_view: None,
             replication_factor: shard::DEFAULT_REPLICATION_FACTOR,
+            v2_store_policy: v2::StorePolicyMode::default(),
+            v2_settle: std::time::Duration::from_secs(2),
+            v2_fold_limits: v2::FoldLimits::default(),
         }
+    }
+
+    /// Override the v2 fold/read resource budgets (tracker-integrity v2
+    /// lists only; fail-closed on violation).
+    #[must_use]
+    pub const fn v2_fold_limits(mut self, limits: v2::FoldLimits) -> Self {
+        self.v2_fold_limits = limits;
+        self
+    }
+
+    /// Set the v2 event-store policy mode (tracker-integrity v2 lists only).
+    ///
+    /// The default requires x0x `AccessPolicy::AppendOnly` (x0x ≥ 0.33.0)
+    /// and fails loudly when the daemon does not honor it;
+    /// [`v2::StorePolicyMode::SignedFallback`] is the interim mode for older
+    /// daemons (weaker guarantees — see the v2 spec).
+    #[must_use]
+    pub const fn v2_store_policy(mut self, mode: v2::StorePolicyMode) -> Self {
+        self.v2_store_policy = mode;
+        self
+    }
+
+    /// Set the v2 consume-then-confirm settle delay (tracker-integrity v2
+    /// lists only). An optimization narrowing the live-partition window,
+    /// NOT a safety bound; default 2s.
+    #[must_use]
+    pub const fn v2_settle(mut self, settle: std::time::Duration) -> Self {
+        self.v2_settle = settle;
+        self
     }
 
     /// Scope this tracker to an x0xd named/MLS group.
@@ -368,7 +404,34 @@ impl X0xCrdtTrackerBuilder {
             Some(client) => client,
             None => Arc::new(X0xdClient::new(&self.base_url)?),
         };
-        Ok(X0xCrdtTracker::from_client_parts(
+        // Tracker-integrity v2 routing: a `symphony2:` list id builds the v2
+        // engine; every trait call delegates to it. v1 lists are untouched.
+        // A v2-prefixed reference that does not parse is REFUSED (never a v1
+        // fallback — design r2 Q5).
+        let v2_engine = if v2::V2ListRef::is_v2_namespace(&self.list_id) {
+            let list_ref = v2::V2ListRef::parse(&self.list_id)
+                .map_err(|e| TrackerError::Core(SymphonyError::validation("tracker.list_id", e)))?;
+            let signing_client = self.signing.client.clone().ok_or_else(|| {
+                TrackerError::Signing(
+                    "v2 lists require a signing client (set signing.policy = \"required\"): \
+                     every v2 mutation is an ML-DSA-signed chained event"
+                        .to_owned(),
+                )
+            })?;
+            let store_api: Arc<dyn v2::V2StoreApi> = Arc::new(X0xdClient::new(&self.base_url)?);
+            let manager = v2::V2StoreManager::new(store_api, signing_client, self.v2_store_policy)
+                .with_limits(self.v2_fold_limits);
+            Some(Arc::new(v2::V2Tracker::new(
+                manager,
+                list_ref,
+                self.agent_id.clone(),
+                Some(client.clone()),
+                self.v2_settle,
+            )))
+        } else {
+            None
+        };
+        let mut tracker = X0xCrdtTracker::from_client_parts(
             self.base_url,
             self.list_id,
             self.agent_id,
@@ -376,7 +439,9 @@ impl X0xCrdtTrackerBuilder {
             self.signing,
             self.group,
             IssueCreationRuntime::new(self.worker_view, self.replication_factor),
-        ))
+        );
+        tracker.v2 = v2_engine;
+        Ok(tracker)
     }
 }
 
@@ -408,6 +473,10 @@ pub struct X0xCrdtTracker {
     creation: IssueCreationRuntime,
     resolved_scope: Arc<tokio::sync::Mutex<Option<ResourceScope>>>,
     verify_cache: Arc<Mutex<HashMap<VerifyCacheKey, VerifyOutcome>>>,
+    /// Tracker-integrity v2 engine, present when `list_id` addresses the
+    /// `symphony2:` namespace. All trait calls delegate to it (spec §2.6);
+    /// the v1 fields above stay inert for v2 lists.
+    v2: Option<Arc<v2::V2Tracker>>,
 }
 
 impl std::fmt::Debug for X0xCrdtTracker {
@@ -513,6 +582,7 @@ impl X0xCrdtTracker {
             creation,
             resolved_scope: Arc::new(tokio::sync::Mutex::new(None)),
             verify_cache: Arc::new(Mutex::new(HashMap::new())),
+            v2: None,
         }
     }
 
@@ -569,6 +639,11 @@ impl X0xCrdtTracker {
     /// data cannot be mapped, or required signature verification has unknown
     /// validity because x0xd transport failed.
     pub async fn list_issues(&self) -> Result<Vec<Issue>> {
+        if let Some(v2) = &self.v2 {
+            return Tracker::list_issues(v2.as_ref())
+                .await
+                .map_err(TrackerError::Core);
+        }
         let scope = self.resource_scope().await?;
         let tasks = match self.client.list_tasks(&scope.list_id).await {
             Ok(tasks) => tasks,
@@ -719,6 +794,9 @@ impl X0xCrdtTracker {
     ///
     /// Returns [`TrackerError::Client`] when x0xd listing or creation fails.
     pub async fn ensure_surfaces(&self) -> Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.ensure_surfaces().await.map_err(TrackerError::Core);
+        }
         let scope = self.resource_scope().await?;
         let task_lists = self.client.list_task_lists().await?;
         if !task_lists.iter().any(|entry| entry.id == scope.list_id) {
@@ -1170,12 +1248,18 @@ impl Tracker for X0xCrdtTracker {
     }
 
     async fn create_issue(&self, draft: IssueDraft) -> x0x_symphony_core::Result<Issue> {
+        if let Some(v2) = &self.v2 {
+            return v2.create_issue(draft).await;
+        }
         self.create_issue_with_shard(draft)
             .await
             .map_err(SymphonyError::from)
     }
 
     async fn fetch_candidates(&self, ctx: &PollContext) -> x0x_symphony_core::Result<Vec<Issue>> {
+        if let Some(v2) = &self.v2 {
+            return v2.fetch_candidates(ctx).await;
+        }
         let issues = self.list_issues().await.map_err(SymphonyError::from)?;
         let terminal_states: BTreeSet<IssueState> = ctx.terminal_states.iter().cloned().collect();
         let mut candidates = issues
@@ -1193,6 +1277,9 @@ impl Tracker for X0xCrdtTracker {
     }
 
     async fn fetch_by_ids(&self, ids: &[IssueId]) -> x0x_symphony_core::Result<Vec<Issue>> {
+        if let Some(v2) = &self.v2 {
+            return v2.fetch_by_ids(ids).await;
+        }
         let requested = ids.iter().collect::<BTreeSet<_>>();
         let issues = self.list_issues().await.map_err(SymphonyError::from)?;
         Ok(issues
@@ -1202,6 +1289,9 @@ impl Tracker for X0xCrdtTracker {
     }
 
     async fn claim(&self, id: &IssueId, agent_id: &AgentId) -> x0x_symphony_core::Result<Claim> {
+        if let Some(v2) = &self.v2 {
+            return v2.claim(id, agent_id).await;
+        }
         self.ensure_agent_matches(id, agent_id)
             .map_err(SymphonyError::from)?;
         let issue = self.fetch_issue(id).await.map_err(SymphonyError::from)?;
@@ -1230,6 +1320,9 @@ impl Tracker for X0xCrdtTracker {
     }
 
     async fn heartbeat(&self, claim: &Claim) -> x0x_symphony_core::Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.heartbeat(claim).await;
+        }
         let id = self
             .ensure_current_claim_owner(claim)
             .await
@@ -1244,6 +1337,9 @@ impl Tracker for X0xCrdtTracker {
     }
 
     async fn release(&self, claim: &Claim, reason: ReleaseReason) -> x0x_symphony_core::Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.release(claim, reason).await;
+        }
         let id = self
             .ensure_current_claim_owner(claim)
             .await
@@ -1257,6 +1353,9 @@ impl Tracker for X0xCrdtTracker {
     }
 
     async fn handoff(&self, claim: &Claim, handoff: Handoff) -> x0x_symphony_core::Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.handoff(claim, handoff).await;
+        }
         let id = self
             .ensure_current_claim_owner(claim)
             .await
@@ -1290,6 +1389,9 @@ impl Tracker for X0xCrdtTracker {
         &self,
         agent_id: Option<&AgentId>,
     ) -> x0x_symphony_core::Result<Vec<Issue>> {
+        if let Some(v2) = &self.v2 {
+            return v2.fetch_claimed(agent_id).await;
+        }
         let issues = self.list_issues().await.map_err(SymphonyError::from)?;
         Ok(issues
             .into_iter()
@@ -1303,6 +1405,9 @@ impl Tracker for X0xCrdtTracker {
     }
 
     async fn block(&self, claim: &Claim, reason: ReleaseReason) -> x0x_symphony_core::Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.block(claim, reason).await;
+        }
         let id = self
             .ensure_current_claim_owner(claim)
             .await
@@ -1320,6 +1425,9 @@ impl Tracker for X0xCrdtTracker {
         issue_id: &IssueId,
         reason: ReleaseReason,
     ) -> x0x_symphony_core::Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.requeue_blocked(issue_id, reason).await;
+        }
         let blob = self
             .claim_blob_for_task(issue_id.as_str())
             .await
@@ -1362,6 +1470,9 @@ impl Tracker for X0xCrdtTracker {
         &self,
         issue_id: &IssueId,
     ) -> x0x_symphony_core::Result<ApprovalState> {
+        if let Some(v2) = &self.v2 {
+            return v2.load_approval_state(issue_id).await;
+        }
         let Some(blob) = self
             .approval_blob_for_issue(issue_id)
             .await
@@ -1376,6 +1487,9 @@ impl Tracker for X0xCrdtTracker {
     }
 
     async fn store_approval(&self, event: &ApprovalEvent) -> x0x_symphony_core::Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.store_approval(event).await;
+        }
         let mut blob = match self
             .approval_blob_for_issue(&event.issue_id)
             .await
@@ -1392,6 +1506,9 @@ impl Tracker for X0xCrdtTracker {
     }
 
     async fn store_consumed(&self, event: &ApprovalConsumed) -> x0x_symphony_core::Result<()> {
+        if let Some(v2) = &self.v2 {
+            return v2.store_consumed(event).await;
+        }
         let mut blob = match self
             .approval_blob_for_issue(&event.issue_id)
             .await

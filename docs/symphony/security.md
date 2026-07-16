@@ -163,6 +163,30 @@ with the corrupted entries removed (keeping only records this daemon signed),
 or — simpler and safer — re-create the issue with `issue new` (a new task id
 starts with empty approval state) and mark the corrupted one done/cancelled.
 
+**Tracker-integrity v2 (`symphony2:` lists) — v1 vs v2 guarantees.** The
+paragraphs above describe **v1** lists. Lists addressed as
+`symphony2:<uuid>:<creator>` use the tracker-integrity v2 model
+(per-author append-only signed event stores + a pure deterministic fold —
+normative spec: `docs/design/tracker-integrity-v2.md`); the same threats
+resolve differently:
+
+| Threat / property | v1 (`symphony-*` lists) | v2 (`symphony2:` lists) |
+|---|---|---|
+| State-transition integrity | Claim blobs unsigned; a hostile replicated writer can flip `Blocked` → `Released` directly | Every transition is an ML-DSA-65-signed, hash-chained event; a transition not authored by a roster member at its named epoch, or not fenced by the fold-winning claim, is inadmissible/ineffective |
+| Hostile un-park of blocked work | Possible against raw blobs (Tracker-API check only) | Requeue admissible ONLY for `awaiting_approval` blocks with a signed justification binding the exact block hash + parked claim nonce + approver (C6); all other reasons are terminal |
+| Impersonating another author | Trust-scoped only | Four-way self-certifying binding (derived key id == envelope signer == store owner == payload actor); fabricated authorship is inadmissible |
+| Concurrent approval/consume writers | RMW blob — records can be silently LOST; replay re-enabled | Per-key append-only records; set-union convergence — records cannot be clobbered; duplicates resolve to ONE deterministic fold winner, losers surfaced as diagnostics |
+| Double-dispatch under concurrency | Best-effort; both nodes can dispatch | Consume-then-confirm fenced by the fold-winning claim; a competing/healed winner ABORTS with zero local executions. Residual: a live-partition window narrowed by the settle re-read (deterministic + detectable after heal — runners should stay idempotent) |
+| Crash after consume, before execute | Approval spent, zero executions (re-approve) | Same fail-toward-zero semantics (re-approve); unchanged by design |
+| Equivocation (rewriting own history) | Undetectable | Per-author hash chains: two signed events with one `author_seq` are self-authenticating fork evidence; the forked author's suffix is inadmissible |
+| Downgrade | n/a | A `symphony2:` reference with a missing/invalid genesis manifest is REFUSED outright — never silently served as v1 |
+| Storage mutability | Mutable KV blobs | `AccessPolicy::AppendOnly` stores (x0x ≥ 0.33.0, released). The daemon-reported anchor (owner AND policy) is verified on every **event store** the tracker touches — own, joined, and read paths alike. Silence is scoped precisely: a missing/ownerless/policyless listing for a store the reader EXPECTS to exist (its own store, or one it has anchored before) is refusal; a roster member whose store has simply never been created or replicated yet (no listing at all) is normal lag — skipped with a per-member notice and retried, never treated as acceptance of anything. Heartbeat companion stores are **excluded** from this guarantee: they are mutable, non-authoritative liveness hints and never fold inputs. Three remote-manipulation regimes, precisely: **(a) alteration** of an existing observed event — REJECTED (signatures + content-addressed keys); **(b) interior deletion** from an observed chain — DETECTED (the `author_seq`/`prev_own_event_hash` chain breaks and the suffix is inadmissible); **(c) tail withholding** — a remote daemon truncating or withholding the TAIL of its own stream is **undetectable** to an observer that never saw the withheld events; it is indistinguishable from replication lag (design r2 residual, unchanged). Interim `v2_store_policy = "signed"` fallback runs on older daemons with the deletion residual OPEN — the default mode refuses loudly instead |
+
+v2 requires `signing.policy: required`. Heartbeats remain mutable
+non-authoritative liveness hints in a `symphony2-hb-*` companion store and
+are never fold inputs; the v1 TaskList mirror of a v2 list is a display
+projection only — disagreement always resolves toward fold state.
+
 ---
 
 ## Sandbox profiles (M2/M4)
