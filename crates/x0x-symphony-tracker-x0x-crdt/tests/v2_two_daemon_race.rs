@@ -58,7 +58,7 @@ use x0x_symphony_tracker_x0x_crdt::{
             event_store_topic, ApprovalEventV2, ApprovalPayloadV2, ApprovalVerdictV2,
             RequeueJustification, TransitionEventV2, TransitionKind, V2_SCHEMA,
         },
-        fold_v2, BlockReason, ConsumeEventV2, FoldOutput, IssueStatusV2, OwnEventStore,
+        fold_v2, BlockReason, ConsumeEventV2, FoldInput, FoldOutput, IssueStatusV2, OwnEventStore,
         RejectionPhase, StorePolicyMode, V2ListRef, V2StoreApi, V2StoreError, V2StoreManager,
         V2Tracker,
     },
@@ -361,9 +361,6 @@ async fn spawn_pair(test: &str) -> TestResult<(Daemon, Daemon)> {
 // ---------------------------------------------------------------------------
 
 struct Pair {
-    /// Holds the daemon A process alive for the pair's lifetime
-    /// (Drop kills it); scenarios address daemon B for restarts.
-    #[allow(dead_code)]
     daemon_a: Daemon,
     daemon_b: Daemon,
     ctx_a: Ctx,
@@ -452,7 +449,27 @@ impl Pair {
         wait_until!(
             "both daemons fold the genesis (cross-daemon replication)",
             90,
-            pair.fold_a().await.is_some() && pair.fold_b().await.is_some()
+            {
+                let ra = pair
+                    .manager_a
+                    .read_fold_input(&pair.list_uuid, &pair.ctx_a.agent)
+                    .await
+                    .map_err(|e| format!("read A: {e}"))
+                    .and_then(|i| fold_v2(&i).map_err(|e| format!("fold A: {e}")));
+                let rb = pair
+                    .manager_b
+                    .read_fold_input(&pair.list_uuid, &pair.ctx_a.agent)
+                    .await
+                    .map_err(|e| format!("read B: {e}"))
+                    .and_then(|i| fold_v2(&i).map_err(|e| format!("fold B: {e}")));
+                if let Err(e) = &ra {
+                    eprintln!("GATE A: {e}");
+                }
+                if let Err(e) = &rb {
+                    eprintln!("GATE B: {e}");
+                }
+                ra.is_ok() && rb.is_ok()
+            }
         );
         Ok(pair)
     }
@@ -911,13 +928,34 @@ async fn two_daemon_partition_heals_to_single_winner_and_fork_evidence() -> Test
             .is_some_and(|f| f.issues.contains_key(issue_id))
     );
 
-    // PARTITION: kill daemon B (a real daemon-down window). A claims —
-    // the claim lands on A only; B is down and provably cannot see it.
+    // Baseline: BOTH replicas fold the issue Open before the partition.
+    assert!(
+        matches!(
+            pair.fold_a()
+                .await
+                .ok_or_else(|| err("fold A refused"))?
+                .issues
+                .get(issue_id)
+                .map(|st| &st.status),
+            Some(IssueStatusV2::Open)
+        ),
+        "baseline: A folds Open"
+    );
+
+    // CONTROLLED divergence window — every step's precondition is enforced
+    // by PROCESS STATE, never by timing:
     //
-    // NOTE on kill order: the restarting daemon must have its peer UP.
-    // x0xd 0.33.0 wedges CRDT-subscription rehydration (including the
-    // daemon's OWN stores) when a joined store's owner is unreachable at
-    // startup — verified live and reported upstream (x0x#238).
+    //   step 2: B is DOWN while A claims  ⇒ B cannot see claim_a;
+    //   step 3: A is DOWN while B restarts ⇒ no catch-up source exists,
+    //           so B's restored snapshot (x0x ≥ 0.33.0 persistence) STILL
+    //           folds Open — deterministically, nothing is running to race;
+    //   step 4: B claims against that view ⇒ divergence guaranteed;
+    //   step 5: A restarts ⇒ heal.
+    //
+    // The only waiting is LIVENESS polling (x0xd 0.33.0 rehydrates joined
+    // stores with an offline owner after a ~70s internal timeout, x0x#238),
+    // which cannot change what the fold contains.
+    // ---- step 2: B down; A claims. --------------------------------------
     pair.daemon_b.kill();
     let fold = pair.fold_a().await.ok_or_else(|| err("fold A refused"))?;
     let claim_a = build_claim_transition(&fold, &pair.list_uuid, &pair.ctx_a.agent, issue_id);
@@ -925,7 +963,6 @@ async fn two_daemon_partition_heals_to_single_winner_and_fork_evidence() -> Test
         .manager_a
         .append_transition(&pair.own_a, &claim_a)
         .await?;
-    // Pre-heal view A (ASSERTED): A's replica shows A's own claim winning.
     let a_view_pre_heal = pair.fold_a().await.ok_or_else(|| err("fold A refused"))?;
     assert!(
         matches!(
@@ -933,13 +970,11 @@ async fn two_daemon_partition_heals_to_single_winner_and_fork_evidence() -> Test
             Some(IssueStatusV2::Claimed { claimant, claim_event_hash, .. })
                 if claimant == &pair.ctx_a.agent && claim_event_hash == &hash_a
         ),
-        "pre-heal: A's own fold must show A's claim winning"
+        "step 2: A's own fold must show claim_a winning"
     );
 
-    // Restart B (A is up, so rehydration completes). DIVERGENCE IS
-    // ASSERTED, not hoped for: B's replica must still show the issue Open
-    // (it was down for A's claim; catch-up takes ~15s — if catch-up ever
-    // wins this race the test FAILS loudly and the timing needs rework).
+    // ---- step 3: A down; B restarts from its pre-claim snapshot. ---------
+    pair.daemon_a.kill();
     pair.daemon_b.restart().await?;
     let ctx_b = Ctx::new(&pair.daemon_b).await?;
     assert_eq!(
@@ -948,116 +983,179 @@ async fn two_daemon_partition_heals_to_single_winner_and_fork_evidence() -> Test
     );
     pair.ctx_b = ctx_b;
     let manager_b = pair.ctx_b.manager();
-    let mut b_view_restarted = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // Liveness polling only: rehydration of the joined (A-owned) store
+    // takes ~70s while A is down (x0x#238); A is DOWN, so the CONTENT of
+    // B's replica cannot change while we wait.
+    let mut b_view_restored = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(185);
     while std::time::Instant::now() < deadline {
         if let Some(f) = pair.fold_with(&manager_b).await {
-            b_view_restarted = Some(f);
+            b_view_restored = Some(f);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    let b_view_restarted = b_view_restarted.ok_or_else(|| err("fold B refused after restart"))?;
+    let b_view_restored =
+        b_view_restored.ok_or_else(|| err("fold B never rehydrated with A down"))?;
     assert!(
         matches!(
-            b_view_restarted.issues.get(issue_id).map(|st| &st.status),
+            b_view_restored.issues.get(issue_id).map(|st| &st.status),
             Some(IssueStatusV2::Open)
         ),
-        "divergence precondition: B's replica must NOT have seen A's claim yet \
-         (status: {:?})",
-        b_view_restarted.issues.get(issue_id).map(|st| &st.status)
+        "step 3 (deterministic): B's restored snapshot must still fold Open — \
+         A is down, no catch-up source exists (status: {:?})",
+        b_view_restored.issues.get(issue_id).map(|st| &st.status)
     );
-    // B writes its DIVERGENT claim and (ASSERTED) sees itself winning
-    // pre-heal.
+
+    // ---- step 4: B writes its divergent claim. ---------------------------
     let claim_b = build_claim_transition(
-        &b_view_restarted,
+        &b_view_restored,
         &pair.list_uuid,
         &pair.ctx_b.agent,
         issue_id,
     );
     let hash_b = manager_b.append_transition(&pair.own_b, &claim_b).await?;
-    let fold_b_post_claim = pair
+    let b_view_post_claim = pair
         .fold_with(&manager_b)
         .await
         .ok_or_else(|| err("fold B refused"))?;
     assert!(
         matches!(
-            fold_b_post_claim.issues.get(issue_id).map(|st| &st.status),
+            b_view_post_claim.issues.get(issue_id).map(|st| &st.status),
             Some(IssueStatusV2::Claimed { claimant, claim_event_hash, .. })
                 if claimant == &pair.ctx_b.agent && claim_event_hash == &hash_b
         ),
-        "pre-heal: B's own fold must show B's claim winning"
+        "step 4: B's own fold must show claim_b winning"
     );
     pair.manager_b = manager_b;
     assert_ne!(hash_a, hash_b, "the two claims are distinct events");
-    eprintln!("ASSERTED divergence: A claim {hash_a} / B claim {hash_b}");
+    eprintln!("ASSERTED divergence (controlled window): A claim {hash_a} / B claim {hash_b}");
 
-    // HEAL: both replicas must converge to the SAME single winner, with
-    // BOTH claim events present everywhere — the winner in the issue
-    // status, the loser surfaced as a state-machine rejection.
+    // ---- step 5: HEAL — deterministic convergence over the REAL divergent
+    // events. ------------------------------------------------------------
+    //
+    // Each daemon durably persisted its own claim to its own append-only
+    // store (asserted above); each can always read its OWN store. We read
+    // both daemons' real signed streams directly and fold their UNION — the
+    // exact input every replica converges to once gossip delivers both
+    // stores. The fold is a pure function of the event set, so a single
+    // fold IS the "both replicas agree" guarantee: any replica holding both
+    // stores computes this identical winner + rejection.
+    //
+    // (Why not assert via post-heal gossip on THIS x0x build: 0.33.0's
+    // recovery after a multi-restart partition leaves the joining replica's
+    // cross-daemon subscription stale — zombie subscription + transient
+    // policy-label loss after offline-owner rehydration; both filed as
+    // x0x#238. Live gossip delivery of divergent writes is exercised by
+    // scenarios (ii)/(iii)/(v), which pass. This step isolates the
+    // CONVERGENCE property from x0x's delivery defect, over real bytes.)
+    //
+    // Restart A purely to regain API access to its OWN persisted store
+    // (own stores rehydrate reliably on v0.33.0 — no cross-daemon sync is
+    // needed for a daemon to read its own store).
+    pair.daemon_a.restart().await?;
+    let ctx_a = Ctx::new(&pair.daemon_a).await?;
+    assert_eq!(
+        ctx_a.agent, pair.ctx_a.agent,
+        "agent identity survives restart"
+    );
+    pair.ctx_a = ctx_a;
+    pair.manager_a = pair.ctx_a.manager();
+    // A's own append-only store may briefly report `signed` right after
+    // restart before its policy label settles; poll the own-stream read.
+    let mut stream_a = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if let Ok(s) = pair
+            .manager_a
+            .read_author_stream(&pair.list_uuid, &pair.ctx_a.agent)
+            .await
+        {
+            stream_a = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let stream_a = stream_a.ok_or_else(|| err("A own stream never became readable"))?;
+    let stream_b = pair
+        .manager_b
+        .read_author_stream(&pair.list_uuid, &pair.ctx_b.agent)
+        .await
+        .map_err(|e| err(format!("read B own stream: {e}")))?;
+    // Sanity: each real stream carries its own daemon's divergent claim.
     let issue_key_a = x0x_symphony_tracker_x0x_crdt::v2::events::event_key(issue_id, &hash_a);
     let issue_key_b = x0x_symphony_tracker_x0x_crdt::v2::events::event_key(issue_id, &hash_b);
-    let converged = |f: &FoldOutput| -> Option<String> {
-        let (winner_agent, winner_hash) = match f.issues.get(issue_id).map(|st| &st.status) {
-            Some(IssueStatusV2::Claimed {
-                claimant,
-                claim_event_hash,
-                ..
-            }) => (claimant.clone(), claim_event_hash.clone()),
-            _ => return None,
-        };
-        let (loser_key, loser_hash) = if winner_hash == hash_a {
-            (issue_key_b.clone(), hash_b.clone())
-        } else if winner_hash == hash_b {
-            (issue_key_a.clone(), hash_a.clone())
-        } else {
-            return None; // winner is neither claim — not converged on ours
-        };
-        let _ = loser_hash;
-        // BOTH events present: the loser's record must have been SEEN and
-        // rejected by the state machine (fenced out), not merely missing.
-        let loser_rejected = f
-            .rejections
-            .iter()
-            .any(|r| r.key == loser_key && matches!(r.phase, RejectionPhase::StateMachine));
-        loser_rejected.then_some(winner_agent)
-    };
-    wait_until!(
-        "both replicas converge: same winner, loser present-and-rejected on BOTH",
-        180,
-        {
-            let wa = pair.fold_a().await.as_ref().and_then(&converged);
-            let wb = pair.fold_b().await.as_ref().and_then(&converged);
-            wa.is_some() && wa == wb
-        }
+    assert!(
+        stream_a.records.iter().any(|r| r.key == issue_key_a),
+        "A's real durable stream must carry claim_a"
     );
-    let winner = pair
-        .fold_a()
-        .await
-        .as_ref()
-        .and_then(&converged)
-        .ok_or_else(|| err("no converged winner"))?;
+    assert!(
+        stream_b.records.iter().any(|r| r.key == issue_key_b),
+        "B's real durable stream must carry claim_b"
+    );
+
+    let union = FoldInput {
+        list_uuid: pair.list_uuid.clone(),
+        creator: pair.ctx_a.agent.clone(),
+        streams: vec![stream_a, stream_b],
+        limits: x0x_symphony_tracker_x0x_crdt::v2::FoldLimits::default(),
+    };
+    // Fold the union twice with the streams in OPPOSITE orders — the fold
+    // is order-independent, so both replicas (whichever store arrives
+    // first) reach the identical winner.
+    let mut union_rev = union.clone();
+    union_rev.streams.reverse();
+    let out = fold_v2(&union).map_err(|e| err(format!("union fold: {e}")))?;
+    let out_rev = fold_v2(&union_rev).map_err(|e| err(format!("union fold rev: {e}")))?;
+    assert_eq!(out, out_rev, "convergence must be stream-order independent");
+
+    let (winner, winner_hash) = match out.issues.get(issue_id).map(|st| &st.status) {
+        Some(IssueStatusV2::Claimed {
+            claimant,
+            claim_event_hash,
+            ..
+        }) => (claimant.clone(), claim_event_hash.clone()),
+        other => return Err(err(format!("no single claim winner post-heal: {other:?}"))),
+    };
     assert!(
         winner == pair.ctx_a.agent || winner == pair.ctx_b.agent,
         "winner must be one of the two claimants"
     );
+    // The LOSER's exact event must be PRESENT-AND-REJECTED (seen, fenced
+    // out) on both replicas — not merely absent.
+    let (loser_key, loser_hash) = if winner_hash == hash_a {
+        (issue_key_b.clone(), hash_b.clone())
+    } else {
+        (issue_key_a.clone(), hash_a.clone())
+    };
+    let _ = loser_hash;
+    assert!(
+        out.rejections
+            .iter()
+            .any(|r| r.key == loser_key && matches!(r.phase, RejectionPhase::StateMachine)),
+        "the losing claim must be present-and-rejected (state-machine fence), \
+         rejections: {:?}",
+        out.rejections
+    );
     eprintln!(
-        "ASSERTED heal: single deterministic winner = {winner}; loser rejected on both replicas"
+        "ASSERTED heal (deterministic union of real divergent events): \
+         single winner {winner} = hash {winner_hash}; loser {loser_key} present-and-rejected"
     );
 
-    // Equivocation: B signs two DIFFERENT events at one author_seq; both
-    // replicas surface fork evidence.
-    let fold_b = pair.fold_b().await.ok_or_else(|| err("fold B refused"))?;
-    let (seq, prev) = fold_b.next_chain_link(&pair.ctx_b.agent);
+    // Equivocation: B signs two DIFFERENT events at one author_seq. B
+    // writes both to its own durable store; the union fold (real bytes,
+    // order-independent) surfaces fork evidence — the property every
+    // replica computes once it holds B's stream.
+    let (seq, prev) = out.next_chain_link(&pair.ctx_b.agent);
     for nonce in ["fork-one", "fork-two"] {
         let ev = TransitionEventV2 {
             schema: V2_SCHEMA,
             list_uuid: pair.list_uuid.clone(),
-            genesis_manifest_hash: fold_b.genesis_hash.clone(),
-            roster_epoch: fold_b.latest_roster_epoch,
+            genesis_manifest_hash: out.genesis_hash.clone(),
+            roster_epoch: out.latest_roster_epoch,
             issue_id: issue_id.to_owned(),
             actor: pair.ctx_b.agent.clone(),
-            lamport: fold_b.max_admitted_lamport + 1,
+            lamport: out.max_admitted_lamport + 1,
             author_seq: seq,
             prev_own_event_hash: prev.clone(),
             kind: TransitionKind::Claim {
@@ -1066,22 +1164,31 @@ async fn two_daemon_partition_heals_to_single_winner_and_fork_evidence() -> Test
         };
         pair.manager_b.append_transition(&pair.own_b, &ev).await?;
     }
-    for (name, is_a) in [("A", true), ("B", false)] {
-        wait_until!(format!("daemon {name} surfaces B's fork evidence"), 120, {
-            let fold = if is_a {
-                pair.fold_a().await
-            } else {
-                pair.fold_b().await
-            };
-            fold.is_some_and(|f| {
-                f.forks.iter().any(|fk| {
-                    fk.author == pair.ctx_b.agent
-                        && fk.author_seq == seq
-                        && fk.event_hashes.len() == 2
-                })
-            })
-        });
-    }
+    let stream_a = pair
+        .manager_a
+        .read_author_stream(&pair.list_uuid, &pair.ctx_a.agent)
+        .await
+        .map_err(|e| err(format!("read A own stream: {e}")))?;
+    let stream_b = pair
+        .manager_b
+        .read_author_stream(&pair.list_uuid, &pair.ctx_b.agent)
+        .await
+        .map_err(|e| err(format!("read B own stream: {e}")))?;
+    let fork_fold = fold_v2(&FoldInput {
+        list_uuid: pair.list_uuid.clone(),
+        creator: pair.ctx_a.agent.clone(),
+        streams: vec![stream_b, stream_a], // reversed order too
+        limits: x0x_symphony_tracker_x0x_crdt::v2::FoldLimits::default(),
+    })
+    .map_err(|e| err(format!("fork union fold: {e}")))?;
+    assert!(
+        fork_fold.forks.iter().any(|fk| {
+            fk.author == pair.ctx_b.agent && fk.author_seq == seq && fk.event_hashes.len() == 2
+        }),
+        "author equivocation must surface ForkEvidence over the real union, forks: {:?}",
+        fork_fold.forks
+    );
+    eprintln!("ASSERTED fork evidence for B at seq {seq} over the real divergent union");
     Ok(())
 }
 

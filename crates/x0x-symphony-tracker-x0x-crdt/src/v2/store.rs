@@ -805,6 +805,17 @@ impl V2StoreManager {
                 // append_only; possible under the interim signed fallback).
                 continue;
             };
+            if value.value.len() > self.limits.max_record_bytes {
+                // Fail-closed read budget (same classification as the
+                // count/member budgets): never buffer an oversize record.
+                return Err(V2StoreError::Invalid(format!(
+                    "record {} in stream {author_agent_id} is {} bytes \
+                     (budget {}); refusing the read",
+                    entry.key,
+                    value.value.len(),
+                    self.limits.max_record_bytes
+                )));
+            }
             if entry.key == CARD_SELF_KEY {
                 card_self = Some(value.value.clone());
             }

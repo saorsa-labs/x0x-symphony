@@ -200,6 +200,11 @@ impl V2Tracker {
             }
             out = self.read_and_fold().await?;
         }
+        // A view that converged exactly on the final allowed pass is
+        // complete — serve it. Only a STILL-growing roster is refused.
+        if !self.join_new_members(&out).await? {
+            return Ok(out);
+        }
         // Fail-closed: a view that never reached the join fixpoint is
         // PARTIAL and must not be served as truth.
         Err(terr(format!(

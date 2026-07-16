@@ -2328,3 +2328,59 @@ fn budget_violations_refuse_the_list() -> TestResult {
     );
     Ok(())
 }
+
+/// Codex round-4 item 1c: the CUMULATIVE roster union across epochs is
+/// budgeted (aligned with the read path) — 200 genesis members plus 200 new
+/// members at epoch 1 exceeds the 256 default even though each individual
+/// roster is within it.
+#[test]
+fn cumulative_roster_union_across_epochs_is_budgeted() -> TestResult {
+    let creator = Author::generate()?;
+    // 200 genesis member ids (creator + 199 synthetic).
+    let mut genesis_roster: Vec<String> = vec![creator.id.clone()];
+    genesis_roster.extend((0..199u32).map(|i| format!("{:0>64}", format!("a{i:x}"))));
+    let manifest = GenesisManifestV2 {
+        schema: V2_SCHEMA,
+        kind: "genesis".to_owned(),
+        list_uuid: "list-cumulative".to_owned(),
+        creator: creator.id.clone(),
+        roster: genesis_roster.clone(),
+        policy: GenesisPolicy::default(),
+        created_at: 1,
+    };
+    let genesis_payload = serde_json::to_vec(&manifest)?;
+    let genesis_hash = sha256_hex(&genesis_payload);
+    let genesis_env = creator.sign_envelope(GENESIS_CONTEXT_V2, &genesis_payload)?;
+    let genesis_record = envelope_record(GENESIS_KEY, &genesis_env)?;
+
+    // Epoch 1: 200 DIFFERENT members (plus creator) — each roster is within
+    // the 256 cap individually; the union is 400.
+    let mut update_roster: Vec<String> = vec![creator.id.clone()];
+    update_roster.extend((0..199u32).map(|i| format!("{:0>64}", format!("b{i:x}"))));
+    let update = RosterEventV2 {
+        schema: V2_SCHEMA,
+        kind: "roster".to_owned(),
+        list_uuid: "list-cumulative".to_owned(),
+        genesis_manifest_hash: genesis_hash.clone(),
+        roster_epoch: 1,
+        prev_roster_hash: genesis_hash.clone(),
+        roster: update_roster,
+        actor: creator.id.clone(),
+    };
+    let payload = serde_json::to_vec(&update)?;
+    let hash = sha256_hex(&payload);
+    let envelope = creator.sign_envelope(ROSTER_CONTEXT_V2, &payload)?;
+    let update_record = envelope_record(&roster_key(1, &hash), &envelope)?;
+
+    let refused = fold_v2(&FoldInput {
+        list_uuid: "list-cumulative".to_owned(),
+        creator: creator.id.clone(),
+        streams: vec![stream(&creator, vec![genesis_record, update_record])],
+        limits: FoldLimits::default(),
+    });
+    assert!(
+        matches!(&refused, Err(ListRefusal::BudgetExceeded(r)) if r.contains("cumulative")),
+        "cumulative 200+200 union must refuse with the default 256 cap, got {refused:?}"
+    );
+    Ok(())
+}

@@ -285,6 +285,7 @@ pub struct X0xCrdtTrackerBuilder {
     replication_factor: usize,
     v2_store_policy: v2::StorePolicyMode,
     v2_settle: std::time::Duration,
+    v2_fold_limits: v2::FoldLimits,
 }
 
 impl X0xCrdtTrackerBuilder {
@@ -302,7 +303,16 @@ impl X0xCrdtTrackerBuilder {
             replication_factor: shard::DEFAULT_REPLICATION_FACTOR,
             v2_store_policy: v2::StorePolicyMode::default(),
             v2_settle: std::time::Duration::from_secs(2),
+            v2_fold_limits: v2::FoldLimits::default(),
         }
+    }
+
+    /// Override the v2 fold/read resource budgets (tracker-integrity v2
+    /// lists only; fail-closed on violation).
+    #[must_use]
+    pub const fn v2_fold_limits(mut self, limits: v2::FoldLimits) -> Self {
+        self.v2_fold_limits = limits;
+        self
     }
 
     /// Set the v2 event-store policy mode (tracker-integrity v2 lists only).
@@ -409,7 +419,8 @@ impl X0xCrdtTrackerBuilder {
                 )
             })?;
             let store_api: Arc<dyn v2::V2StoreApi> = Arc::new(X0xdClient::new(&self.base_url)?);
-            let manager = v2::V2StoreManager::new(store_api, signing_client, self.v2_store_policy);
+            let manager = v2::V2StoreManager::new(store_api, signing_client, self.v2_store_policy)
+                .with_limits(self.v2_fold_limits);
             Some(Arc::new(v2::V2Tracker::new(
                 manager,
                 list_ref,

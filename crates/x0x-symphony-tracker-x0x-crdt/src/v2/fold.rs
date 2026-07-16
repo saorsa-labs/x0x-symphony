@@ -395,13 +395,22 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
     // merged input carries CONFLICTING card-self values is rejected outright
     // — two different self-certifying keys for one agent id is an anomaly,
     // and any pick-one rule would make fold output depend on input order.
-    let (streams, conflicted) = canonical_streams(&input.streams);
-    // Budgets (fail-closed): every violation refuses the list outright.
+    // Budgets (fail-closed) — enforced on the RAW input BEFORE any merge
+    // or dedup work, so oversize hostile input cannot consume memory/CPU
+    // during canonicalization. Every violation refuses the list outright.
     let limits = input.limits;
-    for (owner, stream) in &streams {
+    if input.streams.len() > limits.max_roster_members.saturating_add(1) {
+        return Err(ListRefusal::BudgetExceeded(format!(
+            "input carries {} streams (max {} roster members + creator)",
+            input.streams.len(),
+            limits.max_roster_members
+        )));
+    }
+    for stream in &input.streams {
         if stream.records.len() > limits.max_records_per_stream {
             return Err(ListRefusal::BudgetExceeded(format!(
-                "stream {owner} carries {} records (max {})",
+                "raw stream {} carries {} records (max {})",
+                stream.owner,
                 stream.records.len(),
                 limits.max_records_per_stream
             )));
@@ -412,10 +421,23 @@ pub fn fold_v2(input: &FoldInput) -> Result<FoldOutput, ListRefusal> {
             .find(|r| r.value.len() > limits.max_record_bytes)
         {
             return Err(ListRefusal::BudgetExceeded(format!(
-                "record {} in stream {owner} is {} bytes (max {})",
+                "record {} in raw stream {} is {} bytes (max {})",
                 record.key,
+                stream.owner,
                 record.value.len(),
                 limits.max_record_bytes
+            )));
+        }
+    }
+    let (streams, conflicted) = canonical_streams(&input.streams);
+    // Post-merge re-check: duplicate raw streams for one owner can sum past
+    // the per-stream cap even when each raw copy is within it.
+    for (owner, stream) in &streams {
+        if stream.records.len() > limits.max_records_per_stream {
+            return Err(ListRefusal::BudgetExceeded(format!(
+                "merged stream {owner} carries {} records (max {})",
+                stream.records.len(),
+                limits.max_records_per_stream
             )));
         }
     }
@@ -867,6 +889,12 @@ fn build_roster_chain(
     }
 
     // Walk epochs 1..: each must chain to the previous accepted hash.
+    // The CUMULATIVE member union across all accepted epochs is budgeted —
+    // that union is what actually bounds reader resource use (store joins
+    // and reads), and it aligns the pure fold with the read path, which
+    // budgets the same union. The per-roster cap above remains as an
+    // additional payload-validity rule.
+    let mut cumulative: BTreeSet<String> = rosters.first().cloned().unwrap_or_default();
     let mut prev_hash = genesis_hash.to_owned();
     let mut epoch = 1u64;
     while let Some(candidates) = by_epoch.get(&epoch) {
@@ -889,6 +917,14 @@ fn build_roster_chain(
         match linked.as_slice() {
             [] => break,
             [(_, roster, hash)] => {
+                cumulative.extend(roster.roster.iter().cloned());
+                if cumulative.len() > max_roster_members {
+                    return Err(ListRefusal::BudgetExceeded(format!(
+                        "cumulative roster union reaches {} members across \
+                         epochs (max {max_roster_members})",
+                        cumulative.len()
+                    )));
+                }
                 rosters.push(roster.roster.iter().cloned().collect());
                 prev_hash.clone_from(hash);
                 epoch += 1;

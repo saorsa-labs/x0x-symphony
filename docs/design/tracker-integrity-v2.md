@@ -398,9 +398,15 @@ guarantee (mutable, non-authoritative, never fold inputs; reads are
 best-effort). The four-way binding is anchored in what the daemon
 reports, never in caller inputs. Resource budgets (`FoldLimits`:
 max roster members, max records per stream, max record bytes — default
-256 / 4096 / 256 KiB, programmatically overridable) are enforced on both
-the read path and the pure fold; every violation is `BudgetExceeded`
-refusal (fail-closed, never partial processing). Fork evidence is logged
+256 / 4096 / 256 KiB, overridable via `V2StoreManager::with_limits` /
+`X0xCrdtTrackerBuilder::v2_fold_limits`) are enforced on both the read
+path and the pure fold, on the RAW input before any merge/dedup work;
+every violation is `BudgetExceeded` refusal (fail-closed, never partial
+processing). The roster-member budget applies to the CUMULATIVE union of
+members across all accepted epochs — identically in the read path and the
+fold — because that union is what bounds reader resource use; each
+individual genesis/update roster is additionally capped as a payload
+validity rule. Fork evidence is logged
 at error level on every fold and attached as `ForkEvidence` verification
 notices to issues whose opener or current claimant equivocated.
 
