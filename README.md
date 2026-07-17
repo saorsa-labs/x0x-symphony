@@ -85,5 +85,5 @@ operator guidance, security posture, and runner authoring notes are in
 
 ## License
 
-Dual AGPL-3.0-or-later / Commercial. Contact david@saorsalabs.com for
-commercial licensing.
+Dual-licensed under either of MIT or Apache-2.0, at your option. See
+[`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE).
